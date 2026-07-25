@@ -439,3 +439,23 @@ None of these are reachable without an install: they are properties of unit
 files, service accounts and filesystem modes, not of the code paths a test can
 construct.
 
+### A fix that inverted the fault it was added for
+
+The readback reported the lease valid and the processor ready while capture was
+already being refused, so it was changed to judge expiry itself rather than wait
+for the sweeper. Within the hour, on the same gateway, it reported the lease
+expired two minutes earlier and the processor not ready — while the core was
+logging captured connections through the client anchor the whole time.
+
+The pointer it judged from goes stale by design. A steady-state heartbeat
+refreshes the registry's copy and deliberately leaves the snapshot alone,
+because nothing about the state has changed and there is nothing to swap. So the
+check meant to stop the readback claiming health during a failure began claiming
+failure during health.
+
+Worth recording for the shape rather than the detail: the first fix read the
+nearest available copy, and the sweeper — the existing code that had this right
+— was reading the registry a few lines away. The second observation is what
+caught it, and only because the gateway was left running and looked at again.
+
+
