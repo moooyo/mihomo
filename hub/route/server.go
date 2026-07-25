@@ -79,8 +79,13 @@ type Config struct {
 	// generation must not thereby be able to commit one.
 	OverlayControlAddr    string
 	OverlayGenerationAddr string
-	// OverlayPeer restricts which local process may connect to either socket.
-	OverlayPeer PeerPolicy
+	// OverlayControlPeer and OverlayGenerationPeer restrict which local process
+	// may connect to each socket. They are separate because the sockets admit
+	// different processes — the coordinator mutates, the processor only reads —
+	// and a single policy covering both would have to admit the processor to
+	// the mutation endpoint.
+	OverlayControlPeer    PeerPolicy
+	OverlayGenerationPeer PeerPolicy
 }
 
 type Cors struct {

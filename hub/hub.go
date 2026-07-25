@@ -81,9 +81,13 @@ func applyRoute(cfg *config.Config) {
 		},
 		OverlayControlAddr:    cfg.Controller.RuntimeOverlayControl,
 		OverlayGenerationAddr: cfg.Controller.RuntimeOverlayGeneration,
-		OverlayPeer: route.PeerPolicy{
-			UID: cfg.Controller.RuntimeOverlayPeerUID,
-			GID: cfg.Controller.RuntimeOverlayPeerGID,
+		OverlayControlPeer: route.PeerPolicy{
+			UID: cfg.Controller.RuntimeOverlayControlPeerUID,
+			GID: cfg.Controller.RuntimeOverlayControlPeerGID,
+		},
+		OverlayGenerationPeer: route.PeerPolicy{
+			UID: cfg.Controller.RuntimeOverlayGenerationPeerUID,
+			GID: cfg.Controller.RuntimeOverlayGenerationPeerGID,
 		},
 	})
 }

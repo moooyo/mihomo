@@ -120,11 +120,18 @@ type Controller struct {
 	RuntimeOverlayControl string
 	// RuntimeOverlayGeneration is the processor's read-only socket path.
 	RuntimeOverlayGeneration string
-	// RuntimeOverlayPeerUID / PeerGID restrict which local process may connect
-	// to either socket. -1 means unrestricted, which is only safe because the
-	// sockets are 0600 inside a 0700 directory owned by the runtime user.
-	RuntimeOverlayPeerUID int
-	RuntimeOverlayPeerGID int
+	// RuntimeOverlayControlPeer and RuntimeOverlayGenerationPeer restrict which
+	// local process may connect to each socket. They are separate because the
+	// two sockets admit different processes: the coordinator may mutate, the
+	// processor may only read. One shared policy would have to admit both, and
+	// admitting the processor to the mutation endpoint is precisely what the
+	// separation exists to prevent. -1 means unrestricted, which is only safe
+	// because the sockets are 0600 inside a 0700 directory owned by the runtime
+	// user.
+	RuntimeOverlayControlPeerUID    int
+	RuntimeOverlayControlPeerGID    int
+	RuntimeOverlayGenerationPeerUID int
+	RuntimeOverlayGenerationPeerGID int
 }
 
 type Cors struct {
@@ -245,13 +252,32 @@ type RawRuntimeOverlay struct {
 	ControlSocket    string `yaml:"control-socket" json:"control-socket"`
 	GenerationSocket string `yaml:"generation-socket" json:"generation-socket"`
 	// PeerUID and PeerGID restrict which local process may connect. A negative
-	// value, or the absent default of -1, means unrestricted.
+	// value, or the absent default of -1, means unrestricted. They apply to
+	// both sockets, and exist for the single-user deployment where that is
+	// what is wanted.
 	PeerUID *int `yaml:"peer-uid" json:"peer-uid"`
 	PeerGID *int `yaml:"peer-gid" json:"peer-gid"`
+	// The per-socket forms override the shared ones. A deployment that runs the
+	// coordinator and the processor as different users needs them: the shared
+	// policy would have to admit both identities on both sockets, which would
+	// let a compromised processor reach the mutation endpoint — the one thing
+	// the two-socket split is there to stop.
+	ControlPeerUID    *int `yaml:"control-peer-uid" json:"control-peer-uid"`
+	ControlPeerGID    *int `yaml:"control-peer-gid" json:"control-peer-gid"`
+	GenerationPeerUID *int `yaml:"generation-peer-uid" json:"generation-peer-uid"`
+	GenerationPeerGID *int `yaml:"generation-peer-gid" json:"generation-peer-gid"`
 }
 
 // peerIDOrUnrestricted maps an absent peer id onto the unrestricted sentinel,
 // so "not configured" and "uid 0" stay distinguishable.
+// firstPeerID prefers the per-socket setting and falls back to the shared one.
+func firstPeerID(specific, shared *int) *int {
+	if specific != nil {
+		return specific
+	}
+	return shared
+}
+
 func peerIDOrUnrestricted(v *int) int {
 	if v == nil {
 		return -1
@@ -887,8 +913,14 @@ func parseController(cfg *RawConfig) (*Controller, error) {
 		RuntimeOverlayOwner:           cfg.RuntimeOverlay.Owner,
 		RuntimeOverlayControl:         cfg.RuntimeOverlay.ControlSocket,
 		RuntimeOverlayGeneration:      cfg.RuntimeOverlay.GenerationSocket,
-		RuntimeOverlayPeerUID:         peerIDOrUnrestricted(cfg.RuntimeOverlay.PeerUID),
-		RuntimeOverlayPeerGID:         peerIDOrUnrestricted(cfg.RuntimeOverlay.PeerGID),
+		RuntimeOverlayControlPeerUID: peerIDOrUnrestricted(
+			firstPeerID(cfg.RuntimeOverlay.ControlPeerUID, cfg.RuntimeOverlay.PeerUID)),
+		RuntimeOverlayControlPeerGID: peerIDOrUnrestricted(
+			firstPeerID(cfg.RuntimeOverlay.ControlPeerGID, cfg.RuntimeOverlay.PeerGID)),
+		RuntimeOverlayGenerationPeerUID: peerIDOrUnrestricted(
+			firstPeerID(cfg.RuntimeOverlay.GenerationPeerUID, cfg.RuntimeOverlay.PeerUID)),
+		RuntimeOverlayGenerationPeerGID: peerIDOrUnrestricted(
+			firstPeerID(cfg.RuntimeOverlay.GenerationPeerGID, cfg.RuntimeOverlay.PeerGID)),
 		Cors: Cors{
 			AllowOrigins:        cfg.ExternalControllerCors.AllowOrigins,
 			AllowPrivateNetwork: cfg.ExternalControllerCors.AllowPrivateNetwork,

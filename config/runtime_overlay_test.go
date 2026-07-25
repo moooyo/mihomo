@@ -367,3 +367,45 @@ func TestOrIsNotAcceptedAsAQualifier(t *testing.T) {
 		t.Fatalf("an OR was accepted as an exclusion qualifier: %v", err)
 	}
 }
+
+// The two sockets admit different processes, so they must carry different peer
+// policies. A single shared policy would have to admit the processor's identity
+// on the control socket as well, which is exactly the reach the split exists to
+// deny — and losing that would be invisible in behaviour until someone
+// compromised the processor.
+func TestPerSocketPeerPolicyOverridesTheSharedOne(t *testing.T) {
+	coordinatorUID, processorUID, sharedGID := 401, 402, 900
+	raw := RawRuntimeOverlay{
+		Owner:             "5gpn",
+		PeerUID:           &coordinatorUID,
+		PeerGID:           &sharedGID,
+		GenerationPeerUID: &processorUID,
+	}
+
+	if got := peerIDOrUnrestricted(firstPeerID(raw.ControlPeerUID, raw.PeerUID)); got != coordinatorUID {
+		t.Errorf("control peer uid = %d, want the shared %d", got, coordinatorUID)
+	}
+	if got := peerIDOrUnrestricted(firstPeerID(raw.GenerationPeerUID, raw.PeerUID)); got != processorUID {
+		t.Errorf("generation peer uid = %d, want the per-socket %d; the processor would be "+
+			"checked against the coordinator's identity", got, processorUID)
+	}
+	// An unset per-socket value must fall back rather than becoming
+	// unrestricted, which would silently open the socket to every local user.
+	if got := peerIDOrUnrestricted(firstPeerID(raw.GenerationPeerGID, raw.PeerGID)); got != sharedGID {
+		t.Errorf("generation peer gid = %d, want the shared %d", got, sharedGID)
+	}
+}
+
+func TestAbsentPeerPolicyStaysUnrestricted(t *testing.T) {
+	var raw RawRuntimeOverlay
+	for name, got := range map[string]int{
+		"control uid":    peerIDOrUnrestricted(firstPeerID(raw.ControlPeerUID, raw.PeerUID)),
+		"control gid":    peerIDOrUnrestricted(firstPeerID(raw.ControlPeerGID, raw.PeerGID)),
+		"generation uid": peerIDOrUnrestricted(firstPeerID(raw.GenerationPeerUID, raw.PeerUID)),
+		"generation gid": peerIDOrUnrestricted(firstPeerID(raw.GenerationPeerGID, raw.PeerGID)),
+	} {
+		if got != -1 {
+			t.Errorf("%s = %d, want -1 (unrestricted)", name, got)
+		}
+	}
+}

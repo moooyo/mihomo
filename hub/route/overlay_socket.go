@@ -52,7 +52,7 @@ func startOverlayControl(cfg *Config) {
 	if cfg.OverlayControlAddr == "" {
 		return
 	}
-	l, addr, err := listenLocalSocket(cfg.OverlayControlAddr, cfg.OverlayPeer)
+	l, addr, err := listenLocalSocket(cfg.OverlayControlAddr, cfg.OverlayControlPeer)
 	if err != nil {
 		log.Errorln("Overlay control socket listen error: %s", err)
 		return
@@ -79,7 +79,7 @@ func startOverlayGeneration(cfg *Config) {
 	if cfg.OverlayGenerationAddr == "" {
 		return
 	}
-	l, addr, err := listenLocalSocket(cfg.OverlayGenerationAddr, cfg.OverlayPeer)
+	l, addr, err := listenLocalSocket(cfg.OverlayGenerationAddr, cfg.OverlayGenerationPeer)
 	if err != nil {
 		log.Errorln("Overlay generation socket listen error: %s", err)
 		return
