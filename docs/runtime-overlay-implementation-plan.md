@@ -458,4 +458,34 @@ nearest available copy, and the sweeper — the existing code that had this righ
 — was reading the registry a few lines away. The second observation is what
 caught it, and only because the gateway was left running and looked at again.
 
+### What releasing caught that deploying did not
+
+Three more, all the same shape: a code path that had never executed. The gateway
+under test was updated by installing binaries by hand, so the installer, the
+release workflow and the seed renderers CI uses were the parts nothing had run.
+
+- **Artifact staging aborted every fresh install.** The anchored-seed probe
+  resolves the service accounts and socket groups to write the peer policy, and
+  it runs before installation creates either. The renderer returned failure and
+  the `|| return 1` above it ended the install, at the first step that touches
+  the overlay.
+- **Three separate renderers expand the seed template**, not one: install.sh,
+  the CI `mihomo-config` job's own awk, and two regression scripts. A template
+  change has to satisfy all of them. Two were missed, and because the regression
+  scripts are not named `test_*.sh` they were not covered by the loop that runs
+  the shell policy suite either — so the failure first appeared in a release run
+  for a tag that had already gone out.
+- **The release build still pointed at the sidecar's old directory.** Moving it
+  to `plugin-sidecar/` updated the workflow's `working-directory` and its asset
+  copy but not a relative path inside the build step. Every gate passed and the
+  build failed.
+
+The tag was withdrawn three times before anything was published, which is the
+system working — the gate is upstream of publication and nothing reached users.
+But the diagnosis each time was local: run the job the way CI runs it, against
+the committed tree, and compare with the same job on `main`. That comparison is
+what separated "mine" from "this box", and it should have come before the first
+tag rather than after it.
+
+
 
