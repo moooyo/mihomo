@@ -22,3 +22,8 @@ func peerCredentials(net.Conn) (uid, gid int, err error) {
 // AF_UNIX socket inherits the containing directory's ACL, which listenLocalSocket
 // creates with 0700.
 func setRestrictiveUmask() func() { return func() {} }
+
+// grantSocketGroup has no meaning where the socket carries no POSIX group.
+// A peer policy naming a gid is unusable on such a platform anyway, because
+// peerCredentials already fails closed there.
+func grantSocketGroup(string, int) error { return nil }

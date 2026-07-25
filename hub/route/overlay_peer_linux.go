@@ -5,6 +5,7 @@ package route
 import (
 	"errors"
 	"net"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -46,4 +47,16 @@ func peerCredentials(conn net.Conn) (uid, gid int, err error) {
 func setRestrictiveUmask() func() {
 	old := syscall.Umask(0o177)
 	return func() { syscall.Umask(old) }
+}
+
+// grantSocketGroup hands a bound socket to the group its peer policy admits.
+//
+// Ordering matters: chown first, chmod second. Widening the mode before the
+// owner group is set would leave a window in which the socket is group-writable
+// by whatever group it was created with.
+func grantSocketGroup(path string, gid int) error {
+	if err := os.Chown(path, -1, gid); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o660)
 }

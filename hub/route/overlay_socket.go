@@ -104,8 +104,25 @@ func startOverlayGeneration(cfg *Config) {
 func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, error) {
 	resolved := C.Path.Resolve(addr)
 	dir := filepath.Dir(resolved)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// Traverse-only when a peer group is named. The peers are separate service
+	// users that cannot enter a 0700 directory, and each socket's own mode is
+	// what gates access; the directory only has to be enterable, never
+	// listable. Without a named group nobody but the runtime user is expected,
+	// and the directory stays private.
+	dirMode := os.FileMode(0o700)
+	if policy.GID >= 0 {
+		dirMode = 0o711
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, resolved, err
+	}
+	// MkdirAll leaves an existing directory's mode alone, and the two sockets
+	// share one directory, so widen it explicitly rather than depending on
+	// which socket happened to create it.
+	if policy.GID >= 0 {
+		if err := os.Chmod(dir, dirMode); err != nil {
+			return nil, resolved, err
+		}
 	}
 	// A stale socket file from a previous process would make bind fail. This
 	// is safe because the directory is 0700 and owned by the runtime user.
@@ -120,6 +137,16 @@ func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, er
 	restore()
 	if err != nil {
 		return nil, resolved, err
+	}
+	// A peer that cannot open the socket cannot be authenticated by it. When a
+	// group is named, hand the socket to that group; the SO_PEERCRED check on
+	// every accept is still what authorises, this only makes connecting
+	// possible for the identity the policy already admits.
+	if policy.GID >= 0 {
+		if err := grantSocketGroup(resolved, policy.GID); err != nil {
+			_ = l.Close()
+			return nil, resolved, err
+		}
 	}
 	return &peerCheckedListener{Listener: l, policy: policy, path: resolved}, resolved, nil
 }
