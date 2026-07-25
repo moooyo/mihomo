@@ -801,3 +801,41 @@ func TestDestinationAllowlistIsInTheDigest(t *testing.T) {
 		t.Fatal("widening the destination allowlist did not change the digest")
 	}
 }
+
+// PublicOnly must actually deny something, or it is a field that claims a
+// protection nothing provides. This is the half that is implementable without
+// per-adapter pinned dialing: a destination whose address is already known.
+func TestPublicOnlyRefusesNonGlobalDestinations(t *testing.T) {
+	d := testDocument("g1")
+	d.Egress.Capabilities[0].Destinations = []DestinationRule{
+		{Kind: SelectorIPCIDR, Value: "0.0.0.0/0"},
+		{Kind: SelectorDomainSuffix, Value: "bilibili.com"},
+	}
+	c := mustCompile(t, d)
+	snap := EmptySnapshot("boot", "inst")
+	snap.active = c
+	snap.state = ProcessorReady
+
+	for name, addr := range map[string]string{
+		"loopback":   "127.0.0.1",
+		"private":    "10.0.0.5",
+		"link-local": "169.254.169.254",
+		"cgnat":      "100.64.0.1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := snap.ResolveEgress(&MatchInput{
+				InUser: "module-up-1", InName: "intercept-egress",
+				DstIP: netip.MustParseAddr(addr), DstPort: 443, Network: NetworkTCP,
+			}); ok {
+				t.Fatalf("a public-only capability reached %s", addr)
+			}
+		})
+	}
+
+	if _, ok := snap.ResolveEgress(&MatchInput{
+		InUser: "module-up-1", InName: "intercept-egress",
+		DstIP: netip.MustParseAddr("203.0.113.7"), DstPort: 443, Network: NetworkTCP,
+	}); !ok {
+		t.Fatal("a public-only capability was refused a globally routable destination")
+	}
+}

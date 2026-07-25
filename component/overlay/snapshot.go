@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"net/netip"
 	"sync/atomic"
 	"time"
 )
@@ -182,6 +183,9 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 	}
 	if s.active != nil {
 		if c, ok := s.active.Egress.authorize(in); ok {
+			if c.PublicOnly && forbiddenEgressScope(in.DstIP) {
+				return EgressResolution{}, false
+			}
 			// A quarantined or not-ready generation has no live processor, so a
 			// capability presented against it cannot be genuine.
 			if !s.state.Serviceable() {
@@ -196,10 +200,39 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 			continue
 		}
 		if c, ok := d.compiled.Egress.authorize(in); ok {
+			if c.PublicOnly && forbiddenEgressScope(in.DstIP) {
+				return EgressResolution{}, false
+			}
 			return s.resolution(d.compiled, c, true), true
 		}
 	}
 	return EgressResolution{}, false
+}
+
+// forbiddenEgressScope reports whether an address is one a public-only
+// capability must never reach.
+//
+// This is the cheap half of the rebinding defence: it catches a destination
+// whose address is already known. The expensive half — resolving through the
+// generation's profile and dialing the validated address — needs per-adapter
+// pinned-IP support and is not implemented, so this must not be read as a
+// complete guarantee. It is still worth having: without it PublicOnly would be
+// a field that claims a protection nothing provides.
+func forbiddenEgressScope(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	a := addr.Unmap()
+	switch {
+	case a.IsLoopback(), a.IsPrivate(), a.IsLinkLocalUnicast(), a.IsLinkLocalMulticast(),
+		a.IsInterfaceLocalMulticast(), a.IsMulticast(), a.IsUnspecified():
+		return true
+	}
+	// Carrier-grade NAT, which is neither private nor globally routable.
+	if a.Is4() && a.As4()[0] == 100 && a.As4()[1]&0xc0 == 64 {
+		return true
+	}
+	return false
 }
 
 func (s *Snapshot) resolution(c *Compiled, cap EgressCapability, draining bool) EgressResolution {
