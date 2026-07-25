@@ -153,6 +153,15 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Mount("/providers/proxies", proxyProviderRouter())
 		r.Mount("/providers/rules", ruleProviderRouter())
 		r.Mount("/cache", cacheRouter())
+		// Read-only overlay views, for the console to render what the gateway
+		// is enforcing. Deliberately GET-only and deliberately not the control
+		// router: staging, committing, aborting and readiness stay on the
+		// machine-only socket, because the claim that mihomo's constraints
+		// survive a processor compromise rests on the mutation surface not
+		// being reachable over an HTTP listener at all. Observing state is a
+		// different act from changing it.
+		r.Get("/capabilities", getOverlayCapabilities)
+		r.Get("/runtime-overlays/{owner}", getOverlayReadback)
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/storage", storageRouter())
 		if !embedMode { // disallow restart in embed mode
