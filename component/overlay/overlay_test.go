@@ -24,9 +24,12 @@ func testDocument(id string) *Document {
 				Ports: []PortRange{{From: 443, To: 443}}},
 			{Kind: SelectorIPCIDR, Value: "203.0.113.0/24", Action: ActionDirect},
 		}},
-		Egress: EgressOverlay{Capabilities: []EgressCapability{
-			{ID: "module-up-1", Group: "Proxies", PublicOnly: true},
-		}},
+		Egress: EgressOverlay{Capabilities: []EgressCapability{{
+			ID: "module-up-1", Listener: "intercept-egress", Group: "Proxies", PublicOnly: true,
+			Destinations: []DestinationRule{
+				{Kind: SelectorDomainSuffix, Value: "bilibili.com", Ports: []PortRange{{From: 80, To: 80}, {From: 443, To: 443}}},
+			},
+		}}},
 	}
 }
 
@@ -198,10 +201,10 @@ func TestEgressResolvesOnlyLiveCapabilities(t *testing.T) {
 	snap.active = c
 	snap.state = ProcessorReady
 
-	if _, ok := snap.ResolveEgress(&MatchInput{InUser: "module-up-1"}); !ok {
+	if _, ok := snap.ResolveEgress((egressProbe("module-up-1"))); !ok {
 		t.Fatal("live capability did not resolve")
 	}
-	if _, ok := snap.ResolveEgress(&MatchInput{InUser: "unknown"}); ok {
+	if _, ok := snap.ResolveEgress((egressProbe("unknown"))); ok {
 		t.Fatal("unknown capability resolved")
 	}
 	if _, ok := snap.ResolveEgress(&MatchInput{}); ok {
@@ -211,7 +214,7 @@ func TestEgressResolvesOnlyLiveCapabilities(t *testing.T) {
 	// A quarantined generation has no live processor, so a capability
 	// presented against it cannot be genuine.
 	snap.state = ProcessorQuarantined
-	if _, ok := snap.ResolveEgress(&MatchInput{InUser: "module-up-1"}); ok {
+	if _, ok := snap.ResolveEgress((egressProbe("module-up-1"))); ok {
 		t.Fatal("capability resolved against a quarantined generation")
 	}
 }
@@ -224,11 +227,20 @@ func TestStagedCapabilitiesAreNotUsable(t *testing.T) {
 		t.Fatalf("stage: %v", err)
 	}
 	snap := mgr.Snapshot()
-	if _, ok := snap.ResolveEgress(&MatchInput{InUser: "module-up-1"}); ok {
+	if _, ok := snap.ResolveEgress((egressProbe("module-up-1"))); ok {
 		t.Fatal("a staged capability was usable before commit")
 	}
 	if snap.MatchClient(&MatchInput{Host: "www.bilibili.com", DstPort: 443, Network: NetworkTCP}).Matched {
 		t.Fatal("a staged client rule matched before commit")
+	}
+}
+
+// egressProbe is a request that a correctly-formed capability should authorize:
+// right listener, permitted destination, permitted port.
+func egressProbe(user string) *MatchInput {
+	return &MatchInput{
+		InUser: user, InName: "intercept-egress",
+		Host: "www.bilibili.com", DstPort: 443, Network: NetworkTCP,
 	}
 }
 
@@ -501,7 +513,10 @@ func TestTransitionModeControlsDraining(t *testing.T) {
 			g2 := testDocument("g2")
 			g2.ParentGenerationID = "g1"
 			g2.TransitionMode = tc.mode
-			g2.Egress.Capabilities = []EgressCapability{{ID: "module-up-2", Group: "Proxies"}}
+			g2.Egress.Capabilities = []EgressCapability{{
+				ID: "module-up-2", Listener: "intercept-egress", Group: "Proxies",
+				Destinations: []DestinationRule{{Kind: SelectorDomainSuffix, Value: "bilibili.com"}},
+			}}
 			if _, err := m.Stage(g2); err != nil {
 				t.Fatalf("stage g2: %v", err)
 			}
@@ -510,12 +525,12 @@ func TestTransitionModeControlsDraining(t *testing.T) {
 				t.Fatalf("commit g2: %v", err)
 			}
 
-			_, live := m.Snapshot().ResolveEgress(&MatchInput{InUser: "module-up-1"})
+			_, live := m.Snapshot().ResolveEgress((egressProbe("module-up-1")))
 			if live != tc.stillLive {
 				t.Fatalf("old capability live = %v, want %v", live, tc.stillLive)
 			}
 			// The new generation's own capability must resolve either way.
-			if _, ok := m.Snapshot().ResolveEgress(&MatchInput{InUser: "module-up-2"}); !ok {
+			if _, ok := m.Snapshot().ResolveEgress((egressProbe("module-up-2"))); !ok {
 				t.Fatal("new capability did not resolve")
 			}
 		})
@@ -699,5 +714,90 @@ func TestReadbackDistinguishesNeverReadyFromExpired(t *testing.T) {
 	}
 	if rb.ProcessorState != ProcessorNotReady {
 		t.Fatalf("processorState = %q, want not-ready", rb.ProcessorState)
+	}
+}
+
+// A capability constrains endpoint and egress, not egress alone. The rules it
+// replaces were per-destination and per-port with everything else falling to a
+// deny terminator, so a capability that authorized a group for any destination
+// would grant a compromised processor strictly more than it had before.
+func TestCapabilityConstrainsTheDestination(t *testing.T) {
+	c := mustCompile(t, testDocument("g1"))
+	snap := EmptySnapshot("boot", "inst")
+	snap.active = c
+	snap.state = ProcessorReady
+
+	permitted := &MatchInput{
+		InUser: "module-up-1", InName: "intercept-egress",
+		Host: "www.bilibili.com", DstPort: 443, Network: NetworkTCP,
+	}
+	if _, ok := snap.ResolveEgress(permitted); !ok {
+		t.Fatal("a permitted destination was refused")
+	}
+
+	for name, probe := range map[string]*MatchInput{
+		"destination outside the allowlist": {
+			InUser: "module-up-1", InName: "intercept-egress",
+			Host: "unrelated.test", DstPort: 443, Network: NetworkTCP,
+		},
+		"permitted host on an unlisted port": {
+			InUser: "module-up-1", InName: "intercept-egress",
+			Host: "www.bilibili.com", DstPort: 8080, Network: NetworkTCP,
+		},
+		"no destination at all": {
+			InUser: "module-up-1", InName: "intercept-egress", Network: NetworkTCP,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := snap.ResolveEgress(probe); ok {
+				t.Fatal("the capability authorized a destination outside its allowlist")
+			}
+		})
+	}
+}
+
+// The egress stage is evaluated before the client stage, so a capability
+// honoured on an ordinary inbound would let a client skip client matching
+// entirely by authenticating with the credential.
+func TestCapabilityIsBoundToItsListener(t *testing.T) {
+	c := mustCompile(t, testDocument("g1"))
+	snap := EmptySnapshot("boot", "inst")
+	snap.active = c
+	snap.state = ProcessorReady
+
+	wrongListener := &MatchInput{
+		InUser: "module-up-1", InName: "client-in",
+		Host: "www.bilibili.com", DstPort: 443, Network: NetworkTCP,
+	}
+	if _, ok := snap.ResolveEgress(wrongListener); ok {
+		t.Fatal("a capability was honoured on an inbound it is not bound to")
+	}
+}
+
+// A capability with an empty allowlist authorizes nothing, so accepting the
+// document would publish a capability that can never be used — fail at
+// validation instead of at every dial.
+func TestCapabilityWithNoDestinationsIsRejected(t *testing.T) {
+	d := testDocument("g1")
+	d.Egress.Capabilities[0].Destinations = nil
+	if err := d.Validate(DefaultQuotas()); err == nil {
+		t.Fatal("a capability with an empty destination allowlist was accepted")
+	}
+	d = testDocument("g1")
+	d.Egress.Capabilities[0].Listener = ""
+	if err := d.Validate(DefaultQuotas()); err == nil {
+		t.Fatal("a capability with no listener was accepted")
+	}
+}
+
+// The destination allowlist is part of the authorization, so a change to it
+// must be a different generation.
+func TestDestinationAllowlistIsInTheDigest(t *testing.T) {
+	a := testDocument("g1")
+	b := testDocument("g1")
+	b.Egress.Capabilities[0].Destinations = append(b.Egress.Capabilities[0].Destinations,
+		DestinationRule{Kind: SelectorDomain, Value: "extra.test"})
+	if ComputeDigests(a).Projection == ComputeDigests(b).Projection {
+		t.Fatal("widening the destination allowlist did not change the digest")
 	}
 }

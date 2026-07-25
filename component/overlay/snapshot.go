@@ -168,18 +168,20 @@ type EgressResolution struct {
 
 // ResolveEgress evaluates the egress anchor.
 //
-// It accepts a capability only from the active generation or from an explicitly
-// draining one. A prepared capability is rejected, which is what makes "prepare"
-// safe to call speculatively. An unknown capability returns false and the
-// request continues to the fixed egress reject terminator that must sit
-// immediately after the anchor; it never continues into the client stage or the
-// operator's rules.
+// Three things must hold together: the capability belongs to the active or an
+// explicitly draining generation, it was presented on the processor's own
+// listener, and it covers the requested endpoint. A prepared capability is
+// rejected, which is what makes "prepare" safe to call speculatively.
+//
+// Any failure returns false and the request continues to the fixed egress
+// reject terminator that must sit immediately after the anchor; it never
+// continues into the client stage or the operator's rules.
 func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 	if in.InUser == "" {
 		return EgressResolution{}, false
 	}
 	if s.active != nil {
-		if c, ok := s.active.Egress.Lookup(in.InUser); ok {
+		if c, ok := s.active.Egress.authorize(in); ok {
 			// A quarantined or not-ready generation has no live processor, so a
 			// capability presented against it cannot be genuine.
 			if !s.state.Serviceable() {
@@ -193,7 +195,7 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 		if now.After(d.deadline) {
 			continue
 		}
-		if c, ok := d.compiled.Egress.Lookup(in.InUser); ok {
+		if c, ok := d.compiled.Egress.authorize(in); ok {
 			return s.resolution(d.compiled, c, true), true
 		}
 	}

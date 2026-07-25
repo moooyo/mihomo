@@ -170,9 +170,31 @@ func (c *CompiledClient) Match(in *MatchInput) ClientDecision {
 	return ClientDecision{}
 }
 
+// compiledCapability is one capability with its destination allowlist reduced
+// to matchers.
+type compiledCapability struct {
+	capability   EgressCapability
+	destinations []compiledRule
+}
+
+// permits reports whether this capability authorizes the requested endpoint.
+//
+// The allowlist is the endpoint half of "a capability constrains endpoint and
+// egress". Without it a capability would authorize the operator's egress group
+// for any destination at all, which is strictly more than the per-destination
+// rules it replaces granted.
+func (c *compiledCapability) permits(in *MatchInput) bool {
+	for i := range c.destinations {
+		if c.destinations[i].matches(in) {
+			return true
+		}
+	}
+	return false
+}
+
 // CompiledEgress is the immutable capability table of one generation.
 type CompiledEgress struct {
-	byID map[string]EgressCapability
+	byID map[string]*compiledCapability
 }
 
 // Lookup resolves an opaque capability. A capability that is not in the table
@@ -183,7 +205,33 @@ func (e *CompiledEgress) Lookup(id string) (EgressCapability, bool) {
 		return EgressCapability{}, false
 	}
 	c, ok := e.byID[id]
-	return c, ok
+	if !ok {
+		return EgressCapability{}, false
+	}
+	return c.capability, true
+}
+
+// authorize resolves a capability and checks it against the request. It returns
+// false when the capability is unknown, is presented on the wrong listener, or
+// does not cover the requested endpoint.
+func (e *CompiledEgress) authorize(in *MatchInput) (EgressCapability, bool) {
+	if e == nil || in.InUser == "" {
+		return EgressCapability{}, false
+	}
+	c, ok := e.byID[in.InUser]
+	if !ok {
+		return EgressCapability{}, false
+	}
+	// The egress stage sits before the client stage. Honouring a capability
+	// presented on any other inbound would let an ordinary client skip client
+	// matching entirely by authenticating with the credential.
+	if c.capability.Listener != "" && c.capability.Listener != in.InName {
+		return EgressCapability{}, false
+	}
+	if !c.permits(in) {
+		return EgressCapability{}, false
+	}
+	return c.capability, true
 }
 
 // IDs returns the capability identifiers, for readback and for wiring the
@@ -266,9 +314,25 @@ func Compile(d *Document, q Quotas, processorProxies map[string]string) (*Compil
 		rules = append(rules, cr)
 	}
 
-	byID := make(map[string]EgressCapability, len(d.Egress.Capabilities))
+	byID := make(map[string]*compiledCapability, len(d.Egress.Capabilities))
 	for _, c := range d.Egress.Capabilities {
-		byID[c.ID] = c
+		compiledDests := make([]compiledRule, 0, len(c.Destinations))
+		for j, dest := range c.Destinations {
+			cr := compiledRule{kind: dest.Kind, ports: append([]PortRange(nil), dest.Ports...)}
+			if dest.Kind == SelectorIPCIDR {
+				p, err := netip.ParsePrefix(dest.Value)
+				if err != nil {
+					return nil, fmt.Errorf("%w: capability %q destination %d has an unparsable prefix %q: %s",
+						ErrInvalidDocument, c.ID, j, dest.Value, err)
+				}
+				cr.prefix = p.Masked()
+			} else {
+				cr.value = strings.ToLower(dest.Value)
+				cr.dotSuffix = "." + cr.value
+			}
+			compiledDests = append(compiledDests, cr)
+		}
+		byID[c.ID] = &compiledCapability{capability: c, destinations: compiledDests}
 	}
 
 	profiles := make(map[string]ResolverProfile, len(d.ResolverProfiles))

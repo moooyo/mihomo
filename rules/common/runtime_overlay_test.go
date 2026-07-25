@@ -20,9 +20,13 @@ func buildSnapshot(t *testing.T, ready bool) *overlay.Holder {
 			{Kind: overlay.SelectorDomain, Value: "capture.test", Action: overlay.ActionCapture, Processor: "p"},
 			{Kind: overlay.SelectorDomain, Value: "deny.test", Action: overlay.ActionReject},
 		}},
-		Egress: overlay.EgressOverlay{Capabilities: []overlay.EgressCapability{
-			{ID: "cap-1", Group: "Proxies"},
-		}},
+		Egress: overlay.EgressOverlay{Capabilities: []overlay.EgressCapability{{
+			ID: "cap-1", Listener: "intercept-egress", Group: "Proxies",
+			Destinations: []overlay.DestinationRule{
+				{Kind: overlay.SelectorDomain, Value: "origin.test",
+					Ports: []overlay.PortRange{{From: 443, To: 443}}},
+			},
+		}}},
 	}
 	store, err := overlay.OpenStore(t.TempDir(), "5gpn")
 	if err != nil {
@@ -118,7 +122,7 @@ func TestEgressAnchorResolvesCapability(t *testing.T) {
 	holder := buildSnapshot(t, true)
 	withBinding(t, &Binding{Owner: "5gpn", Holder: holder, AdapterExists: func(string) bool { return true }})
 
-	metadata := &C.Metadata{Host: "origin.test", NetWork: C.TCP, InName: "intercept-egress", InUser: "cap-1"}
+	metadata := &C.Metadata{Host: "origin.test", DstPort: 443, NetWork: C.TCP, InName: "intercept-egress", InUser: "cap-1"}
 	matched, adapter := anchor(t, "egress").Match(metadata, C.RuleMatchHelper{})
 	if !matched || adapter != "Proxies" {
 		t.Fatalf("matched=%v adapter=%q", matched, adapter)
@@ -136,7 +140,7 @@ func TestEgressAnchorDoesNotMatchUnknownCapability(t *testing.T) {
 	withBinding(t, &Binding{Owner: "5gpn", Holder: holder, AdapterExists: func(string) bool { return true }})
 
 	matched, _ := anchor(t, "egress").Match(
-		&C.Metadata{NetWork: C.TCP, InName: "intercept-egress", InUser: "forged"}, C.RuleMatchHelper{})
+		&C.Metadata{Host: "origin.test", DstPort: 443, NetWork: C.TCP, InName: "intercept-egress", InUser: "forged"}, C.RuleMatchHelper{})
 	if matched {
 		t.Fatal("a forged capability matched the egress anchor")
 	}
@@ -149,7 +153,7 @@ func TestEgressAnchorFailsClosedWhenGroupIsGone(t *testing.T) {
 	withBinding(t, &Binding{Owner: "5gpn", Holder: holder, AdapterExists: func(string) bool { return false }})
 
 	matched, adapter := anchor(t, "egress").Match(
-		&C.Metadata{NetWork: C.TCP, InName: "intercept-egress", InUser: "cap-1"}, C.RuleMatchHelper{})
+		&C.Metadata{Host: "origin.test", DstPort: 443, NetWork: C.TCP, InName: "intercept-egress", InUser: "cap-1"}, C.RuleMatchHelper{})
 	if !matched || adapter != "REJECT" {
 		t.Fatalf("matched=%v adapter=%q, want a REJECT", matched, adapter)
 	}
@@ -166,7 +170,7 @@ func TestQuarantinedGenerationDeniesCaptureAndEgress(t *testing.T) {
 		t.Fatalf("capture: matched=%v adapter=%q, want a REJECT", matched, adapter)
 	}
 	if m, _ := anchor(t, "egress").Match(
-		&C.Metadata{NetWork: C.TCP, InUser: "cap-1"}, C.RuleMatchHelper{}); m {
+		&C.Metadata{Host: "origin.test", DstPort: 443, NetWork: C.TCP, InName: "intercept-egress", InUser: "cap-1"}, C.RuleMatchHelper{}); m {
 		t.Fatal("a capability resolved against a generation with no ready processor")
 	}
 }
@@ -191,7 +195,7 @@ func TestAnchorWithForeignOwnerIsInert(t *testing.T) {
 func TestAnchorWithoutBindingIsInert(t *testing.T) {
 	withBinding(t, nil)
 	for _, stage := range []string{"client", "egress"} {
-		if m, _ := anchor(t, stage).Match(&C.Metadata{Host: "capture.test", InUser: "cap-1", NetWork: C.TCP}, C.RuleMatchHelper{}); m {
+		if m, _ := anchor(t, stage).Match(&C.Metadata{Host: "capture.test", DstPort: 443, InName: "intercept-egress", InUser: "cap-1", NetWork: C.TCP}, C.RuleMatchHelper{}); m {
 			t.Fatalf("%s anchor matched with no overlay bound", stage)
 		}
 	}

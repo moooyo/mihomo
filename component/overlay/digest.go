@@ -114,10 +114,21 @@ func (c *canonical) writeProjection(d *Document) {
 	c.list(len(d.Egress.Capabilities))
 	for _, cap := range d.Egress.Capabilities {
 		c.str(cap.ID)
+		c.str(cap.Listener)
 		c.str(cap.Group)
 		c.boolean(cap.AllowDirect)
 		c.boolean(cap.PublicOnly)
 		c.str(cap.ResolverProfile)
+		c.list(len(cap.Destinations))
+		for _, d := range cap.Destinations {
+			c.str(string(d.Kind))
+			c.str(d.Value)
+			c.list(len(d.Ports))
+			for _, p := range d.Ports {
+				c.uint(uint64(p.From))
+				c.uint(uint64(p.To))
+			}
+		}
 		c.str(cap.Owner)
 	}
 
@@ -183,10 +194,21 @@ func CapabilitySetDigest(caps []EgressCapability) string {
 	c.list(len(caps))
 	for _, cap := range caps {
 		c.str(cap.ID)
+		c.str(cap.Listener)
 		c.str(cap.Group)
 		c.boolean(cap.AllowDirect)
 		c.boolean(cap.PublicOnly)
 		c.str(cap.ResolverProfile)
+		c.list(len(cap.Destinations))
+		for _, d := range cap.Destinations {
+			c.str(string(d.Kind))
+			c.str(d.Value)
+			c.list(len(d.Ports))
+			for _, p := range d.Ports {
+				c.uint(uint64(p.From))
+				c.uint(uint64(p.To))
+			}
+		}
 	}
 	return c.sum()
 }

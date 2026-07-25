@@ -211,16 +211,39 @@ type ClientOverlay struct {
 	Rules []ClientRule `json:"rules"`
 }
 
+// DestinationRule is one entry in a capability's destination allowlist.
+type DestinationRule struct {
+	Kind  SelectorKind `json:"kind"`
+	Value string       `json:"value"`
+	Ports []PortRange  `json:"ports,omitempty"`
+}
+
 // EgressCapability maps one opaque credential onto one fixed egress policy.
 // The processor never names a group; it presents a capability and mihomo
 // resolves it server-side against the generation that issued it.
 type EgressCapability struct {
 	// ID is the opaque credential the processor presents. With the SOCKS5
-	// transport this is the authenticated inbound username.
+	// transport this is the authenticated inbound username, so it must be
+	// exactly the credential the processor listener authenticates — a
+	// capability the processor cannot present authorizes nothing.
 	ID string `json:"id"`
+	// Listener is the inbound the capability is valid on. A capability
+	// presented anywhere else is refused: the egress stage sits before the
+	// client stage, so accepting one on an ordinary inbound would let a client
+	// skip client matching entirely.
+	Listener string `json:"listener"`
 	// Group is the operator-selected proxy group or outbound this capability
 	// resolves to.
 	Group string `json:"group"`
+	// Destinations is the allowlist of endpoints this capability may reach.
+	//
+	// A capability constrains endpoint and egress, not egress alone. The rules
+	// it replaces were per-destination and per-port, with everything else
+	// falling to a deny terminator; authorizing a group without constraining
+	// the destination would let a compromised processor reach anything at all
+	// through the operator's egress. An empty list therefore authorizes
+	// nothing.
+	Destinations []DestinationRule `json:"destinations"`
 	// AllowDirect permits the resolved leaf to be DIRECT. When false a
 	// generation whose group resolves to DIRECT fails closed instead.
 	AllowDirect bool `json:"allowDirect"`
@@ -267,15 +290,20 @@ type Quotas struct {
 	MaxCapabilities     int `json:"maxCapabilities"`
 	MaxProcessorTargets int `json:"maxProcessorTargets"`
 	MaxResolverProfiles int `json:"maxResolverProfiles"`
+	// MaxCapabilityDestinations bounds one capability's allowlist. It is large
+	// because the allowlist mirrors the processor's whole capture set, which on
+	// a real deployment is in the hundreds.
+	MaxCapabilityDestinations int `json:"maxCapabilityDestinations"`
 }
 
 // DefaultQuotas are the fork's fixed limits.
 func DefaultQuotas() Quotas {
 	return Quotas{
-		MaxClientRules:      4096,
-		MaxCapabilities:     64,
-		MaxProcessorTargets: 8,
-		MaxResolverProfiles: 8,
+		MaxClientRules:            4096,
+		MaxCapabilities:           64,
+		MaxProcessorTargets:       8,
+		MaxResolverProfiles:       8,
+		MaxCapabilityDestinations: 4096,
 	}
 }
 
@@ -436,6 +464,26 @@ func (d *Document) Validate(q Quotas) error {
 		seen[c.ID] = struct{}{}
 		if c.Group == "" {
 			return fmt.Errorf("%w: egress.capabilities[%d] (%s) has no group", ErrInvalidDocument, i, c.ID)
+		}
+		if c.Listener == "" {
+			return fmt.Errorf("%w: egress.capabilities[%d] (%s) names no listener", ErrInvalidDocument, i, c.ID)
+		}
+		if len(c.Destinations) == 0 {
+			// Fail closed rather than treat "no allowlist" as "everything".
+			return fmt.Errorf("%w: egress.capabilities[%d] (%s) has an empty destination allowlist, which authorizes nothing; omit the capability instead",
+				ErrInvalidDocument, i, c.ID)
+		}
+		if len(c.Destinations) > q.MaxCapabilityDestinations {
+			return fmt.Errorf("%w: egress.capabilities[%d] (%s) lists %d destinations, the limit is %d",
+				ErrQuotaExceeded, i, c.ID, len(c.Destinations), q.MaxCapabilityDestinations)
+		}
+		for j, d := range c.Destinations {
+			if !d.Kind.Valid() || d.Kind == SelectorAny {
+				return fmt.Errorf("%w: egress.capabilities[%d].destinations[%d] has unusable kind %q", ErrInvalidDocument, i, j, d.Kind)
+			}
+			if d.Value == "" {
+				return fmt.Errorf("%w: egress.capabilities[%d].destinations[%d] has an empty value", ErrInvalidDocument, i, j)
+			}
 		}
 		if c.ResolverProfile != "" {
 			if _, ok := profiles[c.ResolverProfile]; !ok {
