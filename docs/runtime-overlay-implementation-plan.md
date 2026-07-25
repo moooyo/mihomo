@@ -211,14 +211,49 @@ the gap is explicit rather than discovered later.
   increment validates the resolved scopes and pins DIRECT; every other adapter is
   rejected for `public-only` rather than silently trusted.
 - **Option C** in its entirety.
-- **Shadow-compile semantic comparison** between the legacy renderer and the
-  overlay. The legacy driver is retained and the migration is documented, but the
-  automated differential is not built.
+- **Processor-side generation polling.** The processor never reads the
+  generation socket. Readiness is instead asserted by the coordinator, which
+  first reads the sidecar's own view of which bundle it has live — see
+  "Who attests readiness" below for why that is the arrangement rather than a
+  shortcut. The generation socket is served and peer-restricted, and nothing
+  connects to it.
+- **Explicit peer-uid check on the sidecar's own control socket.** Reachability
+  is currently bounded by the filesystem: a 0750 RuntimeDirectory owned by the
+  processor's group and a 0660 socket, which admits exactly the coordinator and
+  the sidecar itself. Narrowing it further to a uid needs the installer to
+  render the uid into the unit, which the unit-integrity check pins by exact
+  `ExecStart` line.
 - **Geo database updates as a revision-bearing event.** `POST /configs/geo` and
   the background updater change what `GEOIP`/`GEOSITE` rules match with no lock
   and no revision bump. Overlay client rules deliberately do not support geo
   selectors, so the overlay's own matching is unaffected; the operator rules
   below the client anchor are not covered.
+
+## Who attests readiness
+
+The core fails capture closed unless the processor holds a current lease, and a
+restart leaves the recovered generation quarantined until one arrives. So
+something must renew it every few seconds or capture stops working entirely.
+
+It is not the processor. Its socket is read-only by design, because a
+compromised processor able to register its own readiness could claim to be
+serving a generation it is not — which is the assertion the lease exists to make
+trustworthy. Registration lives on the control socket, which only the
+coordinator may reach.
+
+So the coordinator attests, and earns the right to by reading the sidecar's own
+`/state` first and comparing the bundle it reports live against the one the
+active generation was compiled against. If the sidecar is unreachable, or
+serving something else, nothing is sent and the lease is allowed to lapse.
+Letting it lapse is the honest outcome: the coordinator does not know the
+processor is ready, and capture rejecting is what "not known to be ready" has to
+mean.
+
+This required the readback to carry the active generation's own digests. It
+previously reported only what the last attestation had claimed, so a coordinator
+following it would send back whatever it had already sent and could never
+converge.
+
 
 ## Verification
 
@@ -239,6 +274,36 @@ The 14.1 items that map onto automated tests in this increment:
 - drain deadline expiry revokes; hard revoke closes established sessions;
 - resolver epoch advances on profile change and no pre-commit answer survives;
 - authenticated UDP association and revocation.
+
+### Verified against real traffic
+
+`5gpn/test/overlay/verify-live.sh`, 20/20 on the test gateway. Every check
+drives traffic through it and reads what the data plane did, rather than
+asserting against a model of it.
+
+The migration converted that gateway's rendered config in place: 502 capture,
+504 egress and 323 policy rules removed, 1353 rules down to 25. Two panel allow
+rules were requalified because the core's bypass check refused them — correctly
+— as a path processor-originated traffic could take to the management plane
+without meeting an anchor.
+
+What the live run establishes that no unit test can:
+
+- a captured host resolves through `RuntimeOverlayClient` and is steered at the
+  processor, and the processor's onward connection resolves through
+  `RuntimeOverlayEgress`, with neither rule present anywhere in the config file;
+- an uncaptured host matches the operator's own terminal `MATCH` and is
+  untouched;
+- with the processor stopped, the lease is reported expired, the processor
+  not-ready, a captured host is refused at the handshake, and an uncaptured host
+  still returns 200 — the failure is scoped to capture rather than general;
+- readiness returns on its own when the processor comes back;
+- the operator's config digest is unchanged through all of it, including across
+  two routing changes that would each have rewritten 1300+ rules under the
+  legacy driver;
+- every mutating verb against the read-only controller routes returns 405, and
+  a process that is not the coordinator is refused by the control socket.
+
 
 ## Work breakdown
 
@@ -274,36 +339,62 @@ unless the row says otherwise.
 | 2 | anchor rule type, parser, denylists | mihomo | done |
 | 3 | closure validator, processor exclusion, core revision | mihomo | done |
 | 4 | executor gate, recovery, apply lock, atomic mode | mihomo | done |
-| 5 | control + generation sockets, peer verification | mihomo | done |
+| 5 | control + generation sockets, peer verification | mihomo | done — one peer policy and one owning group per socket |
 | 6 | controller guards (`rules/disable`, `patchConfigs`) | mihomo | done |
 | 7 | tracker generation identity + revocation | mihomo | done |
 | 8 | authenticated SOCKS5 UDP associations | mihomo | done |
 | 9 | resolver cache epoch | mihomo | done |
 | 10 | tests (unit + live) | mihomo | done |
 | 11 | operation journal, generation/bundle IDs | 5gpn | done |
-| 12 | overlay driver beside the legacy YAML driver | 5gpn | done — legacy remains the default |
+| 12 | overlay driver beside the legacy YAML driver | 5gpn | done — **the overlay is now the installed default**; legacy is the fallback for a core that cannot resolve the anchors |
 | 13 | prepare/commit/readback/roll-forward recovery | 5gpn | done |
-| 14 | panel guard requalification | 5gpn | done |
-| 15 | processor generation polling and transaction binding | 5gpn-intercept | done |
+| 14 | panel guard requalification | 5gpn | done — plus a migration for boxes installed before it |
+| 15 | processor generation polling and transaction binding | 5gpn-intercept | **not built** — readiness is attested by the coordinator instead; see "Who attests readiness" |
 | 16 | notification XSS, WebSocket token | zashboard | done |
 | 17 | capability discovery with four states | zashboard | done |
-| 18 | overlay status panel | zashboard | done |
+| 18 | overlay status panel | zashboard | done — needs the read-only controller routes below to have anything to render |
+
+Added after the first increment, all of it found by deploying rather than by
+reading:
+
+| # | Item | Repo | State |
+| --- | --- | --- | --- |
+| 19 | per-socket peer policy, and per-socket owning group | mihomo | done — one shared policy could not admit a coordinator and a processor running as different users without admitting both to both |
+| 20 | readback reports lease and processor state as the data plane sees them | mihomo | done — both had said "ready" while capture was already being refused |
+| 21 | read-only overlay views on the external controller | mihomo | done — the console had no way to see what the gateway was enforcing |
+| 22 | seed anchors, `runtime-overlay:` block, processor declaration | 5gpn | done — emitted only after `mihomo -t` proves the installed core parses them |
+| 23 | socket groups, `RuntimeDirectory`, `StateDirectory` for the journal | 5gpn | done |
+| 24 | coordinator readiness heartbeat | 5gpn | done — without it every capture rule rejects within the lease TTL |
+| 25 | in-place migration of a rendered config | 5gpn | done — `test/overlay/migrate-to-anchored.py` |
+| 26 | live real-traffic verification | 5gpn | done — `test/overlay/verify-live.sh`, 20/20 |
+| 27 | published typed policy projection and digest | 5gpn-extensions | done — the gateway checks its own Go compile against it |
+
 
 Not done, and deliberately so:
 
-- **The legacy driver is still the default.** `overlay_driver.go` is wired and
-  tested but `mutate()` still takes the YAML path. Switching is a persisted,
-  operator-visible migration step, and the review requires shadow comparison
-  first (12.1 step 4), which is not built.
-- **Shadow semantic comparison** between the two drivers.
+- **DNS quarantine cacheable negatives** (6.15) on the 5gpn resolver.
 - **Transport-level pinned-IP dialing.** `Metadata.RemoteAddress()` returns
   `Host` whenever it is set, so DIRECT, HTTP, SOCKS5-out and VMess all forward
   the domain and ignore a populated `DstIP`. A real pin needs a new metadata
   field honoured by each adapter's destination formatting, in the tree's
   highest-churn directory. `public-only` is carried and validated but not yet
   enforced at the transport.
-- **DNS quarantine cacheable negatives** (6.15) on the 5gpn resolver.
 - **Option C** in its entirety.
+
+Two entries that used to sit here have since been done, and are recorded because
+the order mattered:
+
+- **Shadow semantic comparison** between the two drivers. Built as
+  `overlay_shadow_test.go`, run against the test gateway's real
+  `/etc/5gpn/intercept/config.json` rather than fixtures. It immediately found
+  21 of 323 reviewed routing rules that the typed model could not express and
+  was therefore silently dropping — each one a deny or direct decision that
+  would have stopped being enforced. Fixtures would not have found it; that rule
+  shape did not appear in any of them.
+- **Switching the default to the overlay**, which the review makes conditional
+  on that comparison (12.1 step 4). It is now the installed arrangement, gated
+  on the installed core proving it can parse the anchors.
+
 
 ### What live testing caught that unit tests did not
 
@@ -318,3 +409,33 @@ constructs the manager directly.
 
 That is why `test/overlay` exists and why section 13.1 makes the bypass matrix a
 merge gate rather than a one-time check.
+
+### What deploying caught that live testing did not
+
+Running the arrangement on a real gateway, with two separate service users and
+systemd's sandboxing, found a further class again: everything that was correct
+in a single-user, unsandboxed test and impossible in production.
+
+- Both sockets shared one peer policy. With the coordinator and the processor
+  running as different users, the only configuration admitting both admits both
+  to *both* sockets — handing the processor exactly the reach the two-socket
+  split exists to deny.
+- The sockets were 0600 in a 0700 directory owned by the core's user, so no
+  other user could open them. A peer that cannot connect is a peer the
+  SO_PEERCRED check never gets to authorise. Fixing that then exposed a second
+  conflation: "who may connect" and "which group owns the file" are different
+  questions, and using the peer's primary group for both would have required
+  granting the core membership of it.
+- `ProtectSystem=strict` left `/var/lib` read-only, so the journal write failed
+  and the gateway fell back to rendering the config. It did so correctly and
+  logged why — which is how this was found rather than mistaken for the overlay
+  working.
+- Nothing renewed the readiness lease, so capture would have begun rejecting
+  within its TTL on any deployment that got that far.
+- The readback reported the lease valid and the processor ready while a captured
+  host was already being refused at the handshake.
+
+None of these are reachable without an install: they are properties of unit
+files, service accounts and filesystem modes, not of the code paths a test can
+construct.
+
