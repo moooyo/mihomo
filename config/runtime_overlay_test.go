@@ -322,3 +322,48 @@ func mustTunnels(t *testing.T, lines ...string) []LC.Tunnel {
 	}
 	return out
 }
+
+// The operator's console rule cannot simply move below the terminator — it has
+// to stay above the loopback deny — so the guard has to accept the negative
+// inbound qualifier the review prescribes.
+func TestQualifiedAllowRuleBeforeEgressAnchorIsAccepted(t *testing.T) {
+	lines := []string{
+		"AND,((NOT,((IN-NAME,intercept-egress))),(DOMAIN,console.example.test)),DIRECT",
+		anchorEgress,
+		terminator,
+		anchorClient,
+		"MATCH,Proxies",
+	}
+	if _, err := findAnchorLayout(rulesFrom(t, lines...)); err != nil {
+		t.Fatalf("a correctly qualified allow rule was rejected: %v", err)
+	}
+}
+
+// A qualifier that names a different listener leaves the processor's own
+// listener reachable, so it must not be accepted.
+func TestQualifierMustNameTheProcessorListener(t *testing.T) {
+	lines := []string{
+		"AND,((NOT,((IN-NAME,some-other-listener))),(DOMAIN,console.example.test)),DIRECT",
+		anchorEgress,
+		terminator,
+		anchorClient,
+		"MATCH,Proxies",
+	}
+	if _, err := findAnchorLayout(rulesFrom(t, lines...)); !errors.Is(err, overlay.ErrAnchorInvalid) {
+		t.Fatalf("a qualifier naming the wrong listener was accepted: %v", err)
+	}
+}
+
+// An OR is not a qualifier: one excluded branch says nothing about the others.
+func TestOrIsNotAcceptedAsAQualifier(t *testing.T) {
+	lines := []string{
+		"OR,((NOT,((IN-NAME,intercept-egress))),(DOMAIN,console.example.test)),DIRECT",
+		anchorEgress,
+		terminator,
+		anchorClient,
+		"MATCH,Proxies",
+	}
+	if _, err := findAnchorLayout(rulesFrom(t, lines...)); !errors.Is(err, overlay.ErrAnchorInvalid) {
+		t.Fatalf("an OR was accepted as an exclusion qualifier: %v", err)
+	}
+}

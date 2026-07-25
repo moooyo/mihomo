@@ -9,6 +9,7 @@ import (
 	"github.com/metacubex/mihomo/component/overlay"
 	C "github.com/metacubex/mihomo/constant"
 	RC "github.com/metacubex/mihomo/rules/common"
+	"github.com/metacubex/mihomo/rules/logic"
 	T "github.com/metacubex/mihomo/tunnel"
 )
 
@@ -67,13 +68,10 @@ func isDenyAdapter(name string) bool {
 //	RUNTIME-OVERLAY,<owner>,client
 //	<operator rules and terminal MATCH>
 //
-// "Deny-only" before the egress anchor is stricter than the review's "deny or
-// qualified so it cannot match processor traffic". The stricter form is chosen
-// because the weaker one is not decidable: a rule matching on an arbitrary
-// hostname cannot be proven unreachable by processor traffic without
-// enumerating hostnames. An operator whose allow rule must stay simply moves it
-// below the terminator, where the terminator already denies processor traffic
-// to it — which is the fix the review asks for anyway.
+// Every rule before the egress anchor must be a deny, or must carry the
+// negative inbound qualifier excludesProcessorTraffic recognises. Both halves
+// are needed: an operator's console rule often has to stay above the loopback
+// deny and therefore cannot simply be moved below the terminator.
 func findAnchorLayout(rules []C.Rule) (anchorLayout, error) {
 	var layout anchorLayout
 	egressIdx, clientIdx := -1, -1
@@ -129,24 +127,98 @@ func findAnchorLayout(rules []C.Rule) (anchorLayout, error) {
 	layout.EgressListeners = strings.Split(term.Payload(), "/")
 
 	for i := 0; i < egressIdx; i++ {
-		if !isDenyAdapter(unwrapRule(rules[i]).Adapter()) {
-			return layout, fmt.Errorf("%w: rule %d (%s -> %s) precedes the egress anchor but is not a deny rule; "+
-				"a processor-originated connection would reach it without ever meeting the anchor. Move it below the IN-NAME terminator",
-				overlay.ErrAnchorInvalid, i, unwrapRule(rules[i]).RuleType(), unwrapRule(rules[i]).Adapter())
+		if isDenyAdapter(unwrapRule(rules[i]).Adapter()) {
+			continue
 		}
+		if excludesProcessorTraffic(unwrapRule(rules[i]), layout.EgressListeners) {
+			continue
+		}
+		return layout, fmt.Errorf("%w: rule %d (%s -> %s) precedes the egress anchor but is neither a deny rule nor qualified against %v; "+
+			"a processor-originated connection would reach it without ever meeting the anchor. Either move it below the IN-NAME terminator, "+
+			"or wrap it as AND,((NOT,((IN-NAME,%s))),(<original matcher>)),<target>",
+			overlay.ErrAnchorInvalid, i, unwrapRule(rules[i]).RuleType(), unwrapRule(rules[i]).Adapter(),
+			layout.EgressListeners, strings.Join(layout.EgressListeners, "/"))
 	}
 	for i := egressIdx + 2; i < clientIdx; i++ {
-		if !isDenyAdapter(unwrapRule(rules[i]).Adapter()) {
-			return layout, fmt.Errorf("%w: rule %d (%s -> %s) sits between the egress terminator and the client anchor; "+
-				"only deny system guards may occupy that slot",
-				overlay.ErrAnchorInvalid, i, unwrapRule(rules[i]).RuleType(), unwrapRule(rules[i]).Adapter())
+		if isDenyAdapter(unwrapRule(rules[i]).Adapter()) {
+			continue
 		}
+		if excludesProcessorTraffic(unwrapRule(rules[i]), layout.EgressListeners) {
+			continue
+		}
+		return layout, fmt.Errorf("%w: rule %d (%s -> %s) sits between the egress terminator and the client anchor; "+
+			"only deny system guards, or rules qualified against %v, may occupy that slot",
+			overlay.ErrAnchorInvalid, i, unwrapRule(rules[i]).RuleType(), unwrapRule(rules[i]).Adapter(), layout.EgressListeners)
 	}
 
 	layout.EgressIndex = egressIdx
 	layout.ClientIndex = clientIdx
 	layout.Present = true
 	return layout, nil
+}
+
+// excludesProcessorTraffic reports whether a rule structurally cannot match a
+// connection arriving on one of the processor's own listeners.
+//
+// This exists because "every rule before the egress anchor must be a deny" is
+// too strict to be usable: the operator's own console rule has to precede the
+// loopback deny, so it cannot simply be moved below the terminator. The review's
+// answer is a negative inbound qualifier, and this recognises exactly that one
+// form:
+//
+//	AND,((NOT,((IN-NAME,<processor listener>))),(<original matcher>)),<target>
+//
+// Recognition is structural rather than behavioural on purpose. "This rule can
+// never match processor traffic" is not decidable in general — a rule matching
+// on an arbitrary hostname cannot be proven unreachable without enumerating
+// hostnames — so the guard accepts one explicit, auditable shape instead of
+// attempting to infer safety.
+func excludesProcessorTraffic(rule C.Rule, listeners []string) bool {
+	if len(listeners) == 0 {
+		return false
+	}
+	expr, ok := rule.(*logic.Logic)
+	if !ok {
+		return false
+	}
+	switch expr.RuleType() {
+	case C.NOT:
+		return negatesInName(expr, listeners)
+	case C.AND:
+		// Any conjunct that excludes the processor excludes the whole rule.
+		for _, child := range expr.Rules() {
+			if sub, ok := child.(*logic.Logic); ok && sub.RuleType() == C.NOT && negatesInName(sub, listeners) {
+				return true
+			}
+		}
+	}
+	// OR is deliberately not accepted: one qualified branch says nothing about
+	// the others, so an OR can still be reachable by processor traffic.
+	return false
+}
+
+// negatesInName reports whether a NOT expression negates an IN-NAME covering
+// every listener the terminator denies. Covering only some of them would leave
+// the others reachable.
+func negatesInName(expr *logic.Logic, listeners []string) bool {
+	children := expr.Rules()
+	if len(children) != 1 {
+		return false
+	}
+	inName := children[0]
+	if inName.RuleType() != C.InName {
+		return false
+	}
+	named := make(map[string]struct{})
+	for _, n := range strings.Split(inName.Payload(), "/") {
+		named[strings.TrimSpace(n)] = struct{}{}
+	}
+	for _, want := range listeners {
+		if _, ok := named[strings.TrimSpace(want)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // validateRuntimeOverlay enforces the anchor layout and the bypass closure.

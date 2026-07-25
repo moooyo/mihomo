@@ -261,3 +261,13 @@ func (logic *Logic) ProviderNames() (names []string) {
 }
 
 var _ C.Rule = (*Logic)(nil)
+
+// Rules exposes the child rules of a logic expression.
+//
+// The runtime-overlay anchor validator needs it: a rule that precedes the
+// egress anchor is acceptable when it carries a negative inbound qualifier
+// excluding the processor's own listener, and recognising that requires looking
+// at the expression tree rather than at its rendered payload string.
+func (logic *Logic) Rules() []C.Rule {
+	return logic.rules
+}
