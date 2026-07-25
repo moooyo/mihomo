@@ -29,7 +29,7 @@ an assumption, recorded so it can be overturned rather than silently inherited.
 | 1 | Shared sidecar trusted? | Trusted as a process boundary. Per-plugin workers are out of scope. |
 | 2 | Rule-layer anchors or core pre-routing stage? | Anchors, as 6.2.2 recommends, plus the bypass closure guards that make them enforceable. The matcher representation is kept independent of where it is evaluated. |
 | 3 | Active-state corruption: startup failure or deny guard? | Startup failure for the affected client data plane. The overlay refuses rather than serving an unguarded path. |
-| 4 | Who owns extending the closure? | The closure is one function, `config.overlayClosure`, with a test that fails when a new `RawConfig` field is added and not classified. |
+| 4 | Who owns extending the closure? | The closure is one function, `config.OverlayClosureDigest`, so extending it is a single-site change. There is no test that fails when a new `RawConfig` field goes unclassified — that would be worth adding and is not in this increment. |
 | 7 | Selective or full cache invalidation? | Epoch-keyed, so invalidation is O(1) and selective by construction; no `ClearCache`. |
 | 8 | Graceful vs hard revoke | The coordinator declares `transition_mode` per generation. Permission removal, host removal and master-off must use `revoke`. |
 | 9 | Drain deadlines | TCP 30s, UDP 30s, H1 30s, H2 60s, H3 60s, WebSocket 300s. Encoded in `overlay.DefaultDrainDeadlines`. |
