@@ -90,6 +90,10 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
 	case "RULE-SET":
 		isSrc, noResolve := RC.ParseParams(params)
 		parsed, parseErr = RP.NewRuleSet(payload, target, isSrc, noResolve)
+	case "RUNTIME-OVERLAY":
+		// `RUNTIME-OVERLAY,<owner>,<stage>` — ParseRulePayload's default branch
+		// puts the owner in payload and the stage in target.
+		parsed, parseErr = RC.NewRuntimeOverlay(payload, target, params)
 	case "MATCH":
 		parsed = RC.NewMatch(target)
 		parseErr = nil

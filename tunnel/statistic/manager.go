@@ -58,6 +58,27 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 	})
 }
 
+// CloseMatching closes every tracked connection whose info satisfies pred and
+// returns how many were closed.
+//
+// The iteration is not a consistent snapshot — a connection created while it
+// runs may not be visited — so this bounds how long already-established work
+// survives a policy change; it cannot on its own prove that none does. A caller
+// that needs that guarantee must also reject the same connections at admission.
+func (m *Manager) CloseMatching(pred func(*TrackerInfo) bool) int {
+	closed := 0
+	m.connections.Range(func(key string, value Tracker) bool {
+		info := value.Info()
+		if info == nil || !pred(info) {
+			return true
+		}
+		_ = value.Close()
+		closed++
+		return true
+	})
+	return closed
+}
+
 func (m *Manager) PushUploaded(size int64) {
 	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)

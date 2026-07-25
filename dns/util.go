@@ -45,10 +45,27 @@ func updateTTL(records []D.RR, ttl uint32) {
 	}
 }
 
+// cacheKey namespaces a cache entry by the resolver cache epoch.
+//
+// The epoch is what makes a runtime-overlay commit that changes the resolver
+// profile actually change answers. Without it the previous profile's cached
+// entries keep being served until their TTLs expire, which silently breaks the
+// promise that one snapshot swap is the linearization point — for exactly the
+// decisions the overlay says must be generation-bound.
+//
+// Epoch 0 is the pre-overlay default and keeps the historical key shape, so a
+// deployment with no overlay sees no change at all.
+func cacheKey(epoch uint64, q D.Question) string {
+	if epoch == 0 {
+		return q.String()
+	}
+	return strconv.FormatUint(epoch, 36) + "|" + q.String()
+}
+
 // getMsgFromCache returns a cached dns message if it exists, otherwise returns nil.
 // the returned msg is a copy of the original msg, so it can be modified without affecting the original msg.
-func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
-	msg, expireTime, hit := c.GetWithExpire(q.String())
+func getMsgFromCache(c dnsCache, epoch uint64, q D.Question) (*D.Msg, time.Time, bool) {
+	msg, expireTime, hit := c.GetWithExpire(cacheKey(epoch, q))
 	if msg != nil {
 		msg = msg.Copy() // never modify the original msg
 	}
@@ -57,7 +74,7 @@ func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
 
 // putMsgToCache puts a dns message into the cache.
 // the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
-func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
+func putMsgToCache(c dnsCache, epoch uint64, q D.Question, msg *D.Msg) {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
@@ -83,7 +100,7 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 		return
 	}
 
-	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
+	c.SetWithExpire(cacheKey(epoch, q), msg, time.Now().Add(time.Duration(ttl)*time.Second))
 }
 
 func setMsgTTL(msg *D.Msg, ttl uint32) {

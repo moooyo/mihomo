@@ -57,7 +57,12 @@ var (
 	udpInOnce sync.Once
 
 	// Outbound Rule
-	mode = Rule
+	//
+	// Atomic because it is written from an HTTP handler (PATCH /configs) and
+	// from config apply while resolveMetadata reads it on every connection.
+	// The runtime overlay's "must stay in rule mode" invariant is only
+	// observable if this read is not racy.
+	mode = atomic.NewInt32Enum(Rule)
 
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
@@ -231,6 +236,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
+	publishProxyIndex(newProxies)
 	configMux.Unlock()
 }
 
@@ -249,12 +255,12 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 
 // Mode return current mode
 func Mode() TunnelMode {
-	return mode
+	return mode.Load()
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
-	mode = m
+	mode.Store(m)
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -398,7 +404,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode {
+	switch mode.Load() {
 	case Direct:
 		proxy = proxies["DIRECT"]
 	case Global:
@@ -642,9 +648,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case mode.Load() == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case mode.Load() == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())

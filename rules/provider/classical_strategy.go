@@ -51,7 +51,11 @@ func (c *classicalStrategy) Insert(rule string) {
 func (c *classicalStrategy) payloadToRule(rule string) (C.Rule, error) {
 	tp, payload, target, params := common.ParseRulePayload(rule, false)
 	switch tp {
-	case "MATCH", "RULE-SET", "SUB-RULE":
+	// RUNTIME-OVERLAY matters more here than in the logic denylist: Insert only
+	// log.Warnln's a parse failure, so without this entry a remote rule-set
+	// could inject an anchor into a live provider on every fetch, entirely
+	// outside config validation.
+	case "MATCH", "RULE-SET", "SUB-RULE", "RUNTIME-OVERLAY":
 		return nil, fmt.Errorf("unsupported rule type on classical rule-set: %s", tp)
 	}
 	return c.parse(tp, payload, target, params, nil)

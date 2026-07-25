@@ -79,6 +79,12 @@ func applyRoute(cfg *config.Config) {
 			AllowOrigins:        cfg.Controller.Cors.AllowOrigins,
 			AllowPrivateNetwork: cfg.Controller.Cors.AllowPrivateNetwork,
 		},
+		OverlayControlAddr:    cfg.Controller.RuntimeOverlayControl,
+		OverlayGenerationAddr: cfg.Controller.RuntimeOverlayGeneration,
+		OverlayPeer: route.PeerPolicy{
+			UID: cfg.Controller.RuntimeOverlayPeerUID,
+			GID: cfg.Controller.RuntimeOverlayPeerGID,
+		},
 	})
 }
 
@@ -99,6 +105,18 @@ func Parse(configBytes []byte, options ...Option) error {
 
 	for _, option := range options {
 		option(cfg)
+	}
+
+	// Enable and recover the overlay before anything is applied. Recovery
+	// installs the quarantine snapshot, and the check below refuses a
+	// configuration that cannot evaluate a generation this process is durably
+	// bound to — applying it would open the data plane with the overlay
+	// unenforceable, which is the restart bypass window the design forbids.
+	if err := executor.EnableRuntimeOverlay(cfg.Controller.RuntimeOverlayOwner); err != nil {
+		return err
+	}
+	if err := executor.ValidateOverlayAgainstConfig(cfg); err != nil {
+		return err
 	}
 
 	ApplyConfig(cfg)

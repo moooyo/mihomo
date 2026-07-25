@@ -7,6 +7,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/sockopt"
+	"github.com/metacubex/mihomo/component/auth"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
@@ -72,14 +73,42 @@ func NewUDPWithConfig(config LC.AuthServer, lc C.InboundListenConfig, tunnel C.T
 				}
 				continue
 			}
-			handleSocksUDP(l, tunnel, data, put, remoteAddr, additions...)
+			handleSocksUDP(l, config.AuthStore, tunnel, data, put, remoteAddr, additions...)
 		}
 	}()
 
 	return sl, nil
 }
 
-func handleSocksUDP(pc net.PacketConn, tunnel C.Tunnel, buf []byte, put func(), addr net.Addr, additions ...inbound.Addition) {
+func handleSocksUDP(pc net.PacketConn, store auth.AuthStore, tunnel C.Tunnel, buf []byte, put func(), addr net.Addr, additions ...inbound.Addition) {
+	// The TCP path has filtered the peer since forever; the UDP path never did.
+	if inbound.IsRemoteAddrDisAllowed(addr) {
+		if put != nil {
+			put()
+		}
+		return
+	}
+
+	// When the listener authenticates, a datagram must belong to an
+	// association an authenticated control connection opened. Without this a
+	// credential-bearing SOCKS listener still accepts UDP from anyone, which
+	// makes the credential meaningless for UDP.
+	//
+	// An unauthenticated listener keeps its historical behaviour: there is no
+	// identity to bind an association to, and refusing would break every
+	// open SOCKS deployment for no security gain.
+	if store != nil && store.Authenticator() != nil {
+		user, ok := lookupAssociation(pc.LocalAddr().String(), addr)
+		if !ok {
+			dropUnassociated(pc.LocalAddr().String(), addr)
+			if put != nil {
+				put()
+			}
+			return
+		}
+		additions = append(append([]inbound.Addition(nil), additions...), inbound.WithInUser(user))
+	}
+
 	target, payload, err := socks5.DecodeUDPPacket(buf)
 	if err != nil {
 		// Unresolved UDP packet, return buffer to the pool

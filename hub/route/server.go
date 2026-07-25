@@ -72,6 +72,15 @@ type Config struct {
 	DohServer      string
 	IsDebug        bool
 	Cors           Cors
+
+	// OverlayControlAddr and OverlayGenerationAddr are the two machine-only
+	// runtime-overlay sockets. They are separate transports with separate
+	// access control on purpose: a processor that can read the active
+	// generation must not thereby be able to commit one.
+	OverlayControlAddr    string
+	OverlayGenerationAddr string
+	// OverlayPeer restricts which local process may connect to either socket.
+	OverlayPeer PeerPolicy
 }
 
 type Cors struct {
@@ -96,6 +105,8 @@ func ReCreateServer(cfg *Config) {
 	if inbound.SupportNamedPipe {
 		go startPipe(cfg)
 	}
+	go startOverlayControl(cfg)
+	go startOverlayGeneration(cfg)
 }
 
 func SetUIPath(path string) {

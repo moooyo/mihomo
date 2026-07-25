@@ -15,6 +15,7 @@ import (
 	authStore "github.com/metacubex/mihomo/listener/auth"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/reality"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/socks4"
 	"github.com/metacubex/mihomo/transport/socks5"
@@ -186,6 +187,16 @@ func HandleSocks5(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, addition
 	}
 	if command == socks5.CmdUDPAssociate {
 		defer conn.Close()
+		// The control connection is the association's lifetime, and the
+		// authenticated user it carries is the only identity UDP has. Both were
+		// previously discarded here, which is why the UDP listener had nothing
+		// to check a datagram against.
+		release, err := registerAssociation(conn.LocalAddr().String(), conn.RemoteAddr(), target, user)
+		if err != nil {
+			log.Warnln("[SOCKS] UDP associate from %s refused: %s", conn.RemoteAddr(), err)
+			return
+		}
+		defer release()
 		io.Copy(io.Discard, conn)
 		return
 	}
