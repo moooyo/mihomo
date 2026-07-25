@@ -33,7 +33,7 @@ an assumption, recorded so it can be overturned rather than silently inherited.
 | 7 | Selective or full cache invalidation? | Epoch-keyed, so invalidation is O(1) and selective by construction; no `ClearCache`. |
 | 8 | Graceful vs hard revoke | The coordinator declares `transition_mode` per generation. Permission removal, host removal and master-off must use `revoke`. |
 | 9 | Drain deadlines | TCP 30s, UDP 30s, H1 30s, H2 60s, H3 60s, WebSocket 300s. Encoded in `overlay.DefaultDrainDeadlines`. |
-| 12 | Pinned-IP eligibility | Scope validation is enforced for every `public-only` capability. True transport-level pinning is implemented for DIRECT only; every other adapter is declared ineligible for `public-only` and fails closed. See "Deferred" below. |
+| 12 | Pinned-IP eligibility | Deferred in full — see "Deferred" below. `public-only` is carried on the capability and validated at commit, but no transport-level pinning ships in this increment. |
 | 14 | Windows production? | Development only. The control and generation sockets refuse to start on Windows rather than falling back to a weaker transport. |
 
 ## What the code actually looks like (recon summary)
@@ -262,3 +262,59 @@ The 14.1 items that map onto automated tests in this increment:
 | 16 | notification XSS, WebSocket token | zashboard |
 | 17 | capability discovery with four states | zashboard |
 | 18 | overlay status panel | zashboard |
+
+## Status at the end of this increment
+
+Everything below is implemented, tested and verified against a running binary
+unless the row says otherwise.
+
+| # | Item | Repo | State |
+| --- | --- | --- | --- |
+| 1 | overlay core package | mihomo | done |
+| 2 | anchor rule type, parser, denylists | mihomo | done |
+| 3 | closure validator, processor exclusion, core revision | mihomo | done |
+| 4 | executor gate, recovery, apply lock, atomic mode | mihomo | done |
+| 5 | control + generation sockets, peer verification | mihomo | done |
+| 6 | controller guards (`rules/disable`, `patchConfigs`) | mihomo | done |
+| 7 | tracker generation identity + revocation | mihomo | done |
+| 8 | authenticated SOCKS5 UDP associations | mihomo | done |
+| 9 | resolver cache epoch | mihomo | done |
+| 10 | tests (unit + live) | mihomo | done |
+| 11 | operation journal, generation/bundle IDs | 5gpn | done |
+| 12 | overlay driver beside the legacy YAML driver | 5gpn | done — legacy remains the default |
+| 13 | prepare/commit/readback/roll-forward recovery | 5gpn | done |
+| 14 | panel guard requalification | 5gpn | done |
+| 15 | processor generation polling and transaction binding | 5gpn-intercept | done |
+| 16 | notification XSS, WebSocket token | zashboard | done |
+| 17 | capability discovery with four states | zashboard | done |
+| 18 | overlay status panel | zashboard | done |
+
+Not done, and deliberately so:
+
+- **The legacy driver is still the default.** `overlay_driver.go` is wired and
+  tested but `mutate()` still takes the YAML path. Switching is a persisted,
+  operator-visible migration step, and the review requires shadow comparison
+  first (12.1 step 4), which is not built.
+- **Shadow semantic comparison** between the two drivers.
+- **Transport-level pinned-IP dialing.** `Metadata.RemoteAddress()` returns
+  `Host` whenever it is set, so DIRECT, HTTP, SOCKS5-out and VMess all forward
+  the domain and ignore a populated `DstIP`. A real pin needs a new metadata
+  field honoured by each adapter's destination formatting, in the tree's
+  highest-churn directory. `public-only` is carried and validated but not yet
+  enforced at the transport.
+- **DNS quarantine cacheable negatives** (6.15) on the 5gpn resolver.
+- **Option C** in its entirety.
+
+### What live testing caught that unit tests did not
+
+Two bugs shipped past a green unit suite, both the same shape: a validator
+reading live global state at a point in startup where nothing had populated it.
+Recovery recompiled the persisted generation against a processor list
+`ApplyConfig` had not published yet, and the post-recovery dependency check read
+an empty `tunnel.Proxies()`. Both were fatal at parse time, so **every restart
+with a generation persisted exited** — the exact failure-matrix row that says a
+restart must recover into quarantine. Neither is reachable from a unit test that
+constructs the manager directly.
+
+That is why `test/overlay` exists and why section 13.1 makes the bypass matrix a
+merge gate rather than a one-time check.
