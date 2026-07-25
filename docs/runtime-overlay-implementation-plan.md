@@ -217,12 +217,6 @@ the gap is explicit rather than discovered later.
   "Who attests readiness" below for why that is the arrangement rather than a
   shortcut. The generation socket is served and peer-restricted, and nothing
   connects to it.
-- **Explicit peer-uid check on the sidecar's own control socket.** Reachability
-  is currently bounded by the filesystem: a 0750 RuntimeDirectory owned by the
-  processor's group and a 0660 socket, which admits exactly the coordinator and
-  the sidecar itself. Narrowing it further to a uid needs the installer to
-  render the uid into the unit, which the unit-integrity check pins by exact
-  `ExecStart` line.
 - **Geo database updates as a revision-bearing event.** `POST /configs/geo` and
   the background updater change what `GEOIP`/`GEOSITE` rules match with no lock
   and no revision bump. Overlay client rules deliberately do not support geo
