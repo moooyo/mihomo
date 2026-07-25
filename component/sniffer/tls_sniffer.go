@@ -141,7 +141,15 @@ func ReadClientHello(data []byte) (*string, error) {
 					return nil, errNotClientHello
 				}
 				if nameType == 0 {
-					serverName := string(d[:nameLen])
+					// Lower-cased because every domain rule compares against a
+					// lower-cased payload without normalising the host it is
+					// given. DNS names are case-insensitive (RFC 4343), and the
+					// HTTP sniffer already lower-cases its Host header, so
+					// returning the SNI verbatim made rule matching depend on
+					// how the client happened to spell the name: a client
+					// sending mixed-case SNI missed every DOMAIN, DOMAIN-SUFFIX
+					// and DOMAIN-KEYWORD rule and fell through to MATCH.
+					serverName := strings.ToLower(string(d[:nameLen]))
 					// An SNI value may not include a
 					// trailing dot. See
 					// https://tools.ietf.org/html/rfc6066#section-3.

@@ -304,3 +304,54 @@ func TestKeywordAndDomainMatchingIsCaseInsensitiveByDesign(t *testing.T) {
 		}
 	}
 }
+
+// TestMixedCaseSNIBypassesLegacyCaptureRules records why the overlay's
+// lowercasing is not merely a nicety.
+//
+// mihomo's TLS sniffer returns the SNI verbatim (component/sniffer/tls_sniffer.go
+// only strips a trailing dot; the HTTP sniffer does lowercase, the TLS one does
+// not), replaceDomain puts it in SniffHost, and RuleHost() prefers SniffHost.
+// Every native domain matcher then compares that string against a lowercased
+// payload without normalising it.
+//
+// The consequence for a capture rule is that a client which sends mixed-case
+// SNI is not captured at all: the rule misses, and resolution falls through to
+// the operator's terminal MATCH. The overlay's client stage lowercases the host
+// before matching and therefore still captures it.
+func TestMixedCaseSNIBypassesLegacyCaptureRules(t *testing.T) {
+	const wantHost = "gs-loc.apple.com"
+	// What a client controls, and what the TLS sniffer hands on verbatim.
+	sniffed := "GS-LOC.Apple.COM"
+
+	for _, line := range []string{
+		"DOMAIN," + wantHost + ",REJECT",
+		"DOMAIN-SUFFIX,apple.com,REJECT",
+		"DOMAIN-KEYWORD,gs-loc,REJECT",
+	} {
+		t.Run(line, func(t *testing.T) {
+			rule := mustParseLegacy(t, line)
+			lower, _ := rule.Match(&C.Metadata{NetWork: C.TCP, SniffHost: strings.ToLower(sniffed), DstPort: 443}, C.RuleMatchHelper{})
+			mixed, _ := rule.Match(&C.Metadata{NetWork: C.TCP, SniffHost: sniffed, DstPort: 443}, C.RuleMatchHelper{})
+
+			if !lower {
+				t.Fatalf("fixture is wrong: %q does not match the lower-case host", line)
+			}
+			if mixed {
+				t.Logf("native rule %q matches mixed case; the gap this test records has closed", line)
+				return
+			}
+			t.Logf("native rule %q misses mixed-case SNI %q — capture would fall through", line, sniffed)
+		})
+	}
+
+	// The overlay does not have that gap. The action is irrelevant to the
+	// matching path, so this uses reject to avoid needing a declared processor.
+	typed := compileTyped(t, overlay.ClientRule{
+		Kind: overlay.SelectorDomain, Value: wantHost, Action: overlay.ActionReject,
+	})
+	if !typed.Client.Match(&overlay.MatchInput{
+		Host: strings.ToLower(sniffed), DstPort: 443, Network: overlay.NetworkTCP,
+	}).Matched {
+		t.Fatal("the overlay missed a mixed-case host; case variation would bypass capture")
+	}
+}

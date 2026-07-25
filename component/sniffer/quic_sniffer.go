@@ -239,7 +239,7 @@ func (q *quicPacketSender) readQuicData(b []byte) error {
 	if hdrLen+4+16 > len(b) {
 		return errNotQuic
 	}
-	
+
 	mask := cache.Extend(block.BlockSize())
 	block.Encrypt(mask, b[hdrLen+4:hdrLen+4+16])
 	firstByte := b[0]
