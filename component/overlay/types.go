@@ -134,11 +134,17 @@ const (
 	SelectorDomainKeyword  SelectorKind = "domain-keyword"
 	SelectorDomainWildcard SelectorKind = "domain-wildcard"
 	SelectorIPCIDR         SelectorKind = "ip-cidr"
+	// SelectorAny carries no primary selector of its own. It exists so a rule
+	// whose only constraints are keywords can be expressed without inventing a
+	// fake domain to hang them on. A rule using it must carry at least one
+	// keyword constraint, or it would match every connection.
+	SelectorAny SelectorKind = "any"
 )
 
 func (k SelectorKind) Valid() bool {
 	switch k {
-	case SelectorDomain, SelectorDomainSuffix, SelectorDomainKeyword, SelectorDomainWildcard, SelectorIPCIDR:
+	case SelectorDomain, SelectorDomainSuffix, SelectorDomainKeyword,
+		SelectorDomainWildcard, SelectorIPCIDR, SelectorAny:
 		return true
 	}
 	return false
@@ -181,7 +187,16 @@ type ClientRule struct {
 	Value   string       `json:"value"`
 	Network Network      `json:"network,omitempty"`
 	Ports   []PortRange  `json:"ports,omitempty"`
-	Action  ClientAction `json:"action"`
+	// KeywordsAny narrows the rule to hosts containing at least one of these
+	// substrings; KeywordsAll requires every one of them. They are additional
+	// constraints on the primary selector, not alternatives to it.
+	//
+	// Real reviewed policy combines them — "this suffix, but only when the host
+	// also mentions one of these tokens" is a common shape — and a typed model
+	// that cannot express it silently drops a deny the operator approved.
+	KeywordsAny []string     `json:"keywordsAny,omitempty"`
+	KeywordsAll []string     `json:"keywordsAll,omitempty"`
+	Action      ClientAction `json:"action"`
 	// Processor is required when Action is capture and must name a processor
 	// declared in ProcessorTargets.
 	Processor string `json:"processor,omitempty"`
@@ -431,12 +446,36 @@ func (d *Document) Validate(q Quotas) error {
 	return nil
 }
 
+// maxRuleKeywords bounds the keyword constraints on one rule. Matching is a
+// linear substring scan per keyword, so an unbounded list would be a per-packet
+// cost the coordinator could set arbitrarily high.
+const maxRuleKeywords = 16
+
 func (r *ClientRule) validate(idx int, processors map[string]struct{}) error {
 	if !r.Kind.Valid() {
 		return fmt.Errorf("%w: client.rules[%d] has unknown kind %q", ErrInvalidDocument, idx, r.Kind)
 	}
-	if r.Value == "" {
+	if r.Kind == SelectorAny {
+		if r.Value != "" {
+			return fmt.Errorf("%w: client.rules[%d] uses kind %q but carries a value", ErrInvalidDocument, idx, SelectorAny)
+		}
+		// Without a keyword constraint this would match every connection, which
+		// is never what a reviewed extension rule means.
+		if len(r.KeywordsAny) == 0 && len(r.KeywordsAll) == 0 {
+			return fmt.Errorf("%w: client.rules[%d] uses kind %q with no keyword constraint, which would match everything",
+				ErrInvalidDocument, idx, SelectorAny)
+		}
+	} else if r.Value == "" {
 		return fmt.Errorf("%w: client.rules[%d] has an empty value", ErrInvalidDocument, idx)
+	}
+	if len(r.KeywordsAny)+len(r.KeywordsAll) > maxRuleKeywords {
+		return fmt.Errorf("%w: client.rules[%d] carries %d keyword constraints, the limit is %d",
+			ErrQuotaExceeded, idx, len(r.KeywordsAny)+len(r.KeywordsAll), maxRuleKeywords)
+	}
+	for _, kw := range append(append([]string(nil), r.KeywordsAny...), r.KeywordsAll...) {
+		if kw == "" {
+			return fmt.Errorf("%w: client.rules[%d] has an empty keyword constraint", ErrInvalidDocument, idx)
+		}
 	}
 	if !r.Network.Valid() {
 		return fmt.Errorf("%w: client.rules[%d] has unknown network %q", ErrInvalidDocument, idx, r.Network)

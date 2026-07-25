@@ -98,6 +98,14 @@ func (c *canonical) writeProjection(d *Document) {
 			c.uint(uint64(p.From))
 			c.uint(uint64(p.To))
 		}
+		c.list(len(r.KeywordsAny))
+		for _, kw := range r.KeywordsAny {
+			c.str(kw)
+		}
+		c.list(len(r.KeywordsAll))
+		for _, kw := range r.KeywordsAll {
+			c.str(kw)
+		}
 		c.str(string(r.Action))
 		c.str(r.Processor)
 		c.str(r.Owner)

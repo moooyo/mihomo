@@ -37,9 +37,46 @@ type compiledRule struct {
 	prefix    netip.Prefix
 	network   Network
 	ports     []PortRange
-	action    ClientAction
+	// keywordsAny requires at least one match; keywordsAll requires all of
+	// them. Both are lowercased at compile time so matching is a plain
+	// substring scan.
+	keywordsAny []string
+	keywordsAll []string
+	action      ClientAction
 	// target is the resolved proxy name for a capture rule.
 	target string
+}
+
+// matchesKeywords applies the keyword constraints.
+//
+// Constraints, not alternatives: they narrow whatever the primary selector
+// already matched. A rule with keywords and no host to test them against does
+// not match, because "unknown" is not "satisfied".
+func (r *compiledRule) matchesKeywords(host string) bool {
+	if len(r.keywordsAny) == 0 && len(r.keywordsAll) == 0 {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	if len(r.keywordsAny) > 0 {
+		hit := false
+		for _, kw := range r.keywordsAny {
+			if strings.Contains(host, kw) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return false
+		}
+	}
+	for _, kw := range r.keywordsAll {
+		if !strings.Contains(host, kw) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *compiledRule) matches(in *MatchInput) bool {
@@ -58,6 +95,9 @@ func (r *compiledRule) matches(in *MatchInput) bool {
 			return false
 		}
 	}
+	if !r.matchesKeywords(in.Host) {
+		return false
+	}
 	switch r.kind {
 	case SelectorDomain:
 		return in.Host != "" && in.Host == r.value
@@ -74,6 +114,11 @@ func (r *compiledRule) matches(in *MatchInput) bool {
 			return false
 		}
 		return r.prefix.Contains(in.DstIP.Unmap())
+	case SelectorAny:
+		// The keyword constraints above already did the work, and validation
+		// guarantees there is at least one. A hostname is still required: a
+		// bare-address connection has nothing to match keywords against.
+		return in.Host != ""
 	}
 	return false
 }
@@ -195,12 +240,16 @@ func Compile(d *Document, q Quotas, processorProxies map[string]string) (*Compil
 	rules := make([]compiledRule, 0, len(d.Client.Rules))
 	for i, r := range d.Client.Rules {
 		cr := compiledRule{
-			kind:    r.Kind,
-			network: r.Network,
-			ports:   append([]PortRange(nil), r.Ports...),
-			action:  r.Action,
+			kind:        r.Kind,
+			network:     r.Network,
+			ports:       append([]PortRange(nil), r.Ports...),
+			keywordsAny: lowerAll(r.KeywordsAny),
+			keywordsAll: lowerAll(r.KeywordsAll),
+			action:      r.Action,
 		}
 		switch r.Kind {
+		case SelectorAny:
+			// No primary payload to compile.
 		case SelectorIPCIDR:
 			p, err := netip.ParsePrefix(r.Value)
 			if err != nil {
@@ -244,4 +293,17 @@ func Compile(d *Document, q Quotas, processorProxies map[string]string) (*Compil
 		ResolverSetDigest: ResolverProfileSetDigest(doc.ResolverProfiles),
 		CapabilitySet:     CapabilitySetDigest(doc.Egress.Capabilities),
 	}, nil
+}
+
+// lowerAll lowercases a keyword list so matching can be a plain substring scan
+// against the already-lowercased host.
+func lowerAll(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = strings.ToLower(v)
+	}
+	return out
 }
