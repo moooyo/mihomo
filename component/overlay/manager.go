@@ -432,6 +432,9 @@ func (m *Manager) Commit(req CommitRequest) (*CommitResult, error) {
 	next.coreRevision = liveCore
 	next.resolverEpoch = resolverEpoch
 	next.lease = lease
+	if lease != nil {
+		next.lastLease = lease
+	}
 	next.draining = draining
 	next.depErrors = nil
 	delete(next.staged, compiled.Document.GenerationID)
@@ -482,6 +485,7 @@ func (m *Manager) RegisterReadiness(processorID, processInstance, generationID, 
 
 	next := cur.clone()
 	next.lease = lease
+	next.lastLease = lease
 	next.state = state
 	m.holder.Store(next)
 	log.Infoln("[Overlay] processor readiness for generation %s is now %s", cur.active.Document.GenerationID, state)
@@ -517,6 +521,9 @@ func (m *Manager) refreshReadinessLocked() {
 	next := cur.clone()
 	next.state = state
 	next.lease = lease
+	if lease != nil {
+		next.lastLease = lease
+	}
 	m.holder.Store(next)
 	log.Warnln("[Overlay] processor state for generation %s changed to %s", cur.active.Document.GenerationID, state)
 }
@@ -557,24 +564,28 @@ func (m *Manager) Readback() Readback {
 		Draining:         cur.DrainingIDs(),
 		BootEpoch:        cur.bootEpoch,
 		SchemaVersion:    SchemaVersion,
-		LeaseState:       "none",
 	}
 	if cur.active != nil {
 		rb.ActiveDigest = cur.active.Digests.Overall
 		rb.ActiveProjection = cur.active.Digests.Projection
 		rb.CapabilitySet = cur.active.CapabilitySet
 	}
-	if l := cur.lease; l != nil {
-		rb.ProcessorInstance = l.ProcessInstance
-		rb.BundleDigest = l.BundleDigest
-		rb.FencingToken = l.FencingToken
-		rb.LeaseExpiresAt = l.ExpiresAt.Unix()
-		if l.Expired(time.Now()) {
-			rb.LeaseState = "expired"
-		} else {
-			rb.LeaseState = "valid"
-		}
+	// Report the last attestation even after it lapses. A coordinator has to
+	// tell "this processor never attested" apart from "it attested and then
+	// stopped"; collapsing both to "none" hides a live processor going away.
+	lease, leaseState := cur.lease, "valid"
+	if lease == nil {
+		lease, leaseState = cur.lastLease, "expired"
 	}
+	if lease == nil {
+		leaseState = "none"
+	} else {
+		rb.ProcessorInstance = lease.ProcessInstance
+		rb.BundleDigest = lease.BundleDigest
+		rb.FencingToken = lease.FencingToken
+		rb.LeaseExpiresAt = lease.ExpiresAt.Unix()
+	}
+	rb.LeaseState = leaseState
 	if ptr, err := m.store.GetPointer(); err == nil {
 		rb.PersistedGeneration = ptr.Active
 	}

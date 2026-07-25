@@ -55,8 +55,13 @@ type Snapshot struct {
 	draining []drainingGeneration
 	staged   map[string]*Compiled
 
-	state     ProcessorState
-	lease     *Lease
+	state ProcessorState
+	// lease is the live readiness attestation, or nil once it has lapsed.
+	lease *Lease
+	// lastLease survives expiry so readback can report "expired" rather than
+	// "none". The distinction matters to a coordinator: never-attested and
+	// stopped-attesting call for different recovery.
+	lastLease *Lease
 	depErrors []string
 	deadlines DrainDeadlines
 

@@ -43,7 +43,7 @@ func rebindRuntimeOverlay(cfg *config.Config) {
 	if active == nil {
 		return
 	}
-	if err := validateOverlayDependencies(active); err != nil {
+	if err := validateOverlayDependencies(active, liveDependencyView()); err != nil {
 		log.Errorln("[Overlay] active generation %s no longer satisfies the applied configuration: %v", active.Document.GenerationID, err)
 		m.MarkDegraded([]string{err.Error()})
 		return
@@ -113,18 +113,32 @@ func OverlayStateDir() string {
 // every known capture match rejects and every processor egress capability is
 // disabled. That is the only safe answer to a restart, because a client's DNS
 // cache may still point capture hosts at the gateway.
-func EnableRuntimeOverlay(owner string) error {
+//
+// It takes the configuration that is about to be applied rather than reading
+// live state, because recovery runs before ApplyConfig: at that point nothing
+// has published the processor declarations a persisted generation must be
+// recompiled against, and recovery would fail on every restart.
+func EnableRuntimeOverlay(cfg *config.Config) error {
+	owner := cfg.Controller.RuntimeOverlayOwner
 	if owner == "" {
 		return nil
 	}
 	// Idempotent: hub.Parse runs again on every SIGHUP, and re-opening the
 	// store would discard the recovered snapshot and the live lease.
 	if m := tunnel.OverlayManager(); m != nil && m.Owner() == owner {
+		mux.Lock()
+		appliedProcessors = cfg.OverlayProcessors
+		mux.Unlock()
 		return nil
 	}
 	if err := overlay.ValidateOwner(owner); err != nil {
 		return err
 	}
+	// Publish the incoming configuration's processor set so recovery can
+	// recompile against it.
+	mux.Lock()
+	appliedProcessors = cfg.OverlayProcessors
+	mux.Unlock()
 
 	store, err := overlay.OpenStore(OverlayStateDir(), owner)
 	if err != nil {
@@ -134,7 +148,7 @@ func EnableRuntimeOverlay(owner string) error {
 	manager := overlay.NewManager(store, owner, overlay.Hooks{
 		CoreRevision:         coreRevisionLocked,
 		ProcessorProxies:     processorProxies,
-		ValidateDependencies: validateOverlayDependencies,
+		ValidateDependencies: func(c *overlay.Compiled) error { return validateOverlayDependencies(c, liveDependencyView()) },
 		AdvanceResolverEpoch: advanceResolverEpoch,
 		RevokeGeneration:     func(id string) { tunnel.RevokeOverlayGeneration(id) },
 	})
@@ -162,31 +176,61 @@ func processorProxies() map[string]string {
 	return out
 }
 
-// validateOverlayDependencies checks a compiled generation against live state.
+// dependencyView is the state a generation is validated against.
 //
-// Group existence is checked here rather than only at parse time because a
+// It is passed in rather than read from live globals because the two callers see
+// the world at different moments: a commit validates against the running
+// configuration, while startup validates against the configuration that is
+// about to be applied — at which point tunnel's proxy map is still empty. Every
+// earlier version of this read live state and consequently refused every
+// restart of a deployment that used capture.
+type dependencyView struct {
+	proxies    map[string]C.Proxy
+	processors map[string]struct{}
+	mode       tunnel.TunnelMode
+}
+
+func liveDependencyView() dependencyView {
+	return dependencyView{
+		proxies:    tunnel.Proxies(),
+		processors: lastOverlayProcessors(),
+		mode:       tunnel.Mode(),
+	}
+}
+
+func configDependencyView(cfg *config.Config) dependencyView {
+	return dependencyView{
+		proxies:    cfg.Proxies,
+		processors: cfg.OverlayProcessors,
+		mode:       cfg.General.Mode,
+	}
+}
+
+// validateOverlayDependencies checks a compiled generation against a view of
+// the configuration it will run under.
+//
+// Group existence is re-checked here rather than only at parse time because a
 // group can disappear through a config reload between staging and commit; the
-// commit must then fail closed rather than publish a generation whose egress
+// commit must then fail closed instead of publishing a generation whose egress
 // resolves to nothing.
-func validateOverlayDependencies(c *overlay.Compiled) error {
-	proxies := tunnel.Proxies()
-	if tunnel.Mode() != tunnel.Rule {
-		return fmt.Errorf("%w: tunnel is in %s mode", overlay.ErrModeConflict, tunnel.Mode())
+func validateOverlayDependencies(c *overlay.Compiled, view dependencyView) error {
+	if view.mode != tunnel.Rule {
+		return fmt.Errorf("%w: tunnel is in %s mode", overlay.ErrModeConflict, view.mode)
 	}
 	for _, cap := range c.Document.Egress.Capabilities {
-		p, ok := proxies[cap.Group]
+		p, ok := view.proxies[cap.Group]
 		if !ok {
 			return fmt.Errorf("%w: capability %q names egress group %q, which does not exist", overlay.ErrDependencyMissing, cap.ID, cap.Group)
 		}
 		if !cap.AllowDirect && p.Type() == C.Direct {
 			return fmt.Errorf("%w: capability %q resolves to DIRECT but does not allow it", overlay.ErrDependencyMissing, cap.ID)
 		}
-		if _, isProcessor := lastOverlayProcessors()[cap.Group]; isProcessor {
+		if _, isProcessor := view.processors[cap.Group]; isProcessor {
 			return fmt.Errorf("%w: capability %q names the processor %q as its own egress, which would loop", overlay.ErrDependencyMissing, cap.ID, cap.Group)
 		}
 	}
 	for _, t := range c.Document.ProcessorTargets {
-		if _, ok := proxies[t.Name]; !ok {
+		if _, ok := view.proxies[t.Name]; !ok {
 			return fmt.Errorf("%w: processor target %q names proxy %q, which does not exist", overlay.ErrDependencyMissing, t.ID, t.Name)
 		}
 	}
@@ -234,5 +278,7 @@ func ValidateOverlayAgainstConfig(cfg *config.Config) error {
 		return fmt.Errorf("%w: generation %s is persisted but the configuration declares no %q anchors",
 			overlay.ErrAnchorInvalid, snapshot.ActiveID(), m.Owner())
 	}
-	return validateOverlayDependencies(snapshot.Active())
+	// Validated against the configuration about to be applied, not against live
+	// state: at this point in startup nothing has published the proxy map yet.
+	return validateOverlayDependencies(snapshot.Active(), configDependencyView(cfg))
 }

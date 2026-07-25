@@ -1,0 +1,48 @@
+external-controller: 127.0.0.1:19090
+secret: 'testsecret'
+mode: global
+log-level: info
+
+runtime-overlay:
+  owner: 5gpn
+  control-socket: /tmp/overlay-test/control.sock
+  generation-socket: /tmp/overlay-test/generation.sock
+
+listeners:
+  - {name: client-in, type: mixed, listen: 127.0.0.1, port: 17801, udp: true}
+  - name: intercept-egress
+    type: mixed
+    listen: 127.0.0.1
+    port: 17802
+    udp: true
+    users:
+      - {username: cap-alpha, password: secret-alpha}
+
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    TLS: {ports: [443]}
+    HTTP: {ports: [80]}
+
+proxies:
+  - name: MODULE-INTERCEPT
+    type: socks5
+    server: 127.0.0.1
+    port: 17899
+    username: mod-in
+    password: mod-pass
+    udp: true
+    runtime-overlay-processor: true
+
+proxy-groups:
+  - {name: Proxies, type: select, proxies: [DIRECT]}
+  - {name: EverythingElse, type: select, include-all-proxies: true}
+
+rules:
+  - IP-CIDR,127.0.0.0/8,REJECT,no-resolve
+  - RUNTIME-OVERLAY,5gpn,egress
+  - IN-NAME,intercept-egress,REJECT
+  - RUNTIME-OVERLAY,5gpn,client
+  - MATCH,Proxies

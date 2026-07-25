@@ -622,3 +622,82 @@ func TestDrainDeadlinesAreFinite(t *testing.T) {
 		t.Fatalf("Max() = %v, want the websocket deadline %v", d.Max(), d.WebSocket)
 	}
 }
+
+// Recovery runs before the host has published anything about the live
+// configuration. It must still recompile a generation that names a processor,
+// or every restart of a deployment that uses capture fails to come up at all.
+func TestRecoverWithoutHostProcessorListing(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir, "5gpn")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	declared := Hooks{ProcessorProxies: func() map[string]string {
+		return map[string]string{"MODULE-INTERCEPT": "MODULE-INTERCEPT"}
+	}}
+	first := NewManager(store, "5gpn", declared)
+	defer first.Close()
+	if _, err := first.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if _, err := first.Commit(CommitRequest{GenerationID: "g1"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Restart with a hook that reports nothing, standing in for the window
+	// before the configuration is applied.
+	store2, _ := OpenStore(dir, "5gpn")
+	second := NewManager(store2, "5gpn", Hooks{
+		ProcessorProxies: func() map[string]string { return nil },
+	})
+	defer second.Close()
+	if err := second.Recover(); err != nil {
+		t.Fatalf("recovery refused a generation naming a processor: %v", err)
+	}
+	if second.Snapshot().ActiveID() != "g1" {
+		t.Fatalf("active after recovery = %q, want g1", second.Snapshot().ActiveID())
+	}
+}
+
+// "Never attested" and "attested then stopped" call for different coordinator
+// recovery, so readback must not collapse them into one value.
+func TestReadbackDistinguishesNeverReadyFromExpired(t *testing.T) {
+	store, _ := OpenStore(t.TempDir(), "5gpn")
+	m := NewManager(store, "5gpn", Hooks{
+		ProcessorProxies: func() map[string]string { return map[string]string{"MODULE-INTERCEPT": "MODULE-INTERCEPT"} },
+	})
+	defer m.Close()
+	// A very short TTL so the lease lapses without a long sleep.
+	m.leases = NewLeaseRegistry(time.Millisecond)
+
+	if _, err := m.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if _, err := m.Commit(CommitRequest{GenerationID: "g1"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := m.Readback().LeaseState; got != "none" {
+		t.Fatalf("before any attestation: leaseState = %q, want none", got)
+	}
+
+	if _, err := m.RegisterReadiness("proc", "inst", "g1", "", "", 0, 0); err != nil {
+		t.Fatalf("readiness: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	m.RefreshReadiness()
+
+	rb := m.Readback()
+	if rb.LeaseState != "expired" {
+		t.Fatalf("after expiry: leaseState = %q, want expired", rb.LeaseState)
+	}
+	if rb.ProcessorInstance != "inst" {
+		t.Fatalf("the lapsed attestation's instance was lost: %q", rb.ProcessorInstance)
+	}
+	// Lease expiry changes readiness, not desired state.
+	if rb.ActiveGeneration != "g1" {
+		t.Fatalf("expiry changed the active generation to %q", rb.ActiveGeneration)
+	}
+	if rb.ProcessorState != ProcessorNotReady {
+		t.Fatalf("processorState = %q, want not-ready", rb.ProcessorState)
+	}
+}
