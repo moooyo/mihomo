@@ -487,5 +487,42 @@ the committed tree, and compare with the same job on `main`. That comparison is
 what separated "mine" from "this box", and it should have come before the first
 tag rather than after it.
 
+### What installing caught that releasing did not
+
+Running the installer — from the published artifacts, on a real gateway — found
+five more. Every one was a code path nothing had executed, because the gateway
+under test had been updated by copying binaries into place.
+
+- **`StateDirectory=5gpn` aborted every install.** `/var/lib/5gpn` is a shared
+  project directory the installer claims as root:root 0755 and puts the swapfile
+  in. systemd chowns a StateDirectory tree to the service on every start —
+  including the installer's own ownership marker inside it — so the installer
+  then refused to claim a root it no longer recognised. The journal belongs in
+  `/var/lib/5gpn-dns`, which is that service's own.
+- **The installer rejected the config it had just written.** Its config-matching
+  check required the unqualified `DOMAIN,<console>,DIRECT` rule while the seed
+  ships the form that excludes processor traffic. Only a second run can see it.
+- **The installer rejected the accounts it had just configured.** Service
+  accounts had to belong to exactly their own group, and the overlay needs two
+  socket groups. The isolation that rule protects is real, so the exception is
+  enumerated: those groups own one socket each and nothing else, which is what
+  makes membership grant no reach beyond the socket.
+
+And the one that hid the others:
+
+- **`exec 7>&- 2>/dev/null`.** `exec` carrying only redirections applies them to
+  the shell and never restores them, so from the moment the transaction lock was
+  taken the installer discarded all of its own stderr. Four sites, two for each
+  lock. The symptom was an installer that exits 1 having printed nothing at all
+  — no error, no phase, nothing — and the real message was recoverable only by
+  patching the line out and running again. Two failures were diagnosed that way
+  before the cause of the silence was itself understood.
+
+The lesson is narrower than "test more". Every one of these lived in a path that
+the project's own verification never executed: 22/22 of real-traffic checks
+covered what the data plane does and none of them covered how it comes to be
+installed. Coverage is of paths run, not of behaviour believed.
+
+
 
 
