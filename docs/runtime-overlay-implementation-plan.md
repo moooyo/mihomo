@@ -363,6 +363,14 @@ reading:
 | 26 | live real-traffic verification | 5gpn | done — `test/overlay/verify-live.sh`, 20/20 |
 | 27 | published typed policy projection and digest | 5gpn-extensions | done — the gateway checks its own Go compile against it |
 
+And after that, three items that came from auditing what the first two increments
+had left structurally wrong rather than functionally broken:
+
+| # | Item | Repo | State |
+| --- | --- | --- | --- |
+| 28 | the processor becomes a separately released component | sidecar | done — its own repository, CI, release, pinned digest; consumed the way mihomo and gum are |
+| 29 | the template's renderer contract is derived from the template | 5gpn | done — `tests/test_seed_template_renderers.sh` names any renderer that does not expand a declared placeholder |
+| 30 | the installer's two seed renderers become one | 5gpn | done — `test/overlay/render-equivalence.sh` proved the output byte-identical across the change |
 
 Not done, and deliberately so:
 
@@ -516,6 +524,61 @@ The lesson is narrower than "test more". Every one of these lived in a path that
 the project's own verification never executed: 22/22 of real-traffic checks
 covered what the data plane does and none of them covered how it comes to be
 installed. Coverage is of paths run, not of behaviour believed.
+
+
+### What the copies cost, and what retiring them required
+
+The processor lived inside the gateway's tree, was built by the gateway's
+release, shipped as the gateway's asset, and had its invariants asserted by the
+gateway's tests. Two consequences followed from that arrangement and neither was
+visible while it held: the two could only ever ship together, and the processor's
+version was asserted by proxy — the gateway's own version stood in for it, which
+is only true while both are built from one commit. It is now consumed the way
+mihomo and gum already were: a named repository, an exact version, a pinned
+digest, and its own version checked. Its 22 policy assertions moved to its
+repository and run there, because assertions that do not run are not assertions.
+
+The seed template had six independent renderers. A placeholder taught to only
+some of them emits `__SOMETHING__` verbatim, and the rendered YAML either fails
+to parse or carries the literal into a live config — which had happened, and
+surfaced from a release run for a tag that had already shipped. Two fixes, in
+this order:
+
+- The contract is now **derived from the template** rather than restated
+  anywhere. A test reads the template's placeholders and names any renderer that
+  does not expand one. Adding a placeholder fails it until every renderer knows.
+- Two of the renderers became one, and the merge was gated on a property
+  stronger than review: capture the rendered output, make the change, capture
+  again, compare bytes. The first draft of that tool carried a reference
+  implementation to compare against — which was a seventh renderer of the same
+  template, reintroduced inside the test meant to help retire them. It was
+  removed; the tool now proves only that the same renderer's output did not move,
+  which is exactly the question a consolidation raises.
+
+Four renderers remain, in CI and in two regression scripts. Merging them means
+teaching those contexts to source a shipped script, which is a larger change and
+less urgent now that the contract is derived rather than remembered.
+
+### A claim that did not survive being instrumented
+
+The installer's `ERR` trap was reported here as double-reporting failures that
+callers already handle. Instrumenting it showed otherwise: the trap fires at
+`depth=0`, the idempotence guard holds, and the single report it produces is the
+correct one. The six duplicated messages that prompted the claim came from a
+state that could not be reproduced.
+
+That is recorded rather than quietly dropped, because the proposed remedy was to
+restructure the error model of a 7,500-line installer. Doing that on an
+unconfirmed mechanism is how a noisy failure becomes a silent one — and silence
+is the failure mode this installer has already produced once, at real cost.
+
+The same instrumentation run confirmed something else, twice: deleting a service
+account orphans the directories it owned, and the installer then refuses to claim
+a project root whose owner no longer resolves, with no path forward. Both times
+the machine was recovered by reading the source. The fix is a **diagnostic** —
+name the uid, say it belonged to a removed service account, give the command to
+restore it — not an automatic `chown`. Silently taking ownership of a directory
+whose owner cannot be identified is precisely what that check exists to refuse.
 
 
 
