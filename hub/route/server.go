@@ -86,6 +86,10 @@ type Config struct {
 	// the mutation endpoint.
 	OverlayControlPeer    PeerPolicy
 	OverlayGenerationPeer PeerPolicy
+	// OverlaySocketGID values own the socket files so the admitted peer can
+	// open them. -1 leaves a socket private to the runtime user.
+	OverlayControlSocketGID    int
+	OverlayGenerationSocketGID int
 }
 
 type Cors struct {

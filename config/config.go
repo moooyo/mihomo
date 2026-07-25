@@ -132,6 +132,17 @@ type Controller struct {
 	RuntimeOverlayControlPeerGID    int
 	RuntimeOverlayGenerationPeerUID int
 	RuntimeOverlayGenerationPeerGID int
+	// RuntimeOverlayControlSocketGID and RuntimeOverlayGenerationSocketGID own
+	// the socket files, so the admitted peer can open them at all. This is a
+	// different question from which peer is admitted: the peer check reads the
+	// connecting process's own group, while changing a file's group requires
+	// mihomo to be a member of the target one. Using the peer's primary group
+	// for both would mean granting mihomo membership of it, widening what the
+	// core can read for no reason. A dedicated group per socket, owning nothing
+	// else, keeps the two concerns apart. -1 leaves the socket private to the
+	// runtime user.
+	RuntimeOverlayControlSocketGID    int
+	RuntimeOverlayGenerationSocketGID int
 }
 
 type Cors struct {
@@ -266,6 +277,12 @@ type RawRuntimeOverlay struct {
 	ControlPeerGID    *int `yaml:"control-peer-gid" json:"control-peer-gid"`
 	GenerationPeerUID *int `yaml:"generation-peer-uid" json:"generation-peer-uid"`
 	GenerationPeerGID *int `yaml:"generation-peer-gid" json:"generation-peer-gid"`
+	// The group each socket file belongs to, so the admitted peer can open it.
+	// mihomo must itself be a member of these — an unprivileged process cannot
+	// give a file away to a group it does not belong to — which is why they are
+	// dedicated groups rather than the peers' own primary ones.
+	ControlSocketGID    *int `yaml:"control-socket-gid" json:"control-socket-gid"`
+	GenerationSocketGID *int `yaml:"generation-socket-gid" json:"generation-socket-gid"`
 }
 
 // peerIDOrUnrestricted maps an absent peer id onto the unrestricted sentinel,
@@ -921,6 +938,8 @@ func parseController(cfg *RawConfig) (*Controller, error) {
 			firstPeerID(cfg.RuntimeOverlay.GenerationPeerUID, cfg.RuntimeOverlay.PeerUID)),
 		RuntimeOverlayGenerationPeerGID: peerIDOrUnrestricted(
 			firstPeerID(cfg.RuntimeOverlay.GenerationPeerGID, cfg.RuntimeOverlay.PeerGID)),
+		RuntimeOverlayControlSocketGID:    peerIDOrUnrestricted(cfg.RuntimeOverlay.ControlSocketGID),
+		RuntimeOverlayGenerationSocketGID: peerIDOrUnrestricted(cfg.RuntimeOverlay.GenerationSocketGID),
 		Cors: Cors{
 			AllowOrigins:        cfg.ExternalControllerCors.AllowOrigins,
 			AllowPrivateNetwork: cfg.ExternalControllerCors.AllowPrivateNetwork,

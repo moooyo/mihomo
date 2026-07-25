@@ -84,15 +84,25 @@ type Readback struct {
 	ProcessorState      ProcessorState `json:"processorState"`
 	DependencyErrors    []string       `json:"dependencyErrors,omitempty"`
 	ProcessorInstance   string         `json:"processorInstanceId,omitempty"`
-	BundleDigest        string         `json:"sidecarBundleDigest,omitempty"`
-	CapabilitySet       string         `json:"capabilitySetDigest,omitempty"`
-	LeaseState          string         `json:"leaseState"`
-	LeaseExpiresAt      int64          `json:"leaseExpiresAt,omitempty"`
-	FencingToken        uint64         `json:"fencingToken,omitempty"`
-	Prepared            []string       `json:"preparedGenerations"`
-	Draining            []string       `json:"drainingGenerations"`
-	BootEpoch           string         `json:"bootEpoch"`
-	SchemaVersion       int            `json:"schemaVersion"`
+	// BundleDigest is what the last attestation claimed, not what the active
+	// generation requires. The two differ exactly when the processor is serving
+	// something stale, which is the case worth being able to see.
+	BundleDigest string `json:"sidecarBundleDigest,omitempty"`
+	// ActiveBundleDigest and ActiveCertHostSet are what the active generation
+	// was compiled against. A coordinator renewing the processor's lease has to
+	// send values that match these — Lease.Matches compares against them — so
+	// omitting them left it unable to construct a lease that could ever match,
+	// and capture would fail closed for a generation that was otherwise fine.
+	ActiveBundleDigest string   `json:"activeSidecarBundleDigest,omitempty"`
+	ActiveCertHostSet  string   `json:"activeCertificateHostSetDigest,omitempty"`
+	CapabilitySet      string   `json:"capabilitySetDigest,omitempty"`
+	LeaseState         string   `json:"leaseState"`
+	LeaseExpiresAt     int64    `json:"leaseExpiresAt,omitempty"`
+	FencingToken       uint64   `json:"fencingToken,omitempty"`
+	Prepared           []string `json:"preparedGenerations"`
+	Draining           []string `json:"drainingGenerations"`
+	BootEpoch          string   `json:"bootEpoch"`
+	SchemaVersion      int      `json:"schemaVersion"`
 }
 
 // CommitResult is returned by a successful commit, including an idempotent
@@ -569,13 +579,26 @@ func (m *Manager) Readback() Readback {
 		rb.ActiveDigest = cur.active.Digests.Overall
 		rb.ActiveProjection = cur.active.Digests.Projection
 		rb.CapabilitySet = cur.active.CapabilitySet
+		rb.ActiveBundleDigest = cur.active.Document.SidecarBundleDigest
+		rb.ActiveCertHostSet = cur.active.Document.CertificateHostSetDigest
 	}
 	// Report the last attestation even after it lapses. A coordinator has to
 	// tell "this processor never attested" apart from "it attested and then
 	// stopped"; collapsing both to "none" hides a live processor going away.
+	// Expiry is evaluated here rather than trusted from the held pointer. The
+	// sweeper is what swaps the state, so between a lease lapsing and the next
+	// sweep the held pointer is still set — and reporting that as "valid" tells
+	// an operator the processor is attesting when capture has already begun
+	// failing closed.
 	lease, leaseState := cur.lease, "valid"
-	if lease == nil {
+	if lease.Expired(time.Now()) {
 		lease, leaseState = cur.lastLease, "expired"
+		// The processor state has to follow. It is the field an operator reads
+		// first, and reporting "ready" while capture is already being refused
+		// describes the opposite of what the data plane is doing.
+		if rb.ProcessorState == ProcessorReady {
+			rb.ProcessorState = ProcessorNotReady
+		}
 	}
 	if lease == nil {
 		leaseState = "none"

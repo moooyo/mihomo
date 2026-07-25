@@ -52,7 +52,7 @@ func startOverlayControl(cfg *Config) {
 	if cfg.OverlayControlAddr == "" {
 		return
 	}
-	l, addr, err := listenLocalSocket(cfg.OverlayControlAddr, cfg.OverlayControlPeer)
+	l, addr, err := listenLocalSocket(cfg.OverlayControlAddr, cfg.OverlayControlPeer, cfg.OverlayControlSocketGID)
 	if err != nil {
 		log.Errorln("Overlay control socket listen error: %s", err)
 		return
@@ -79,7 +79,7 @@ func startOverlayGeneration(cfg *Config) {
 	if cfg.OverlayGenerationAddr == "" {
 		return
 	}
-	l, addr, err := listenLocalSocket(cfg.OverlayGenerationAddr, cfg.OverlayGenerationPeer)
+	l, addr, err := listenLocalSocket(cfg.OverlayGenerationAddr, cfg.OverlayGenerationPeer, cfg.OverlayGenerationSocketGID)
 	if err != nil {
 		log.Errorln("Overlay generation socket listen error: %s", err)
 		return
@@ -101,7 +101,7 @@ func startOverlayGeneration(cfg *Config) {
 // os.Chmod(addr, 0o666) with the error discarded — which both widens the socket
 // to every local user and leaves a window in which it carries the process
 // umask.
-func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, error) {
+func listenLocalSocket(addr string, policy PeerPolicy, socketGID int) (net.Listener, string, error) {
 	resolved := C.Path.Resolve(addr)
 	dir := filepath.Dir(resolved)
 	// Traverse-only when a peer group is named. The peers are separate service
@@ -110,7 +110,7 @@ func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, er
 	// listable. Without a named group nobody but the runtime user is expected,
 	// and the directory stays private.
 	dirMode := os.FileMode(0o700)
-	if policy.GID >= 0 {
+	if socketGID >= 0 {
 		dirMode = 0o711
 	}
 	if err := os.MkdirAll(dir, dirMode); err != nil {
@@ -119,7 +119,7 @@ func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, er
 	// MkdirAll leaves an existing directory's mode alone, and the two sockets
 	// share one directory, so widen it explicitly rather than depending on
 	// which socket happened to create it.
-	if policy.GID >= 0 {
+	if socketGID >= 0 {
 		if err := os.Chmod(dir, dirMode); err != nil {
 			return nil, resolved, err
 		}
@@ -142,8 +142,8 @@ func listenLocalSocket(addr string, policy PeerPolicy) (net.Listener, string, er
 	// group is named, hand the socket to that group; the SO_PEERCRED check on
 	// every accept is still what authorises, this only makes connecting
 	// possible for the identity the policy already admits.
-	if policy.GID >= 0 {
-		if err := grantSocketGroup(resolved, policy.GID); err != nil {
+	if socketGID >= 0 {
+		if err := grantSocketGroup(resolved, socketGID); err != nil {
 			_ = l.Close()
 			return nil, resolved, err
 		}

@@ -89,6 +89,8 @@ func applyRoute(cfg *config.Config) {
 			UID: cfg.Controller.RuntimeOverlayGenerationPeerUID,
 			GID: cfg.Controller.RuntimeOverlayGenerationPeerGID,
 		},
+		OverlayControlSocketGID:    cfg.Controller.RuntimeOverlayControlSocketGID,
+		OverlayGenerationSocketGID: cfg.Controller.RuntimeOverlayGenerationSocketGID,
 	})
 }
 
