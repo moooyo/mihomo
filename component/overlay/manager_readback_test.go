@@ -68,3 +68,38 @@ func TestProcessorStateFollowsTheLease(t *testing.T) {
 		t.Fatal("quarantined must not be serviceable")
 	}
 }
+
+// A steady-state heartbeat refreshes the registry's lease and deliberately
+// leaves the snapshot alone — nothing about the state changed, so there is
+// nothing to swap. The pointer the snapshot holds therefore stops advancing
+// while the processor is attesting perfectly well.
+//
+// Observed on a live gateway: the readback said the lease had expired two
+// minutes earlier and the processor was not ready, while the core was logging
+// captured connections through the client anchor the whole time. Judging expiry
+// from the held pointer reports a healthy gateway as lapsed — the exact inverse
+// of the fault the expiry check was added for.
+func TestRegistryIsTheAuthorityOnLeaseValidity(t *testing.T) {
+	registry := NewLeaseRegistry(DefaultLeaseTTL)
+	first, err := registry.Register("intercept", "inst-1", "g-1", "b-1", "c-1", 0, 0)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// What a snapshot would have captured at that moment.
+	held := *first
+
+	// A later heartbeat, same lease.
+	refreshed, err := registry.Register("intercept", "inst-1", "g-1", "b-1", "c-1", 0, 0)
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if refreshed.LeaseID != first.LeaseID {
+		t.Fatalf("a heartbeat minted a new lease %q (was %q)", refreshed.LeaseID, first.LeaseID)
+	}
+	if !refreshed.ExpiresAt.After(held.ExpiresAt) && !refreshed.ExpiresAt.Equal(held.ExpiresAt) {
+		t.Fatal("a heartbeat moved the expiry backwards")
+	}
+	if current := registry.Current(); current == nil {
+		t.Fatal("the registry reports no current lease immediately after a heartbeat")
+	}
+}

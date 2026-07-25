@@ -585,13 +585,15 @@ func (m *Manager) Readback() Readback {
 	// Report the last attestation even after it lapses. A coordinator has to
 	// tell "this processor never attested" apart from "it attested and then
 	// stopped"; collapsing both to "none" hides a live processor going away.
-	// Expiry is evaluated here rather than trusted from the held pointer. The
-	// sweeper is what swaps the state, so between a lease lapsing and the next
-	// sweep the held pointer is still set — and reporting that as "valid" tells
-	// an operator the processor is attesting when capture has already begun
-	// failing closed.
-	lease, leaseState := cur.lease, "valid"
-	if lease.Expired(time.Now()) {
+	// Read the live lease from the registry, the way the sweeper does, rather
+	// than the pointer the snapshot holds. A steady-state heartbeat refreshes
+	// the registry's copy and deliberately leaves the snapshot untouched — the
+	// state has not changed, so there is nothing to swap — which means the held
+	// pointer's expiry stops advancing while the processor is attesting
+	// perfectly well. Judging expiry from it reports a healthy gateway as
+	// lapsed, the exact inverse of the fault this check was added for.
+	lease, leaseState := m.leases.Current(), "valid"
+	if lease == nil {
 		lease, leaseState = cur.lastLease, "expired"
 		// The processor state has to follow. It is the field an operator reads
 		// first, and reporting "ready" while capture is already being refused
