@@ -839,3 +839,68 @@ func TestPublicOnlyRefusesNonGlobalDestinations(t *testing.T) {
 		t.Fatal("a public-only capability was refused a globally routable destination")
 	}
 }
+
+// A gateway that restarts and resumes an existing generation never commits, so
+// the readiness sweeper has to be running on that path too. It is what fails
+// captures closed when a lease lapses on an idle link, without waiting for
+// traffic to arrive and notice.
+//
+// Nothing here calls RefreshReadiness. That is the whole point: the function
+// was already correct and already covered, and the only test driving it called
+// it by hand, so it proved the function worked rather than that anything ran
+// it. On the recovery path nothing did.
+func TestRecoveredGenerationSweepsReadinessWithoutACommit(t *testing.T) {
+	dir := t.TempDir()
+	hooks := Hooks{ProcessorProxies: func() map[string]string {
+		return map[string]string{"MODULE-INTERCEPT": "MODULE-INTERCEPT"}
+	}}
+
+	store, err := OpenStore(dir, "5gpn")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	first := NewManager(store, "5gpn", hooks)
+	if _, err := first.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	readyLease(t, first, "g1")
+	if _, err := first.Commit(CommitRequest{GenerationID: "g1"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	first.Close()
+
+	// The restart. This manager only ever recovers.
+	store2, err := OpenStore(dir, "5gpn")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	second := NewManager(store2, "5gpn", hooks)
+	defer second.Close()
+	second.leases = NewLeaseRegistry(20 * time.Millisecond)
+	second.sweepInterval = time.Millisecond
+	if err := second.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	if _, err := second.RegisterReadiness("proc", "inst1", "g1", "", "", 0, 0); err != nil {
+		t.Fatalf("register readiness: %v", err)
+	}
+	if got := second.Snapshot().State(); got != ProcessorReady {
+		t.Fatalf("state after attestation = %s, want ready", got)
+	}
+
+	// Assert the held state, not the readback. Readback rewrites the state it
+	// reports when the lease is gone, so reading it here would pass whether or
+	// not the sweeper ever ran — which is exactly how this went unnoticed.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if second.Snapshot().State() == ProcessorNotReady {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the lapsed lease never moved the held state off %s; the sweeper is not running after a recovery",
+				second.Snapshot().State())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}

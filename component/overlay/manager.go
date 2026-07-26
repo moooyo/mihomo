@@ -138,6 +138,9 @@ type Manager struct {
 
 	sweepOnce sync.Once
 	sweepStop chan struct{}
+	// sweepInterval is a field so a test can drive the sweeper without waiting
+	// on wall-clock seconds. Nothing outside this package sets it.
+	sweepInterval time.Duration
 }
 
 // NewManager builds a manager over an already-opened store.
@@ -154,6 +157,7 @@ func NewManager(store *Store, owner string, hooks Hooks) *Manager {
 		bootEpoch:       boot,
 		processInstance: inst,
 		sweepStop:       make(chan struct{}),
+		sweepInterval:   time.Second,
 	}
 }
 
@@ -227,6 +231,17 @@ func (m *Manager) Recover() error {
 	}
 
 	m.holder.Store(next)
+	// The sweeper has to run after a recovery, not only after a commit.
+	//
+	// It is what turns a lapsed lease into a fail-closed capture without
+	// waiting for traffic, and a process that came up on this path may never
+	// commit at all — a gateway that restarts and resumes an existing
+	// generation is the ordinary case, not the exception. Starting it only from
+	// Commit left the readiness transition happening nowhere: Readback rewrites
+	// the state it reports so an operator polling the API still sees the truth,
+	// which is exactly why the gap survived. The state itself never moved and
+	// nothing was ever logged about it.
+	m.startSweeper()
 	log.Infoln("[Overlay] recovered generation %s in quarantine; capture traffic rejects until the processor presents a matching lease", ptr.Active)
 	return nil
 }
@@ -662,7 +677,7 @@ func (m *Manager) startSweeper() {
 // even if nothing is currently asking, and a lapsed lease must fail captures
 // closed even on an idle link.
 func (m *Manager) sweep(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(m.sweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
