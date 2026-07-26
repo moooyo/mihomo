@@ -247,9 +247,14 @@ type EgressCapability struct {
 	// AllowDirect permits the resolved leaf to be DIRECT. When false a
 	// generation whose group resolves to DIRECT fails closed instead.
 	AllowDirect bool `json:"allowDirect"`
-	// PublicOnly requires the destination to resolve to a globally routable
-	// address and forces pinned-IP dialing, so an authorized hostname cannot
-	// rebind onto a private one between authorization and dial.
+	// PublicOnly is intended to require the destination to resolve to a
+	// globally routable address. It is NOT enforced today: the coordinator
+	// never sets it, and the sole check keyed on it (forbiddenEgressScope in
+	// snapshot.go) inspects an already-known DstIP, which is the zero value for
+	// a domain-form target — so a hostname that resolves to a private address
+	// between authorization and dial is not caught here. Enforcing it needs
+	// per-adapter pinned-IP dialing, which is not implemented; do not rely on
+	// this field for isolation.
 	PublicOnly bool `json:"publicOnly"`
 	// ResolverProfile names the generation-bound resolver profile used for
 	// origin resolution. Empty means the core resolver.
