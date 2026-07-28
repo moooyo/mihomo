@@ -178,6 +178,31 @@ func (m *Manager) Leases() *LeaseRegistry { return m.leases }
 // Quotas reports the fork's fixed limits.
 func (m *Manager) Quotas() Quotas { return m.quotas }
 
+// seal installs a snapshot that fails closed without a document.
+//
+// It returns nil: an unusable store is a condition to serve through, not a
+// reason to refuse to run. The gateway stays up -- the operator can still reach
+// the console, read the readback and see why -- and every overlay-steered
+// connection rejects until a coordinator commits a generation, which it now
+// does at every startup. What this replaces was a process that exits, is
+// restarted by systemd, exits again, and takes DNS and the console down with it
+// for as long as the store stays broken.
+func (m *Manager) seal(what string, cause error) error {
+	log.Errorln("[Overlay] %s: %v", what, cause)
+	log.Errorln("[Overlay] sealing: every overlay-steered connection rejects until a generation is committed")
+
+	next := m.holder.Load().clone()
+	next.active = nil
+	next.staged = nil
+	next.draining = nil
+	next.lease = nil
+	next.sealed = true
+	next.state = ProcessorQuarantined
+	next.depErrors = []string{what + ": " + cause.Error()}
+	m.holder.Store(next)
+	return nil
+}
+
 // Recover loads the durable recovery decision and installs the startup
 // quarantine snapshot. It must run before client data-plane listeners open.
 //
@@ -186,6 +211,9 @@ func (m *Manager) Quotas() Quotas { return m.quotas }
 // capability. That is the only safe answer to a restart: the client's DNS cache
 // may still point at the gateway for capture hosts, so opening listeners with
 // no overlay at all would create exactly the bypass window the design forbids.
+//
+// When the generation cannot be read at all, quarantine is not expressible and
+// Recover seals instead; see seal and Snapshot.sealed.
 func (m *Manager) Recover() error {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
@@ -201,21 +229,27 @@ func (m *Manager) Recover() error {
 
 	rec, err := m.store.GetGeneration(ptr.Active)
 	if err != nil {
-		// A corrupt or missing active artifact means the capture set cannot be
-		// reconstructed. Refusing here is deliberate: the alternative is to
-		// serve the ordinary path for hosts whose clients still resolve to the
-		// gateway, which is an unguarded data plane.
-		return fmt.Errorf("overlay: cannot reconstruct persisted generation %s: %w", ptr.Active, err)
+		// The capture set cannot be reconstructed, so quarantine cannot be
+		// expressed: it rejects the generation's own capture matches, and there
+		// are none to read. Refusing to start was the only fail-closed answer
+		// available, and it costs the operator the entire gateway -- DNS,
+		// console and data plane -- for as long as the store stays broken.
+		//
+		// Sealing is fail-closed without the document. See Snapshot.sealed.
+		return m.seal("cannot reconstruct persisted generation "+ptr.Active, err)
 	}
 
 	compiled, err := Compile(&rec.Document, m.quotas, m.hooks.processorProxies())
 	if err != nil {
-		return fmt.Errorf("overlay: persisted generation %s no longer compiles: %w", ptr.Active, err)
+		// Same position: the document is readable but this build cannot turn it
+		// into matchers, which a schema change across an upgrade will do.
+		return m.seal("persisted generation "+ptr.Active+" no longer compiles", err)
 	}
 
 	next := m.holder.Load().clone()
 	next.active = compiled
 	next.state = ProcessorQuarantined
+	next.sealed = false
 	next.coreRevision = ptr.CoreRevision
 	next.resolverEpoch = m.resolverEpoch
 	next.lease = nil
@@ -462,6 +496,10 @@ func (m *Manager) Commit(req CommitRequest) (*CommitResult, error) {
 	}
 	next.draining = draining
 	next.depErrors = nil
+	// A commit is the one event that answers what sealing was waiting for: this
+	// process now holds a document it can serve. Leaving the seal set would keep
+	// rejecting traffic the generation was published to handle.
+	next.sealed = false
 	delete(next.staged, compiled.Document.GenerationID)
 
 	// The live swap. Everything above is preparation; this single store is what

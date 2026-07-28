@@ -57,6 +57,24 @@ type Snapshot struct {
 	staged   map[string]*Compiled
 
 	state ProcessorState
+	// sealed marks a snapshot that lost the generation it was meant to serve.
+	//
+	// Quarantine is the ordinary fail-closed answer to a restart, and it is
+	// expressed as the generation's own rules with every capture match
+	// rejecting. That needs the document. When the persisted generation cannot
+	// be reconstructed there are no rules to reject with, so quarantine cannot
+	// be expressed at all -- and the only remaining fail-closed option was
+	// refusing to start, which takes the whole gateway down for as long as the
+	// store stays broken.
+	//
+	// A sealed snapshot is the state that was missing: it fails closed without
+	// needing the document, by rejecting everything that reaches the client
+	// anchor rather than only what it can prove was captured. Broader than
+	// quarantine, and deliberately so -- with no document, "captured" is
+	// precisely what cannot be known, and passing traffic on that ignorance is
+	// the bypass the anchors exist to prevent. It clears the moment a
+	// generation commits, which the coordinator does at every startup.
+	sealed bool
 	// lease is the live readiness attestation, or nil once it has lapsed.
 	lease *Lease
 	// lastLease survives expiry so readback can report "expired" rather than
@@ -143,6 +161,12 @@ func (s *Snapshot) Staged(id string) (*Compiled, bool) {
 // match falls through to the operator's ordinary rules and that is precisely
 // the bypass the overlay exists to prevent.
 func (s *Snapshot) MatchClient(in *MatchInput) ClientDecision {
+	if s.sealed {
+		// The overlay had policy and can no longer read it. Rejecting is the
+		// only honest answer: falling through would serve the operator's own
+		// rules to hosts whose clients still resolve to the gateway.
+		return ClientDecision{Matched: true, Action: ActionReject, RuleIndex: -1}
+	}
 	if s.active == nil {
 		return ClientDecision{}
 	}

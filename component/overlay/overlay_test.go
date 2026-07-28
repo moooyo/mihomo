@@ -1017,3 +1017,104 @@ func TestDestinationQuotaCountsEveryBinding(t *testing.T) {
 		t.Fatalf("%d destinations across two bindings passed a limit of %d", 2*half, q.MaxCapabilityDestinations)
 	}
 }
+
+// A store this build cannot reconstruct must not take the gateway down.
+//
+// Recovery used to return an error here, and the host turns that into a fatal
+// config error: the process exits, systemd restarts it, it exits again, and DNS
+// and the console go with it for as long as the store stays broken. The reason
+// was sound -- quarantine rejects the generation's own capture matches, and with
+// no readable document there are none to reject, so refusing was the only
+// fail-closed answer available. Sealing is the answer that was missing.
+func TestRecoverSealsInsteadOfRefusingToStart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir, "5gpn")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	hooks := Hooks{ProcessorProxies: func() map[string]string {
+		return map[string]string{"MODULE-INTERCEPT": "MODULE-INTERCEPT"}
+	}}
+	first := NewManager(store, "5gpn", hooks)
+	defer first.Close()
+	if _, err := first.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	readyLease(t, first, "g1")
+	if _, err := first.Commit(CommitRequest{GenerationID: "g1"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Corrupt the artifact the pointer names, leaving the pointer intact. This
+	// is the shape an upgrade produces when the document schema moves.
+	for _, name := range []string{
+		filepath.Join(dir, "5gpn", "generations", "g1.json"),
+		filepath.Join(dir, "generations", "g1.json"),
+	} {
+		if _, statErr := os.Stat(name); statErr == nil {
+			if err := os.WriteFile(name, []byte("{\"corrupt\":true}"), 0o600); err != nil {
+				t.Fatalf("corrupt generation: %v", err)
+			}
+		}
+	}
+
+	store2, err := OpenStore(dir, "5gpn")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	second := NewManager(store2, "5gpn", hooks)
+	defer second.Close()
+	if err := second.Recover(); err != nil {
+		t.Fatalf("recover returned %v; an unreadable store must be served through, "+
+			"not turned into a fatal that crash-loops the gateway", err)
+	}
+
+	snap := second.Snapshot()
+	// Fail CLOSED, not open. With no document, "captured" is exactly what cannot
+	// be known, so everything reaching the anchor rejects. Returning no-match
+	// would drop captured hosts onto the operator's own rules -- the bypass the
+	// anchors exist to prevent, and the reason refusing to start looked correct.
+	for _, host := range []string{"www.bilibili.com", "unrelated.example.com"} {
+		d := snap.MatchClient(&MatchInput{Host: host, DstPort: 443, Network: NetworkTCP})
+		if !d.Matched || d.Action != ActionReject {
+			t.Fatalf("sealed match for %s = %+v, want reject", host, d)
+		}
+	}
+	// And no capability resolves, so a processor credential buys nothing either.
+	if _, ok := snap.ResolveEgress(&MatchInput{
+		Host: "origin.test", InUser: "module-up-1", InName: "intercept-egress",
+		DstPort: 443, Network: NetworkTCP,
+	}); ok {
+		t.Fatal("a sealed snapshot authorized an egress capability")
+	}
+}
+
+// Sealing is a holding state, not a latch: the commit that supplies a document
+// is exactly what it was waiting for, and traffic must flow again after it.
+func TestCommitClearsTheSeal(t *testing.T) {
+	m := newTestManager(t)
+	defer m.Close()
+
+	sealed := m.holder.Load().clone()
+	sealed.sealed = true
+	m.holder.Store(sealed)
+	if d := m.Snapshot().MatchClient(&MatchInput{Host: "anything.test", DstPort: 443, Network: NetworkTCP}); !d.Matched || d.Action != ActionReject {
+		t.Fatalf("seal fixture is not rejecting: %+v", d)
+	}
+
+	if _, err := m.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	readyLease(t, m, "g1")
+	if _, err := m.Commit(CommitRequest{GenerationID: "g1"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	snap := m.Snapshot()
+	if d := snap.MatchClient(&MatchInput{Host: "unrelated.example.com", DstPort: 443, Network: NetworkTCP}); d.Matched {
+		t.Fatalf("still rejecting unrelated traffic after a commit: %+v", d)
+	}
+	if d := snap.MatchClient(&MatchInput{Host: "www.bilibili.com", DstPort: 443, Network: NetworkTCP}); !d.Matched || d.Action != ActionCapture {
+		t.Fatalf("captured host after commit = %+v, want capture", d)
+	}
+}
