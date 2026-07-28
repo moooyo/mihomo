@@ -218,15 +218,20 @@ func validateOverlayDependencies(c *overlay.Compiled, view dependencyView) error
 		return fmt.Errorf("%w: tunnel is in %s mode", overlay.ErrModeConflict, view.mode)
 	}
 	for _, cap := range c.Document.Egress.Capabilities {
-		p, ok := view.proxies[cap.Group]
-		if !ok {
-			return fmt.Errorf("%w: capability %q names egress group %q, which does not exist", overlay.ErrDependencyMissing, cap.ID, cap.Group)
-		}
-		if !cap.AllowDirect && p.Type() == C.Direct {
-			return fmt.Errorf("%w: capability %q resolves to DIRECT but does not allow it", overlay.ErrDependencyMissing, cap.ID)
-		}
-		if _, isProcessor := view.processors[cap.Group]; isProcessor {
-			return fmt.Errorf("%w: capability %q names the processor %q as its own egress, which would loop", overlay.ErrDependencyMissing, cap.ID, cap.Group)
+		// Every binding is checked, not just the first: a capability is only as
+		// safe as its least safe destination, and a group that vanished between
+		// staging and commit must fail the commit whichever binding named it.
+		for _, bind := range cap.Bindings {
+			p, ok := view.proxies[bind.Group]
+			if !ok {
+				return fmt.Errorf("%w: capability %q names egress group %q, which does not exist", overlay.ErrDependencyMissing, cap.ID, bind.Group)
+			}
+			if !bind.AllowDirect && p.Type() == C.Direct {
+				return fmt.Errorf("%w: capability %q resolves group %q to DIRECT but does not allow it", overlay.ErrDependencyMissing, cap.ID, bind.Group)
+			}
+			if _, isProcessor := view.processors[bind.Group]; isProcessor {
+				return fmt.Errorf("%w: capability %q names the processor %q as its own egress, which would loop", overlay.ErrDependencyMissing, cap.ID, bind.Group)
+			}
 		}
 	}
 	for _, t := range c.Document.ProcessorTargets {

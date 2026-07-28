@@ -74,7 +74,7 @@ func (c *canonical) sum() string { return hex.EncodeToString(c.h.Sum(nil)) }
 // list is first-match, so a reordering is a different policy and must produce a
 // different digest.
 func (c *canonical) writeProjection(d *Document) {
-	c.str("mihomo-projection/v1")
+	c.str("mihomo-projection/v2")
 	c.uint(uint64(d.SchemaVersion))
 	c.str(d.Owner)
 	c.str(d.GenerationID)
@@ -115,18 +115,21 @@ func (c *canonical) writeProjection(d *Document) {
 	for _, cap := range d.Egress.Capabilities {
 		c.str(cap.ID)
 		c.str(cap.Listener)
-		c.str(cap.Group)
-		c.boolean(cap.AllowDirect)
 		c.boolean(cap.PublicOnly)
 		c.str(cap.ResolverProfile)
-		c.list(len(cap.Destinations))
-		for _, d := range cap.Destinations {
-			c.str(string(d.Kind))
-			c.str(d.Value)
-			c.list(len(d.Ports))
-			for _, p := range d.Ports {
-				c.uint(uint64(p.From))
-				c.uint(uint64(p.To))
+		c.list(len(cap.Bindings))
+		for _, bind := range cap.Bindings {
+			c.str(bind.Group)
+			c.boolean(bind.AllowDirect)
+			c.list(len(bind.Destinations))
+			for _, d := range bind.Destinations {
+				c.str(string(d.Kind))
+				c.str(d.Value)
+				c.list(len(d.Ports))
+				for _, p := range d.Ports {
+					c.uint(uint64(p.From))
+					c.uint(uint64(p.To))
+				}
 			}
 		}
 		c.str(cap.Owner)
@@ -190,23 +193,26 @@ func ResolverProfileSetDigest(profiles []ResolverProfile) string {
 // capture-rule change without diffing the whole document.
 func CapabilitySetDigest(caps []EgressCapability) string {
 	c := newCanonical()
-	c.str("capability-set/v1")
+	c.str("capability-set/v2")
 	c.list(len(caps))
 	for _, cap := range caps {
 		c.str(cap.ID)
 		c.str(cap.Listener)
-		c.str(cap.Group)
-		c.boolean(cap.AllowDirect)
 		c.boolean(cap.PublicOnly)
 		c.str(cap.ResolverProfile)
-		c.list(len(cap.Destinations))
-		for _, d := range cap.Destinations {
-			c.str(string(d.Kind))
-			c.str(d.Value)
-			c.list(len(d.Ports))
-			for _, p := range d.Ports {
-				c.uint(uint64(p.From))
-				c.uint(uint64(p.To))
+		c.list(len(cap.Bindings))
+		for _, bind := range cap.Bindings {
+			c.str(bind.Group)
+			c.boolean(bind.AllowDirect)
+			c.list(len(bind.Destinations))
+			for _, d := range bind.Destinations {
+				c.str(string(d.Kind))
+				c.str(d.Value)
+				c.list(len(d.Ports))
+				for _, p := range d.Ports {
+					c.uint(uint64(p.From))
+					c.uint(uint64(p.To))
+				}
 			}
 		}
 	}

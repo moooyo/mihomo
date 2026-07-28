@@ -160,8 +160,13 @@ func (s *Snapshot) MatchClient(in *MatchInput) ClientDecision {
 type EgressResolution struct {
 	GenerationID string
 	Capability   EgressCapability
-	Profile      ResolverProfile
-	HasProfile   bool
+	// Binding is the destination-scoped decision that authorized this request.
+	// It, not the capability, carries the egress group: one credential spans
+	// every group the generation's extensions were bound to, and which one a
+	// connection leaves through is decided by where it is going.
+	Binding    EgressBinding
+	Profile    ResolverProfile
+	HasProfile bool
 	// Draining is true when the capability belongs to a superseded generation
 	// that is still inside its drain window.
 	Draining bool
@@ -182,7 +187,7 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 		return EgressResolution{}, false
 	}
 	if s.active != nil {
-		if c, ok := s.active.Egress.authorize(in); ok {
+		if c, binding, ok := s.active.Egress.authorize(in); ok {
 			if c.PublicOnly && forbiddenEgressScope(in.DstIP) {
 				return EgressResolution{}, false
 			}
@@ -191,7 +196,7 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 			if !s.state.Serviceable() {
 				return EgressResolution{}, false
 			}
-			return s.resolution(s.active, c, false), true
+			return s.resolution(s.active, c, binding, false), true
 		}
 	}
 	now := time.Now()
@@ -199,11 +204,11 @@ func (s *Snapshot) ResolveEgress(in *MatchInput) (EgressResolution, bool) {
 		if now.After(d.deadline) {
 			continue
 		}
-		if c, ok := d.compiled.Egress.authorize(in); ok {
+		if c, binding, ok := d.compiled.Egress.authorize(in); ok {
 			if c.PublicOnly && forbiddenEgressScope(in.DstIP) {
 				return EgressResolution{}, false
 			}
-			return s.resolution(d.compiled, c, true), true
+			return s.resolution(d.compiled, c, binding, true), true
 		}
 	}
 	return EgressResolution{}, false
@@ -235,10 +240,11 @@ func forbiddenEgressScope(addr netip.Addr) bool {
 	return false
 }
 
-func (s *Snapshot) resolution(c *Compiled, cap EgressCapability, draining bool) EgressResolution {
+func (s *Snapshot) resolution(c *Compiled, cap EgressCapability, binding EgressBinding, draining bool) EgressResolution {
 	r := EgressResolution{
 		GenerationID: c.Document.GenerationID,
 		Capability:   cap,
+		Binding:      binding,
 		Draining:     draining,
 	}
 	if cap.ResolverProfile != "" {
