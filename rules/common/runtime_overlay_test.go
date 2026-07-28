@@ -21,11 +21,14 @@ func buildSnapshot(t *testing.T, ready bool) *overlay.Holder {
 			{Kind: overlay.SelectorDomain, Value: "deny.test", Action: overlay.ActionReject},
 		}},
 		Egress: overlay.EgressOverlay{Capabilities: []overlay.EgressCapability{{
-			ID: "cap-1", Listener: "intercept-egress", Group: "Proxies",
-			Destinations: []overlay.DestinationRule{
-				{Kind: overlay.SelectorDomain, Value: "origin.test",
-					Ports: []overlay.PortRange{{From: 443, To: 443}}},
-			},
+			ID: "cap-1", Listener: "intercept-egress",
+			Bindings: []overlay.EgressBinding{{
+				Group: "Proxies",
+				Destinations: []overlay.DestinationRule{
+					{Kind: overlay.SelectorDomain, Value: "origin.test",
+						Ports: []overlay.PortRange{{From: 443, To: 443}}},
+				},
+			}},
 		}}},
 	}
 	store, err := overlay.OpenStore(t.TempDir(), "5gpn")

@@ -218,9 +218,42 @@ type DestinationRule struct {
 	Ports []PortRange  `json:"ports,omitempty"`
 }
 
+// EgressBinding is one destination-scoped egress decision inside a capability.
+//
+// Splitting the group off the capability is what lets a single credential carry
+// a processor whose extensions were bound to different groups. The alternative
+// -- a credential per group -- was considered and rejected: it would put the
+// choice of group in the processor, which is precisely what "the processor
+// never names a group" forbids, and it would tie the number of credentials the
+// listener authenticates to the operator's group list, so adding a proxy group
+// would mean rewriting the configuration the overlay exists to leave alone.
+type EgressBinding struct {
+	// Group is the operator-selected proxy group or outbound this binding
+	// resolves to.
+	Group string `json:"group"`
+	// Destinations is the allowlist of endpoints this binding covers.
+	//
+	// A capability constrains endpoint and egress, not egress alone. The rules
+	// it replaces were per-destination and per-port, with everything else
+	// falling to a deny terminator; authorizing a group without constraining
+	// the destination would let a compromised processor reach anything at all
+	// through the operator's egress. An empty list therefore authorizes
+	// nothing.
+	Destinations []DestinationRule `json:"destinations"`
+	// AllowDirect permits the resolved leaf to be DIRECT. When false a binding
+	// whose group resolves to DIRECT fails closed instead.
+	AllowDirect bool `json:"allowDirect"`
+}
+
 // EgressCapability maps one opaque credential onto one fixed egress policy.
 // The processor never names a group; it presents a capability and mihomo
 // resolves it server-side against the generation that issued it.
+//
+// The policy is a destination-indexed group table rather than a single group.
+// That is what the ordered per-destination egress rules this replaces did:
+// which group a connection left through was decided by where it was going, not
+// by which credential opened it. Keeping the decision here, on the server side
+// of the credential, is what keeps it out of the processor.
 type EgressCapability struct {
 	// ID is the opaque credential the processor presents. With the SOCKS5
 	// transport this is the authenticated inbound username, so it must be
@@ -232,21 +265,12 @@ type EgressCapability struct {
 	// client stage, so accepting one on an ordinary inbound would let a client
 	// skip client matching entirely.
 	Listener string `json:"listener"`
-	// Group is the operator-selected proxy group or outbound this capability
-	// resolves to.
-	Group string `json:"group"`
-	// Destinations is the allowlist of endpoints this capability may reach.
-	//
-	// A capability constrains endpoint and egress, not egress alone. The rules
-	// it replaces were per-destination and per-port, with everything else
-	// falling to a deny terminator; authorizing a group without constraining
-	// the destination would let a compromised processor reach anything at all
-	// through the operator's egress. An empty list therefore authorizes
-	// nothing.
-	Destinations []DestinationRule `json:"destinations"`
-	// AllowDirect permits the resolved leaf to be DIRECT. When false a
-	// generation whose group resolves to DIRECT fails closed instead.
-	AllowDirect bool `json:"allowDirect"`
+	// Bindings is the destination-indexed egress policy, in order; the first
+	// binding covering a destination decides it. The coordinator emits disjoint
+	// destination sets, so order is a tie-break that should never be needed --
+	// but it is defined rather than left to map iteration, because a policy
+	// whose outcome depends on evaluation order is not a policy.
+	Bindings []EgressBinding `json:"bindings"`
 	// PublicOnly is intended to require the destination to resolve to a
 	// globally routable address. It is NOT enforced today: the coordinator
 	// never sets it, and the sole check keyed on it (forbiddenEgressScope in
@@ -467,28 +491,39 @@ func (d *Document) Validate(q Quotas) error {
 			return fmt.Errorf("%w: duplicate capability id %q", ErrInvalidDocument, c.ID)
 		}
 		seen[c.ID] = struct{}{}
-		if c.Group == "" {
-			return fmt.Errorf("%w: egress.capabilities[%d] (%s) has no group", ErrInvalidDocument, i, c.ID)
-		}
 		if c.Listener == "" {
 			return fmt.Errorf("%w: egress.capabilities[%d] (%s) names no listener", ErrInvalidDocument, i, c.ID)
 		}
-		if len(c.Destinations) == 0 {
-			// Fail closed rather than treat "no allowlist" as "everything".
-			return fmt.Errorf("%w: egress.capabilities[%d] (%s) has an empty destination allowlist, which authorizes nothing; omit the capability instead",
+		if len(c.Bindings) == 0 {
+			// Fail closed rather than treat "no policy" as "everything".
+			return fmt.Errorf("%w: egress.capabilities[%d] (%s) has no bindings, which authorizes nothing; omit the capability instead",
 				ErrInvalidDocument, i, c.ID)
 		}
-		if len(c.Destinations) > q.MaxCapabilityDestinations {
-			return fmt.Errorf("%w: egress.capabilities[%d] (%s) lists %d destinations, the limit is %d",
-				ErrQuotaExceeded, i, c.ID, len(c.Destinations), q.MaxCapabilityDestinations)
+		// The quota bounds the capability, not each binding: what it exists to
+		// cap is the total work one credential can impose on the matcher, and
+		// splitting the same allowlist across more bindings must not buy more.
+		total := 0
+		for b, bind := range c.Bindings {
+			if bind.Group == "" {
+				return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s) has no group", ErrInvalidDocument, i, b, c.ID)
+			}
+			if len(bind.Destinations) == 0 {
+				return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s -> %s) has an empty destination allowlist, which authorizes nothing; omit the binding instead",
+					ErrInvalidDocument, i, b, c.ID, bind.Group)
+			}
+			total += len(bind.Destinations)
+			for j, d := range bind.Destinations {
+				if !d.Kind.Valid() || d.Kind == SelectorAny {
+					return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d].destinations[%d] has unusable kind %q", ErrInvalidDocument, i, b, j, d.Kind)
+				}
+				if d.Value == "" {
+					return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d].destinations[%d] has an empty value", ErrInvalidDocument, i, b, j)
+				}
+			}
 		}
-		for j, d := range c.Destinations {
-			if !d.Kind.Valid() || d.Kind == SelectorAny {
-				return fmt.Errorf("%w: egress.capabilities[%d].destinations[%d] has unusable kind %q", ErrInvalidDocument, i, j, d.Kind)
-			}
-			if d.Value == "" {
-				return fmt.Errorf("%w: egress.capabilities[%d].destinations[%d] has an empty value", ErrInvalidDocument, i, j)
-			}
+		if total > q.MaxCapabilityDestinations {
+			return fmt.Errorf("%w: egress.capabilities[%d] (%s) lists %d destinations across its bindings, the limit is %d",
+				ErrQuotaExceeded, i, c.ID, total, q.MaxCapabilityDestinations)
 		}
 		if c.ResolverProfile != "" {
 			if _, ok := profiles[c.ResolverProfile]; !ok {

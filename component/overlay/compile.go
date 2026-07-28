@@ -170,26 +170,46 @@ func (c *CompiledClient) Match(in *MatchInput) ClientDecision {
 	return ClientDecision{}
 }
 
-// compiledCapability is one capability with its destination allowlist reduced
-// to matchers.
-type compiledCapability struct {
-	capability   EgressCapability
+// compiledBinding is one destination-scoped egress decision with its allowlist
+// reduced to matchers.
+type compiledBinding struct {
+	binding      EgressBinding
 	destinations []compiledRule
 }
 
-// permits reports whether this capability authorizes the requested endpoint.
+func (b *compiledBinding) permits(in *MatchInput) bool {
+	for i := range b.destinations {
+		if b.destinations[i].matches(in) {
+			return true
+		}
+	}
+	return false
+}
+
+// compiledCapability is one capability with every binding's allowlist reduced
+// to matchers.
+type compiledCapability struct {
+	capability EgressCapability
+	bindings   []compiledBinding
+}
+
+// resolve reports which binding, if any, authorizes the requested endpoint.
 //
 // The allowlist is the endpoint half of "a capability constrains endpoint and
 // egress". Without it a capability would authorize the operator's egress group
 // for any destination at all, which is strictly more than the per-destination
 // rules it replaces granted.
-func (c *compiledCapability) permits(in *MatchInput) bool {
-	for i := range c.destinations {
-		if c.destinations[i].matches(in) {
-			return true
+//
+// First match wins. The coordinator emits disjoint destination sets so no
+// endpoint should reach a second binding, but the order is honoured rather than
+// assumed away: a policy whose outcome depends on iteration order is not one.
+func (c *compiledCapability) resolve(in *MatchInput) (EgressBinding, bool) {
+	for i := range c.bindings {
+		if c.bindings[i].permits(in) {
+			return c.bindings[i].binding, true
 		}
 	}
-	return false
+	return EgressBinding{}, false
 }
 
 // CompiledEgress is the immutable capability table of one generation.
@@ -213,25 +233,28 @@ func (e *CompiledEgress) Lookup(id string) (EgressCapability, bool) {
 
 // authorize resolves a capability and checks it against the request. It returns
 // false when the capability is unknown, is presented on the wrong listener, or
-// does not cover the requested endpoint.
-func (e *CompiledEgress) authorize(in *MatchInput) (EgressCapability, bool) {
+// has no binding covering the requested endpoint. The binding it returns is the
+// egress decision: the caller must not read a group off the capability, which
+// no longer carries one.
+func (e *CompiledEgress) authorize(in *MatchInput) (EgressCapability, EgressBinding, bool) {
 	if e == nil || in.InUser == "" {
-		return EgressCapability{}, false
+		return EgressCapability{}, EgressBinding{}, false
 	}
 	c, ok := e.byID[in.InUser]
 	if !ok {
-		return EgressCapability{}, false
+		return EgressCapability{}, EgressBinding{}, false
 	}
 	// The egress stage sits before the client stage. Honouring a capability
 	// presented on any other inbound would let an ordinary client skip client
 	// matching entirely by authenticating with the credential.
 	if c.capability.Listener != "" && c.capability.Listener != in.InName {
-		return EgressCapability{}, false
+		return EgressCapability{}, EgressBinding{}, false
 	}
-	if !c.permits(in) {
-		return EgressCapability{}, false
+	binding, ok := c.resolve(in)
+	if !ok {
+		return EgressCapability{}, EgressBinding{}, false
 	}
-	return c.capability, true
+	return c.capability, binding, true
 }
 
 // IDs returns the capability identifiers, for readback and for wiring the
@@ -316,23 +339,27 @@ func Compile(d *Document, q Quotas, processorProxies map[string]string) (*Compil
 
 	byID := make(map[string]*compiledCapability, len(d.Egress.Capabilities))
 	for _, c := range d.Egress.Capabilities {
-		compiledDests := make([]compiledRule, 0, len(c.Destinations))
-		for j, dest := range c.Destinations {
-			cr := compiledRule{kind: dest.Kind, ports: append([]PortRange(nil), dest.Ports...)}
-			if dest.Kind == SelectorIPCIDR {
-				p, err := netip.ParsePrefix(dest.Value)
-				if err != nil {
-					return nil, fmt.Errorf("%w: capability %q destination %d has an unparsable prefix %q: %s",
-						ErrInvalidDocument, c.ID, j, dest.Value, err)
+		compiledBindings := make([]compiledBinding, 0, len(c.Bindings))
+		for b, bind := range c.Bindings {
+			compiledDests := make([]compiledRule, 0, len(bind.Destinations))
+			for j, dest := range bind.Destinations {
+				cr := compiledRule{kind: dest.Kind, ports: append([]PortRange(nil), dest.Ports...)}
+				if dest.Kind == SelectorIPCIDR {
+					p, err := netip.ParsePrefix(dest.Value)
+					if err != nil {
+						return nil, fmt.Errorf("%w: capability %q binding %d destination %d has an unparsable prefix %q: %s",
+							ErrInvalidDocument, c.ID, b, j, dest.Value, err)
+					}
+					cr.prefix = p.Masked()
+				} else {
+					cr.value = strings.ToLower(dest.Value)
+					cr.dotSuffix = "." + cr.value
 				}
-				cr.prefix = p.Masked()
-			} else {
-				cr.value = strings.ToLower(dest.Value)
-				cr.dotSuffix = "." + cr.value
+				compiledDests = append(compiledDests, cr)
 			}
-			compiledDests = append(compiledDests, cr)
+			compiledBindings = append(compiledBindings, compiledBinding{binding: bind, destinations: compiledDests})
 		}
-		byID[c.ID] = &compiledCapability{capability: c, destinations: compiledDests}
+		byID[c.ID] = &compiledCapability{capability: c, bindings: compiledBindings}
 	}
 
 	profiles := make(map[string]ResolverProfile, len(d.ResolverProfiles))

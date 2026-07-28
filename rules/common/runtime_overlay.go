@@ -109,12 +109,15 @@ func (r *RuntimeOverlay) Match(metadata *C.Metadata, _ C.RuleMatchHelper) (bool,
 			// to sit immediately after this anchor.
 			return false, ""
 		}
-		if !r.resolves(b, res.Capability.Group) {
+		// The group comes off the resolved binding, never off the capability:
+		// one credential spans every group the generation binds, and the
+		// destination is what selects among them.
+		if !r.resolves(b, res.Binding.Group) {
 			return true, rejectAdapter
 		}
 		metadata.OverlayGeneration = res.GenerationID
 		metadata.OverlayCapability = res.Capability.ID
-		return true, res.Capability.Group
+		return true, res.Binding.Group
 	}
 
 	d := snapshot.MatchClient(&in)

@@ -2,6 +2,7 @@ package overlay
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -25,10 +26,13 @@ func testDocument(id string) *Document {
 			{Kind: SelectorIPCIDR, Value: "203.0.113.0/24", Action: ActionDirect},
 		}},
 		Egress: EgressOverlay{Capabilities: []EgressCapability{{
-			ID: "module-up-1", Listener: "intercept-egress", Group: "Proxies", PublicOnly: true,
-			Destinations: []DestinationRule{
-				{Kind: SelectorDomainSuffix, Value: "bilibili.com", Ports: []PortRange{{From: 80, To: 80}, {From: 443, To: 443}}},
-			},
+			ID: "module-up-1", Listener: "intercept-egress", PublicOnly: true,
+			Bindings: []EgressBinding{{
+				Group: "Proxies",
+				Destinations: []DestinationRule{
+					{Kind: SelectorDomainSuffix, Value: "bilibili.com", Ports: []PortRange{{From: 80, To: 80}, {From: 443, To: 443}}},
+				},
+			}},
 		}}},
 	}
 }
@@ -514,8 +518,11 @@ func TestTransitionModeControlsDraining(t *testing.T) {
 			g2.ParentGenerationID = "g1"
 			g2.TransitionMode = tc.mode
 			g2.Egress.Capabilities = []EgressCapability{{
-				ID: "module-up-2", Listener: "intercept-egress", Group: "Proxies",
-				Destinations: []DestinationRule{{Kind: SelectorDomainSuffix, Value: "bilibili.com"}},
+				ID: "module-up-2", Listener: "intercept-egress",
+				Bindings: []EgressBinding{{
+					Group:        "Proxies",
+					Destinations: []DestinationRule{{Kind: SelectorDomainSuffix, Value: "bilibili.com"}},
+				}},
 			}}
 			if _, err := m.Stage(g2); err != nil {
 				t.Fatalf("stage g2: %v", err)
@@ -779,7 +786,7 @@ func TestCapabilityIsBoundToItsListener(t *testing.T) {
 // validation instead of at every dial.
 func TestCapabilityWithNoDestinationsIsRejected(t *testing.T) {
 	d := testDocument("g1")
-	d.Egress.Capabilities[0].Destinations = nil
+	d.Egress.Capabilities[0].Bindings[0].Destinations = nil
 	if err := d.Validate(DefaultQuotas()); err == nil {
 		t.Fatal("a capability with an empty destination allowlist was accepted")
 	}
@@ -795,7 +802,7 @@ func TestCapabilityWithNoDestinationsIsRejected(t *testing.T) {
 func TestDestinationAllowlistIsInTheDigest(t *testing.T) {
 	a := testDocument("g1")
 	b := testDocument("g1")
-	b.Egress.Capabilities[0].Destinations = append(b.Egress.Capabilities[0].Destinations,
+	b.Egress.Capabilities[0].Bindings[0].Destinations = append(b.Egress.Capabilities[0].Bindings[0].Destinations,
 		DestinationRule{Kind: SelectorDomain, Value: "extra.test"})
 	if ComputeDigests(a).Projection == ComputeDigests(b).Projection {
 		t.Fatal("widening the destination allowlist did not change the digest")
@@ -807,7 +814,7 @@ func TestDestinationAllowlistIsInTheDigest(t *testing.T) {
 // per-adapter pinned dialing: a destination whose address is already known.
 func TestPublicOnlyRefusesNonGlobalDestinations(t *testing.T) {
 	d := testDocument("g1")
-	d.Egress.Capabilities[0].Destinations = []DestinationRule{
+	d.Egress.Capabilities[0].Bindings[0].Destinations = []DestinationRule{
 		{Kind: SelectorIPCIDR, Value: "0.0.0.0/0"},
 		{Kind: SelectorDomainSuffix, Value: "bilibili.com"},
 	}
@@ -902,5 +909,111 @@ func TestRecoveredGenerationSweepsReadinessWithoutACommit(t *testing.T) {
 				second.Snapshot().State())
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// One credential, several groups. This is the whole point of binding the group
+// to the destination rather than to the capability: a processor whose
+// extensions were bound to different egress groups presents the single
+// credential it authenticates with, and mihomo decides which group each
+// connection leaves through from where it is going.
+//
+// The alternative -- a credential per group -- would put that choice in the
+// processor, which is exactly what "the processor never names a group" forbids.
+func TestOneCredentialResolvesEachDestinationToItsOwnGroup(t *testing.T) {
+	d := testDocument("g1")
+	d.Egress.Capabilities = []EgressCapability{{
+		ID: "module-up-1", Listener: "intercept-egress",
+		Bindings: []EgressBinding{
+			{Group: "Proxies", Destinations: []DestinationRule{
+				{Kind: SelectorDomain, Value: "proxied.test", Ports: []PortRange{{From: 443, To: 443}}},
+			}},
+			{Group: "DIRECT", AllowDirect: true, Destinations: []DestinationRule{
+				{Kind: SelectorDomain, Value: "unproxied.test", Ports: []PortRange{{From: 443, To: 443}}},
+			}},
+		},
+	}}
+	c := mustCompile(t, d)
+	snap := EmptySnapshot("boot", "inst")
+	snap.active = c
+	snap.state = ProcessorReady
+
+	for host, want := range map[string]string{
+		"proxied.test":   "Proxies",
+		"unproxied.test": "DIRECT",
+	} {
+		res, ok := snap.ResolveEgress(&MatchInput{
+			Host: host, InUser: "module-up-1", InName: "intercept-egress",
+			DstPort: 443, Network: NetworkTCP,
+		})
+		if !ok {
+			t.Fatalf("%s was not authorized by the one credential that covers it", host)
+		}
+		if res.Binding.Group != want {
+			t.Fatalf("%s resolved to group %q, want %q", host, res.Binding.Group, want)
+		}
+		if res.Capability.ID != "module-up-1" {
+			t.Fatalf("%s resolved capability %q", host, res.Capability.ID)
+		}
+	}
+
+	// A destination in no binding is still refused. Spanning groups must not
+	// have widened what the credential reaches.
+	if _, ok := snap.ResolveEgress(&MatchInput{
+		Host: "elsewhere.test", InUser: "module-up-1", InName: "intercept-egress",
+		DstPort: 443, Network: NetworkTCP,
+	}); ok {
+		t.Fatal("a destination outside every binding was authorized")
+	}
+}
+
+// Which binding covers a destination is part of the authorization, so moving a
+// destination between groups must be a different generation.
+func TestBindingGroupIsInTheDigest(t *testing.T) {
+	a := testDocument("g1")
+	b := testDocument("g1")
+	b.Egress.Capabilities[0].Bindings[0].Group = "Other"
+	if ComputeDigests(a).Projection == ComputeDigests(b).Projection {
+		t.Fatal("re-pointing a binding at another group did not change the digest")
+	}
+	if CapabilitySetDigest(a.Egress.Capabilities) == CapabilitySetDigest(b.Egress.Capabilities) {
+		t.Fatal("re-pointing a binding at another group did not change the capability set digest")
+	}
+}
+
+// A binding with no group, or a capability with no bindings, authorizes
+// nothing. Both must fail at validation rather than at every dial.
+func TestCapabilityWithNoUsableBindingIsRejected(t *testing.T) {
+	d := testDocument("g1")
+	d.Egress.Capabilities[0].Bindings = nil
+	if err := d.Validate(DefaultQuotas()); err == nil {
+		t.Fatal("a capability with no bindings was accepted")
+	}
+	d = testDocument("g1")
+	d.Egress.Capabilities[0].Bindings[0].Group = ""
+	if err := d.Validate(DefaultQuotas()); err == nil {
+		t.Fatal("a binding with no group was accepted")
+	}
+}
+
+// The destination quota bounds the credential, not the binding: splitting the
+// same allowlist across more bindings must not buy a larger one.
+func TestDestinationQuotaCountsEveryBinding(t *testing.T) {
+	q := DefaultQuotas()
+	half := q.MaxCapabilityDestinations/2 + 1
+	fill := func(n int) []DestinationRule {
+		out := make([]DestinationRule, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, DestinationRule{Kind: SelectorDomain, Value: fmt.Sprintf("h%d.test", i)})
+		}
+		return out
+	}
+	d := testDocument("g1")
+	d.Egress.Capabilities[0].Bindings = []EgressBinding{
+		{Group: "Proxies", Destinations: fill(half)},
+		{Group: "DIRECT", AllowDirect: true, Destinations: fill(half)},
+	}
+	if err := d.Validate(q); err == nil {
+		t.Fatalf("%d destinations across two bindings passed a limit of %d", 2*half, q.MaxCapabilityDestinations)
 	}
 }
