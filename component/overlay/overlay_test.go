@@ -1190,3 +1190,60 @@ func TestUnboundedBindingChangesTheCapabilityDigest(t *testing.T) {
 		t.Fatal("an unbounded binding hashed the same as an allowlisted one")
 	}
 }
+
+// A coordinator reads back, then commits with what it read. Readback must
+// therefore report the LIVE core revision, not the one recorded in the active
+// snapshot.
+//
+// Reporting the snapshot's revision wedges the overlay permanently: after any
+// reload that moves the dependency closure, every readback keeps returning the
+// stale value, every commit CASes against it, and no routing change can land
+// again until the process restarts. That is a silent, total loss of control
+// over the data plane, so it is pinned here rather than left to review.
+func TestReadbackReportsTheLiveCoreRevision(t *testing.T) {
+	store, err := OpenStore(t.TempDir(), "5gpn")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	live := uint64(1)
+	m := NewManager(store, "5gpn", Hooks{
+		CoreRevision:     func() uint64 { return live },
+		LiveCoreRevision: func() uint64 { return live },
+		ProcessorProxies: func() map[string]string { return map[string]string{"MODULE-INTERCEPT": "MODULE-INTERCEPT"} },
+	})
+	t.Cleanup(m.Close)
+
+	if _, err := m.Stage(testDocument("g1")); err != nil {
+		t.Fatalf("stage g1: %v", err)
+	}
+	if _, err := m.Commit(CommitRequest{GenerationID: "g1", ExpectedCoreRevision: live}); err != nil {
+		t.Fatalf("commit g1: %v", err)
+	}
+	if rb := m.Readback(); rb.CoreRevision != 1 || rb.ActiveCoreRevision != 1 {
+		t.Fatalf("after commit: core=%d active=%d, want 1/1", rb.CoreRevision, rb.ActiveCoreRevision)
+	}
+
+	// The host reloads its configuration and the closure moves. The active
+	// generation is still the one validated at revision 1.
+	live = 4
+
+	rb := m.Readback()
+	if rb.CoreRevision != 4 {
+		t.Fatalf("readback core revision = %d, want the live 4", rb.CoreRevision)
+	}
+	if rb.ActiveCoreRevision != 1 {
+		t.Fatalf("active core revision = %d, want the 1 it was validated at", rb.ActiveCoreRevision)
+	}
+
+	// The whole point: a commit built from that readback has to be accepted.
+	if _, err := m.Stage(testDocument("g2")); err != nil {
+		t.Fatalf("stage g2: %v", err)
+	}
+	if _, err := m.Commit(CommitRequest{
+		GenerationID:         "g2",
+		ExpectedActive:       rb.ActiveGeneration,
+		ExpectedCoreRevision: rb.CoreRevision,
+	}); err != nil {
+		t.Fatalf("a commit CAS'd on the readback must succeed, got %v", err)
+	}
+}

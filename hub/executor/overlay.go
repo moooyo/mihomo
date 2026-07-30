@@ -147,6 +147,7 @@ func EnableRuntimeOverlay(cfg *config.Config) error {
 
 	manager := overlay.NewManager(store, owner, overlay.Hooks{
 		CoreRevision:         coreRevisionLocked,
+		LiveCoreRevision:     CoreRevision,
 		ProcessorProxies:     processorProxies,
 		ValidateDependencies: func(c *overlay.Compiled) error { return validateOverlayDependencies(c, liveDependencyView()) },
 		AdvanceResolverEpoch: advanceResolverEpoch,

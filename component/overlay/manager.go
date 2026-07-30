@@ -17,7 +17,21 @@ type Hooks struct {
 	// configuration. A commit carries the revision it expects; if the closure
 	// moved in between, the commit conflicts instead of silently applying
 	// against a configuration it was never validated for.
+	//
+	// It is called only from paths that already hold the host's apply lock, so
+	// it must not take that lock itself. Readback runs off that path and uses
+	// LiveCoreRevision instead.
 	CoreRevision func() uint64
+
+	// LiveCoreRevision returns the same value as CoreRevision for callers that
+	// do NOT hold the host's apply lock, and therefore takes it itself.
+	//
+	// Readback has to report this rather than the revision recorded in the
+	// active snapshot. A coordinator reads back and then commits with what it
+	// read; reporting the snapshot's revision means that after any reload which
+	// moved the closure, every commit CASes against a value the core has left
+	// behind, and no routing change can ever land again.
+	LiveCoreRevision func() uint64
 
 	// ProcessorProxies returns the proxies declared as runtime-overlay
 	// processors, keyed by proxy name. A capture target absent from this map
@@ -51,6 +65,16 @@ func (h Hooks) coreRevision() uint64 {
 	return h.CoreRevision()
 }
 
+// liveCoreRevision falls back to CoreRevision so a host that wires only the
+// locked accessor still reports something, rather than silently reporting 0 and
+// disabling the revision CAS altogether.
+func (h Hooks) liveCoreRevision() uint64 {
+	if h.LiveCoreRevision == nil {
+		return h.coreRevision()
+	}
+	return h.LiveCoreRevision()
+}
+
 func (h Hooks) processorProxies() map[string]string {
 	if h.ProcessorProxies == nil {
 		return nil
@@ -74,16 +98,23 @@ func (h Hooks) validate(c *Compiled) error {
 // two there is a window in which they legitimately differ, and conflating them
 // would make a crash in that window look like a failed commit.
 type Readback struct {
-	Enabled             bool           `json:"enabled"`
-	ActiveGeneration    string         `json:"activeGeneration"`
-	ActiveDigest        string         `json:"activeDigest,omitempty"`
-	ActiveProjection    string         `json:"activeProjectionDigest,omitempty"`
-	PersistedGeneration string         `json:"persistedGeneration"`
-	CoreRevision        uint64         `json:"coreConfigRevision"`
-	ResolverEpoch       uint64         `json:"resolverEpoch"`
-	ProcessorState      ProcessorState `json:"processorState"`
-	DependencyErrors    []string       `json:"dependencyErrors,omitempty"`
-	ProcessorInstance   string         `json:"processorInstanceId,omitempty"`
+	Enabled             bool   `json:"enabled"`
+	ActiveGeneration    string `json:"activeGeneration"`
+	ActiveDigest        string `json:"activeDigest,omitempty"`
+	ActiveProjection    string `json:"activeProjectionDigest,omitempty"`
+	PersistedGeneration string `json:"persistedGeneration"`
+	// CoreRevision is the LIVE dependency-closure revision, which is what a
+	// commit is CAS'd against. It is deliberately not the revision the active
+	// generation was validated at -- see ActiveCoreRevision for that.
+	CoreRevision uint64 `json:"coreConfigRevision"`
+	// ActiveCoreRevision is the revision the active generation was validated
+	// against. It differs from CoreRevision exactly when the configuration has
+	// been reloaded since, which is the drift worth being able to see.
+	ActiveCoreRevision uint64         `json:"activeCoreConfigRevision"`
+	ResolverEpoch      uint64         `json:"resolverEpoch"`
+	ProcessorState     ProcessorState `json:"processorState"`
+	DependencyErrors   []string       `json:"dependencyErrors,omitempty"`
+	ProcessorInstance  string         `json:"processorInstanceId,omitempty"`
 	// BundleDigest is what the last attestation claimed, not what the active
 	// generation requires. The two differ exactly when the processor is serving
 	// something stale, which is the case worth being able to see.
@@ -617,16 +648,17 @@ func (m *Manager) MarkDegraded(errs []string) {
 func (m *Manager) Readback() Readback {
 	cur := m.holder.Load()
 	rb := Readback{
-		Enabled:          true,
-		ActiveGeneration: cur.ActiveID(),
-		CoreRevision:     cur.coreRevision,
-		ResolverEpoch:    cur.resolverEpoch,
-		ProcessorState:   cur.state,
-		DependencyErrors: cur.DependencyErrors(),
-		Prepared:         cur.StagedIDs(),
-		Draining:         cur.DrainingIDs(),
-		BootEpoch:        cur.bootEpoch,
-		SchemaVersion:    SchemaVersion,
+		Enabled:            true,
+		ActiveGeneration:   cur.ActiveID(),
+		CoreRevision:       m.hooks.liveCoreRevision(),
+		ActiveCoreRevision: cur.coreRevision,
+		ResolverEpoch:      cur.resolverEpoch,
+		ProcessorState:     cur.state,
+		DependencyErrors:   cur.DependencyErrors(),
+		Prepared:           cur.StagedIDs(),
+		Draining:           cur.DrainingIDs(),
+		BootEpoch:          cur.bootEpoch,
+		SchemaVersion:      SchemaVersion,
 	}
 	if cur.active != nil {
 		rb.ActiveDigest = cur.active.Digests.Overall
