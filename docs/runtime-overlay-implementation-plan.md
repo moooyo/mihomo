@@ -340,7 +340,7 @@ unless the row says otherwise.
 | 9 | resolver cache epoch | mihomo | done |
 | 10 | tests (unit + live) | mihomo | done |
 | 11 | operation journal, generation/bundle IDs | 5gpn | done |
-| 12 | overlay driver beside the legacy YAML driver | 5gpn | done — **the overlay is now the installed default**; legacy is the fallback for a core that cannot resolve the anchors |
+| 12 | overlay driver beside the legacy YAML driver | 5gpn | done — and superseded: 5gpn 0.0.53 removed the YAML driver, so the overlay is the only publication path and a core that cannot resolve the anchors is refused at install time |
 | 13 | prepare/commit/readback/roll-forward recovery | 5gpn | done |
 | 14 | panel guard requalification | 5gpn | done — plus a migration for boxes installed before it |
 | 15 | processor generation polling and transaction binding | 5gpn-intercept | **not built** — readiness is attested by the coordinator instead; see "Who attests readiness" |
