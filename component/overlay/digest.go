@@ -121,6 +121,10 @@ func (c *canonical) writeProjection(d *Document) {
 		for _, bind := range cap.Bindings {
 			c.str(bind.Group)
 			c.boolean(bind.AllowDirect)
+			// Without this an unbounded binding and a bounded one with an empty
+			// allowlist would hash the same, and a generation that widened the
+			// policy could be accepted as unchanged.
+			c.boolean(bind.Unbounded)
 			c.list(len(bind.Destinations))
 			for _, d := range bind.Destinations {
 				c.str(string(d.Kind))
@@ -204,6 +208,10 @@ func CapabilitySetDigest(caps []EgressCapability) string {
 		for _, bind := range cap.Bindings {
 			c.str(bind.Group)
 			c.boolean(bind.AllowDirect)
+			// Without this an unbounded binding and a bounded one with an empty
+			// allowlist would hash the same, and a generation that widened the
+			// policy could be accepted as unchanged.
+			c.boolean(bind.Unbounded)
 			c.list(len(bind.Destinations))
 			for _, d := range bind.Destinations {
 				c.str(string(d.Kind))

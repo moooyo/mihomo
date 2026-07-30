@@ -178,6 +178,12 @@ type compiledBinding struct {
 }
 
 func (b *compiledBinding) permits(in *MatchInput) bool {
+	// An unbounded binding constrains the egress group and nothing about the
+	// endpoint. Validation guarantees it carries no destinations and sits last,
+	// so reaching it means no allowlist covered the request.
+	if b.binding.Unbounded {
+		return true
+	}
 	for i := range b.destinations {
 		if b.destinations[i].matches(in) {
 			return true

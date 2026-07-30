@@ -239,7 +239,25 @@ type EgressBinding struct {
 	// the destination would let a compromised processor reach anything at all
 	// through the operator's egress. An empty list therefore authorizes
 	// nothing.
-	Destinations []DestinationRule `json:"destinations"`
+	Destinations []DestinationRule `json:"destinations,omitempty"`
+	// Unbounded authorizes this group for every destination on the listener.
+	//
+	// It exists because an extension's network permission names no host: the
+	// operator confirms that the extension may reach anything it can resolve,
+	// and an allowlist cannot express that. Without it the coordinator has
+	// nothing to enumerate and every request the extension makes rejects at the
+	// listener's deny terminator, which reads as a broken extension rather than
+	// as the policy it is.
+	//
+	// It is a separate field rather than an empty allowlist or an "any"
+	// destination on purpose. An empty list stays what it has always been --
+	// a coordinator that dropped its rules, failing closed. An "any" row would
+	// look like one entry among several while subsuming all of them, which is
+	// why SelectorAny is refused as a destination kind.
+	//
+	// It removes the endpoint constraint and nothing else: AllowDirect, the
+	// listener check, PublicOnly, and the resolver profile all still apply.
+	Unbounded bool `json:"unbounded,omitempty"`
 	// AllowDirect permits the resolved leaf to be DIRECT. When false a binding
 	// whose group resolves to DIRECT fails closed instead.
 	AllowDirect bool `json:"allowDirect"`
@@ -506,6 +524,23 @@ func (d *Document) Validate(q Quotas) error {
 		for b, bind := range c.Bindings {
 			if bind.Group == "" {
 				return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s) has no group", ErrInvalidDocument, i, b, c.ID)
+			}
+			if bind.Unbounded {
+				// Carrying both would leave which one decides undefined, and
+				// the allowlist would read as a constraint that is not applied.
+				if len(bind.Destinations) > 0 {
+					return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s -> %s) is unbounded and also lists destinations; it must carry exactly one of them",
+						ErrInvalidDocument, i, b, c.ID, bind.Group)
+				}
+				// Last, and only one. A binding that matches everything shadows
+				// every binding after it, so anything but the final position
+				// would silently discard the rest of the policy instead of
+				// applying it.
+				if b != len(c.Bindings)-1 {
+					return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s -> %s) is unbounded but is not the last binding, so it would shadow the %d after it",
+						ErrInvalidDocument, i, b, c.ID, bind.Group, len(c.Bindings)-1-b)
+				}
+				continue
 			}
 			if len(bind.Destinations) == 0 {
 				return fmt.Errorf("%w: egress.capabilities[%d].bindings[%d] (%s -> %s) has an empty destination allowlist, which authorizes nothing; omit the binding instead",

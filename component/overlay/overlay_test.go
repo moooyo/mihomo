@@ -1118,3 +1118,75 @@ func TestCommitClearsTheSeal(t *testing.T) {
 		t.Fatalf("captured host after commit = %+v, want capture", d)
 	}
 }
+
+// An extension's network permission names no host, so the binding that carries
+// it cannot name one either. These pin the three properties that keep that from
+// becoming an accident: it is explicit, it is alone, and it is last.
+func TestUnboundedEgressBindingAuthorizesAnyDestination(t *testing.T) {
+	d := testDocument("g1")
+	d.Egress.Capabilities[0].Bindings = append(d.Egress.Capabilities[0].Bindings, EgressBinding{
+		Group: "Japan", Unbounded: true,
+	})
+	c := mustCompile(t, d)
+	snap := EmptySnapshot("boot", "inst")
+	snap.active = c
+	snap.state = ProcessorReady
+
+	// The allowlisted destination still resolves through its own binding, so an
+	// unbounded binding beside it does not swallow the narrower decision.
+	bind, ok := snap.ResolveEgress(egressProbe("module-up-1"))
+	if !ok || bind.Binding.Group != "Proxies" {
+		t.Fatalf("allowlisted destination resolved to %+v, %t", bind, ok)
+	}
+
+	// Anything else reaches the unbounded binding instead of failing closed.
+	elsewhere := &MatchInput{
+		InUser: "module-up-1", InName: "intercept-egress",
+		Host: "weatherkit.pages.dev", DstPort: 443, Network: NetworkTCP,
+	}
+	bind, ok = snap.ResolveEgress(elsewhere)
+	if !ok || bind.Binding.Group != "Japan" {
+		t.Fatalf("unlisted destination resolved to %+v, %t", bind, ok)
+	}
+
+	// The listener check is not relaxed by it.
+	wrongListener := *elsewhere
+	wrongListener.InName = "other"
+	if _, ok := snap.ResolveEgress(&wrongListener); ok {
+		t.Fatal("an unbounded binding authorized the wrong listener")
+	}
+}
+
+func TestUnboundedEgressBindingMustBeExplicitAloneAndLast(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*Document){
+		"with destinations": func(d *Document) {
+			d.Egress.Capabilities[0].Bindings[0].Unbounded = true
+		},
+		"not last": func(d *Document) {
+			caps := &d.Egress.Capabilities[0]
+			caps.Bindings = append([]EgressBinding{{Group: "Japan", Unbounded: true}}, caps.Bindings...)
+		},
+		"still empty when bounded": func(d *Document) {
+			d.Egress.Capabilities[0].Bindings[0].Destinations = nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := testDocument("g1")
+			mutate(d)
+			if err := d.Validate(DefaultQuotas()); err == nil {
+				t.Fatal("document was accepted")
+			}
+		})
+	}
+}
+
+// A widened policy must not hash as an unchanged one.
+func TestUnboundedBindingChangesTheCapabilityDigest(t *testing.T) {
+	bounded := testDocument("g1")
+	unbounded := testDocument("g1")
+	unbounded.Egress.Capabilities[0].Bindings = []EgressBinding{{Group: "Proxies", Unbounded: true}}
+	if CapabilitySetDigest(bounded.Egress.Capabilities) == CapabilitySetDigest(unbounded.Egress.Capabilities) {
+		t.Fatal("an unbounded binding hashed the same as an allowlisted one")
+	}
+}
