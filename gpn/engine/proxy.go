@@ -3,14 +3,14 @@ package engine
 import (
 	"context"
 	"crypto/rand"
-	"github.com/metacubex/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"github.com/metacubex/http"
+	"github.com/metacubex/tls"
 	"io"
 	"log"
 	"net"
-	"github.com/metacubex/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -300,7 +300,6 @@ func mitmTLSNextProtos(http2 bool) []string {
 	}
 	return []string{"http/1.1"}
 }
-
 
 func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn net.PacketConn) error {
 	controlClosed := make(chan struct{})

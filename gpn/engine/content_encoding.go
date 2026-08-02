@@ -7,8 +7,8 @@ import (
 	"compress/zlib"
 	"errors"
 	"fmt"
-	"io"
 	"github.com/metacubex/http"
+	"io"
 	"strings"
 
 	"github.com/andybalholm/brotli"
