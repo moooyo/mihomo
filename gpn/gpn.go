@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/gpn/api"
 	"github.com/metacubex/mihomo/gpn/dial"
 	"github.com/metacubex/mihomo/gpn/engine"
 	"github.com/metacubex/mihomo/gpn/state"
@@ -51,6 +52,7 @@ func Start(home string) error {
 		return dial.UDP(ctx, host, port)
 	})
 
+	api.Advertise("gpn-core", api.Feature{Version: 1})
 	installed.Store(true)
 	log.Infoln("[GPN] state directory %s", dir)
 	return nil
@@ -74,6 +76,14 @@ func StateDir() string {
 // gateway rather than refusing to boot. The error is returned for the caller to
 // log; it is not fatal.
 func StartInterception(configPath string) error {
+	// Withdrawing first means every early return below leaves the feature
+	// unadvertised. Advertising a subsystem that failed to come up would have
+	// the client render a panel over an engine that is not there, which is a
+	// worse failure than an absent panel: the operator would read its emptiness
+	// as "no extensions enabled".
+	api.Advertise("gpn-interception", api.Feature{})
+	engineRef.Store(nil)
+
 	if configPath == "" {
 		tunnel.SetInterceptor(nil)
 		return nil
@@ -88,6 +98,7 @@ func StartInterception(configPath string) error {
 	}
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
+	api.Advertise("gpn-interception", api.Feature{Version: 1})
 	log.Infoln("[GPN] interception engine installed from %s", configPath)
 	return nil
 }
