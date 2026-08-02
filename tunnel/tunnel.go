@@ -540,6 +540,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	// The destination is known and nothing has been read off conn yet, which is
+	// the only point where a transformation stage can still see the handshake.
+	if ic := captureTCPFor(metadata); ic != nil {
+		ic.HandleTCP(conn, metadata)
+		return
+	}
+
 	peekMutex := sync.Mutex{}
 	if !conn.Peeked() {
 		peekMutex.Lock()
