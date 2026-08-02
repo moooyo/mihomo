@@ -32,12 +32,12 @@ const (
 // across action or configuration snapshots.
 type moduleNetworkRequester struct {
 	ctx   context.Context
-	proxy ProxyConfig
 	roots *x509.CertPool
 	// A requester exists only for a module holding the network grant, and that
 	// grant no longer carries an origin list. Every other guard still applies:
 	// the URL is canonicalized, IP literals and unsafe or private hosts are
-	// refused, and the request still leaves through authenticated mihomo SOCKS5.
+	// refused, and the request still leaves through mihomo's own rule
+	// evaluation -- which is what the authenticated SOCKS5 hop was arranging.
 	slots chan struct{}
 
 	mu         sync.Mutex
@@ -47,13 +47,12 @@ type moduleNetworkRequester struct {
 
 func newModuleNetworkRequester(
 	ctx context.Context,
-	proxy ProxyConfig,
 	roots *x509.CertPool,
 	slots chan struct{},
 ) *moduleNetworkRequester {
 	return &moduleNetworkRequester{
-		ctx:        ctx,
-		proxy:      proxy,
+		ctx: ctx,
+
 		roots:      roots,
 		slots:      slots,
 		transports: make(map[string]*http.Transport),
@@ -188,12 +187,11 @@ type moduleNetworkResponse struct {
 
 func performModuleNetworkRequest(
 	ctx context.Context,
-	proxy ProxyConfig,
 	roots *x509.CertPool,
 	slots chan struct{},
 	options map[string]any,
 ) (moduleNetworkResponse, error) {
-	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
+	requester := newModuleNetworkRequester(ctx, roots, slots)
 	defer requester.Close()
 	req, err := newModuleNetworkRequest(options)
 	if err != nil {

@@ -265,7 +265,7 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		// instead), so contextObject["network"] was unreachable JavaScript.
 		// Two requesters means two transport maps and two deferred Closes, and
 		// a reader with no way to tell which one is live.
-		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, r.networkSlots)
+		requester = newModuleNetworkRequester(actionCtx, roots, r.networkSlots)
 		defer requester.Close()
 		if rule.Entry != scriptEntryProxyCompat {
 			contextObject["network"] = requester.newAPI(vm, loop)

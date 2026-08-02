@@ -13,7 +13,6 @@ import (
 // the compiled script runtime or decoded script settings from Config.
 type upstreamTransportProjection struct {
 	generation uint64
-	proxy      ProxyConfig
 	http2      bool
 	targets    upstreamTargetProjection
 	// fingerprint identifies everything a pooled transport depends on, and
@@ -62,9 +61,6 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 	// fields, so a field cannot be added to one and forgotten in the other
 	// without the two going obviously out of step.
 	digest := sha256.New()
-	writeFingerprintField(digest, cfg.UpstreamProxy.Address)
-	writeFingerprintField(digest, cfg.UpstreamProxy.Username)
-	writeFingerprintField(digest, cfg.UpstreamProxy.Password)
 	writeFingerprintBool(digest, cfg.MITM.HTTP2)
 	writeFingerprintBool(digest, cfg.MITM.Enabled)
 	for _, module := range cfg.Modules {
@@ -106,7 +102,6 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 
 	projection := upstreamTransportProjection{
 		generation: cfg.generation,
-		proxy:      cfg.UpstreamProxy,
 		http2:      cfg.MITM.HTTP2,
 		targets:    targets,
 	}

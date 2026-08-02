@@ -44,24 +44,14 @@ var canonicalRoutingDomainPattern = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]
 type Config struct {
 	Version        int          `json:"version"`
 	ExecutionOrder []string     `json:"execution_order"`
-	Listen         string       `json:"listen"`
-	Username       string       `json:"username"`
-	Password       string       `json:"password"`
 	TLSCert        string       `json:"tls_cert"`
 	TLSKey         string       `json:"tls_key"`
-	UpstreamProxy  ProxyConfig  `json:"upstream_proxy"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
 	runtime        *compiledScriptConfig
 	// generation is assigned by configStore and advances only when validated
 	// document content changes. Directly decoded test/check configs leave it zero.
 	generation uint64
-}
-
-type ProxyConfig struct {
-	Address  string `json:"address"`
-	Username string `json:"username"`
-	Password string `json:"password"`
 }
 
 type MITMSettings struct {
@@ -546,21 +536,6 @@ func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 	if c.Version != configVersion {
 		return fmt.Errorf("config version must be %d", configVersion)
 	}
-	if err := validateLoopbackAddress("listen", c.Listen); err != nil {
-		return err
-	}
-	if err := validateLoopbackAddress("upstream_proxy.address", c.UpstreamProxy.Address); err != nil {
-		return err
-	}
-	if c.Listen != "127.0.0.1:18080" || c.UpstreamProxy.Address != "127.0.0.1:17890" {
-		return errors.New("SOCKS addresses do not match the fixed loopback boundary")
-	}
-	if len(c.Username) < 16 || len(c.Password) < 24 || len(c.Username) > 255 || len(c.Password) > 255 {
-		return errors.New("inbound SOCKS credentials have an invalid length")
-	}
-	if len(c.UpstreamProxy.Username) < 16 || len(c.UpstreamProxy.Password) < 24 || len(c.UpstreamProxy.Username) > 255 || len(c.UpstreamProxy.Password) > 255 {
-		return errors.New("upstream SOCKS credentials have an invalid length")
-	}
 	if strings.TrimSpace(c.TLSCert) == "" || strings.TrimSpace(c.TLSKey) == "" {
 		return errors.New("tls_cert and tls_key are required")
 	}
@@ -727,28 +702,6 @@ func validCanonicalRoutingDomain(value string) bool {
 		value == strings.ToLower(value) &&
 		!strings.HasSuffix(value, ".") &&
 		canonicalRoutingDomainPattern.MatchString(value)
-}
-
-func (c Config) ValidateDeployment() error {
-	if c.TLSCert != "/etc/5gpn/intercept/tls/fullchain.pem" || c.TLSKey != "/etc/5gpn/intercept/tls/privkey.pem" {
-		return errors.New("TLS paths do not match the fixed interception runtime boundary")
-	}
-	return nil
-}
-
-func validateLoopbackAddress(name, value string) error {
-	host, port, err := net.SplitHostPort(value)
-	if err != nil {
-		return fmt.Errorf("%s must be a host:port address: %w", name, err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || ip.To4() == nil || !ip.IsLoopback() {
-		return fmt.Errorf("%s must use an IPv4 loopback address", name)
-	}
-	if port == "" || port == "0" {
-		return fmt.Errorf("%s must use a non-zero port", name)
-	}
-	return nil
 }
 
 func canonicalHost(value string) string {
