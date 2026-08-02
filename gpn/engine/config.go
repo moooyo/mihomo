@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net"
 	"net/url"
@@ -19,9 +18,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/metacubex/mihomo/gpn/state"
 
 	"github.com/dop251/goja"
 	"github.com/itchyny/gojq"
@@ -1618,69 +1620,33 @@ func certificateDigest(cfg Config) string {
 	return digestText(strings.Join(certificateHostPatterns(cfg), "\n") + "\n")
 }
 
+// configStore holds the interception document: the compiled snapshot being
+// served, and the write path that replaces it.
+//
+// It used to be a poller. The document was written by a different process, so
+// this one stat'd it on every request, kept file-identity caches so it would not
+// re-read what it had already read, kept a second set so it would not re-log a
+// failure it had already logged, tracked whether an unstattable path had been
+// complained about, and carried a migration seam for a pushed bundle that could
+// take over from the file permanently and never hand back.
+//
+// Every line of that answered one question -- has someone else changed this
+// underneath me -- and in one address space nobody else can. What is left is a
+// pointer to load and a mutex to write under.
 type configStore struct {
-	path         string
-	readDocument func(string) ([]byte, os.FileInfo, error)
+	path string
 
-	mu               sync.Mutex
-	modTime          time.Time
-	goodSize         int64
-	goodFile         os.FileInfo
-	badModTime       time.Time
-	badSize          int64
-	badFile          os.FileInfo
-	readErrorModTime time.Time
-	readErrorSize    int64
-	readErrorFile    os.FileInfo
-	// readErrorUnstatable suppresses the duplicate read-failure log when the path
-	// could not be stat'd at all. The identity-keyed suppression above needs a
-	// FileInfo; without one, Current would log on every single request.
-	readErrorUnstatable bool
-	contentDigest       [sha256.Size]byte
-	cfg                 Config
-	logs                engineLogPublisher
-
-	// bundleSource, when set, reports the pushed bundle and whether this process
-	// has ever made one live.
-	//
-	// This is the migration seam. Before the control API the coordinator wrote
-	// this process's private file and it polled; a deployment that has never been
-	// pushed a bundle keeps working exactly that way. The first push flips the
-	// source permanently, so the two never both decide: once a bundle has been
-	// live, a withdrawal means "serve nothing", not "go back to the document the
-	// bundle migrated away from".
-	bundleSource func() (*Config, bool)
-	// bundle is the activation being served, retained only to recognise the next
-	// one. Every activation is a distinct allocation and this store holds a
-	// reference to the one it compares against, so a later allocation can never
-	// alias it. Released on withdrawal, so a purge still frees the compiled
-	// scripts it was holding.
-	bundle *Config
-	// generation numbers the snapshots this store hands out. One counter serves
-	// both sources, so the one-way handover from the file to a pushed bundle can
-	// only move it forward and equal generations always mean the same snapshot —
-	// which is exactly what the upstream transport pool compares.
+	mu         sync.Mutex
+	cur        atomic.Pointer[Config]
+	revision   string
 	generation uint64
-}
 
-// errNoActiveBundle means a pushed bundle has been withdrawn and this sidecar has
-// nothing to serve. Every caller of Current already fails closed on an error,
-// which is what "serves nothing" has to mean.
-var errNoActiveBundle = errors.New("no active bundle")
-
-// setBundleSource installs the pushed-bundle source. The source reports the live
-// bundle and, second, whether one has ever been live in this process. That second
-// answer only ever latches from false to true, so "no bundle now, but one has
-// been" is always recognised as a withdrawal rather than as a deployment that was
-// never migrated.
-func (s *configStore) setBundleSource(source func() (*Config, bool)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.bundleSource = source
+	logsMu sync.RWMutex
+	logs   engineLogPublisher
 }
 
 func newConfigStore(path string) (*configStore, error) {
-	body, info, err := readConfigDocumentWithInfo(path)
+	body, err := readConfigDocument(path)
 	if err != nil {
 		return nil, err
 	}
@@ -1689,190 +1655,127 @@ func newConfigStore(path string) (*configStore, error) {
 		return nil, err
 	}
 	cfg.generation = 1
-	store := &configStore{
-		path: path, readDocument: readConfigDocumentWithInfo,
-		contentDigest: sha256.Sum256(body), cfg: cfg, generation: cfg.generation,
-	}
-	store.rememberGoodFile(info)
+	store := &configStore{path: path, revision: documentRevision(body), generation: 1}
+	store.cur.Store(&cfg)
 	return store, nil
 }
 
+// Current returns the compiled snapshot. A pointer load: no syscall, no lock,
+// and nothing that can fail once the store exists.
 func (s *configStore) Current() (Config, error) {
+	if cfg := s.cur.Load(); cfg != nil {
+		return *cfg, nil
+	}
+	return Config{}, errors.New("gpn/engine: no interception document")
+}
+
+// Revision names the document by its bytes, which is what a write must quote.
+func (s *configStore) Revision() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.bundleSource != nil {
-		cfg, migrated := s.bundleSource()
-		if cfg != nil {
-			if cfg != s.bundle {
-				s.bundle = cfg
-				s.generation++
-			}
-			active := *cfg
-			active.generation = s.generation
-			return active, nil
-		}
-		if migrated {
-			// The seam is already crossed. A withdrawal means serve nothing, not
-			// fall back to the document the bundle migrated away from.
-			s.bundle = nil
-			return Config{}, errNoActiveBundle
-		}
+	return s.revision
+}
+
+// Update mutates, validates, persists, then publishes.
+//
+// The candidate is marshalled and decoded again before it goes live, so what
+// the engine serves is compiled from exactly the bytes on disk. Compiling the
+// in-memory value instead would let a field that does not survive marshalling
+// be live and unpersisted, and the difference would surface at the next restart
+// as a configuration that changed while nobody was editing it.
+//
+// The pointer moves only after the rename, so a reader can never observe a
+// document a crash would un-observe.
+func (s *configStore) Update(expected string, mutate func(Config) (Config, error)) (Config, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current := Config{}
+	if cfg := s.cur.Load(); cfg != nil {
+		current = *cfg
 	}
-	// A stat failure must not be worse than a read failure. Fourteen lines below,
-	// a readDocument error logs once and retains the last valid snapshot, which is
-	// the documented contract: "retains the last valid snapshot after an invalid
-	// external replacement... transient read errors remain retryable". Returning
-	// an error here made the outcome depend on which of the two syscalls happened
-	// to observe the same momentary fault -- an editor that unlinks and recreates,
-	// a bind-mount remount, a transient EACCES/EIO -- and during that window every
-	// caller fails closed against a perfectly good compiled snapshot: ServeHTTP
-	// answers 503, GetCertificate reports an unrecognised SNI so the handshake
-	// fails, and handleSOCKSConnection drops the session.
-	//
-	// The stat exists only to feed the identity caches, so skip them when it fails
-	// and let readDocument re-derive its own FileInfo. A file that is genuinely
-	// gone still ends at "serve nothing" through the bundle seam's
-	// errNoActiveBundle, which is the channel designed for that.
-	info, statErr := os.Stat(s.path)
-	if statErr != nil {
-		info = nil
-	} else {
-		if s.matchesGoodFile(info) {
-			return s.cfg, nil
-		}
-		if s.matchesBadFile(info) {
-			return s.cfg, nil
-		}
+	if expected != "" && expected != s.revision {
+		return current, s.revision, state.ErrRevisionConflict
 	}
-	readDocument := s.readDocument
-	if readDocument == nil {
-		readDocument = readConfigDocumentWithInfo
-	}
-	body, readInfo, err := readDocument(s.path)
+
+	next, err := mutate(current)
 	if err != nil {
-		// Two suppressions, because Current runs on every request and an
-		// unstattable path has no identity to key one on.
-		if info != nil {
-			if !s.matchesReadErrorFile(info) {
-				s.reportConfigReadFailure(err)
-				s.rememberReadErrorFile(info)
-			}
-		} else if !s.readErrorUnstatable {
-			s.reportConfigReadFailure(err)
-			s.clearReadErrorFile()
-			s.readErrorUnstatable = true
-		}
-		return s.cfg, nil
+		return current, s.revision, err
 	}
-	s.clearReadErrorFile()
-	s.readErrorUnstatable = false
-	if readInfo == nil {
-		readInfo = info
+	raw, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return current, s.revision, fmt.Errorf("gpn/engine: marshal config: %w", err)
 	}
-	digest := sha256.Sum256(body)
-	if digest == s.contentDigest {
-		s.rememberGoodFile(readInfo)
-		s.clearBadFile()
-		return s.cfg, nil
+	compiled, err := decodeConfig(raw)
+	if err != nil {
+		return current, s.revision, err
+	}
+	if err := state.WriteFile(s.path, raw); err != nil {
+		return current, s.revision, err
+	}
+
+	s.generation++
+	compiled.generation = s.generation
+	s.cur.Store(&compiled)
+	s.revision = documentRevision(raw)
+	s.publishEngineLog("info", "configuration updated")
+	return compiled, s.revision, nil
+}
+
+// Reload re-reads the document, for the operator who edited it by hand. Nothing
+// else needs it: every other write goes through Update, which publishes exactly
+// what it persisted.
+func (s *configStore) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	body, err := readConfigDocument(s.path)
+	if err != nil {
+		return err
+	}
+	revision := documentRevision(body)
+	if revision == s.revision {
+		return nil
 	}
 	cfg, err := decodeConfig(body)
 	if err != nil {
-		log.Print("intercept: ignoring invalid replacement config; retaining the last valid snapshot")
-		if s.engineLogsEnabled() {
-			s.publishEngineLog("error", "configuration replacement rejected: "+err.Error())
-		}
-		s.rememberBadFile(readInfo)
-		return s.cfg, nil
+		// Retain the last valid snapshot: an invalid document on disk must not
+		// take the running gateway's capture set down with it.
+		s.publishEngineLog("error", "configuration reload rejected: "+err.Error())
+		return err
 	}
 	s.generation++
 	cfg.generation = s.generation
-	s.cfg = cfg
-	s.rememberGoodFile(readInfo)
-	s.contentDigest = digest
-	s.clearBadFile()
+	s.cur.Store(&cfg)
+	s.revision = revision
 	s.publishEngineLog("info", "configuration reloaded")
-	return cfg, nil
+	return nil
 }
 
+func documentRevision(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:16])
+}
+
+// The log publisher has its own lock. It is installed after the store exists
+// and read from inside a write the store lock already covers, so sharing one
+// mutex would be a self-deadlock waiting for a caller to find it.
 func (s *configStore) setEngineLogPublisher(publisher engineLogPublisher) {
-	s.mu.Lock()
+	s.logsMu.Lock()
 	s.logs = publisher
-	s.mu.Unlock()
+	s.logsMu.Unlock()
 }
 
 func (s *configStore) publishEngineLog(level, message string) {
-	if s.engineLogsEnabled() {
-		s.logs.Publish(EngineLog{Level: level, Source: "engine", Message: message})
+	s.logsMu.RLock()
+	logs := s.logs
+	s.logsMu.RUnlock()
+	if engineLogPublishingEnabled(logs) {
+		logs.Publish(EngineLog{Level: level, Source: "engine", Message: message})
 	}
 }
 
 func (s *configStore) engineLogsEnabled() bool {
+	s.logsMu.RLock()
+	defer s.logsMu.RUnlock()
 	return engineLogPublishingEnabled(s.logs)
-}
-
-func (s *configStore) matchesGoodFile(info os.FileInfo) bool {
-	return s.goodFile != nil && info.Size() == s.goodSize && info.ModTime().Equal(s.modTime) && os.SameFile(info, s.goodFile)
-}
-
-func (s *configStore) rememberGoodFile(info os.FileInfo) {
-	if !os.SameFile(info, info) {
-		s.modTime = time.Time{}
-		s.goodSize = 0
-		s.goodFile = nil
-		return
-	}
-	s.modTime = info.ModTime()
-	s.goodSize = info.Size()
-	s.goodFile = info
-}
-
-func (s *configStore) matchesBadFile(info os.FileInfo) bool {
-	return s.badFile != nil && info.Size() == s.badSize && info.ModTime().Equal(s.badModTime) && os.SameFile(info, s.badFile)
-}
-
-func (s *configStore) rememberBadFile(info os.FileInfo) {
-	// Windows resolves FileInfo identity lazily. Comparing the value with itself
-	// pins the file ID before an atomic replacement can reuse its modification time.
-	if !os.SameFile(info, info) {
-		s.clearBadFile()
-		return
-	}
-	s.badModTime = info.ModTime()
-	s.badSize = info.Size()
-	s.badFile = info
-}
-
-func (s *configStore) clearBadFile() {
-	s.badModTime = time.Time{}
-	s.badSize = 0
-	s.badFile = nil
-}
-
-func (s *configStore) matchesReadErrorFile(info os.FileInfo) bool {
-	return s.readErrorFile != nil && info.Size() == s.readErrorSize && info.ModTime().Equal(s.readErrorModTime) && os.SameFile(info, s.readErrorFile)
-}
-
-func (s *configStore) rememberReadErrorFile(info os.FileInfo) {
-	// This state suppresses duplicate log lines only. Unlike a decoded invalid
-	// document, an I/O failure is retried on every Current call.
-	if !os.SameFile(info, info) {
-		s.clearReadErrorFile()
-		return
-	}
-	s.readErrorModTime = info.ModTime()
-	s.readErrorSize = info.Size()
-	s.readErrorFile = info
-}
-
-func (s *configStore) clearReadErrorFile() {
-	s.readErrorModTime = time.Time{}
-	s.readErrorSize = 0
-	s.readErrorFile = nil
-}
-
-func (s *configStore) reportConfigReadFailure(err error) {
-	log.Print("intercept: could not read replacement config; retaining the last valid snapshot")
-	if s.engineLogsEnabled() {
-		s.publishEngineLog("warn", "configuration read failed: "+err.Error())
-	}
 }

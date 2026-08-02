@@ -108,7 +108,7 @@ func StartInterception(configPath string) error {
 	// worse failure than an absent panel: the operator would read its emptiness
 	// as "no extensions enabled".
 	api.Advertise("gpn-interception", api.Feature{})
-	api.SetInterceptionSource(nil)
+	api.SetInterceptionEngine(nil)
 	engineRef.Store(nil)
 	// The resolver must forget the capture table in the same breath. A stale
 	// lookup would keep steering hosts the current document no longer names,
@@ -131,7 +131,7 @@ func StartInterception(configPath string) error {
 	}
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
-	api.SetInterceptionSource(func() (any, error) { return e.Snapshot() })
+	api.SetInterceptionEngine(e)
 	api.Advertise("gpn-interception", api.Feature{Version: 1})
 	if svc := dnsRef.Load(); svc != nil {
 		svc.Resolver().SetCaptureLookup(func(name string) (dns.Capture, bool) {
