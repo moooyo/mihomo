@@ -761,13 +761,6 @@ func canonicalHost(value string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
-func allowedInboundSOCKSTarget(cfg Config, target netTarget) bool {
-	if !cfg.MITM.Enabled || (target.Port != 80 && target.Port != 443) {
-		return false
-	}
-	return activeInterceptHost(cfg, target.Host) || net.ParseIP(target.Host) != nil
-}
-
 func activeInterceptHost(cfg Config, value string) bool {
 	if !cfg.MITM.Enabled {
 		return false
