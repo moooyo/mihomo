@@ -40,13 +40,6 @@ const (
 	AND
 	OR
 	NOT
-	// RuntimeOverlayClient and RuntimeOverlayEgress are the two runtime-overlay
-	// anchors. They are two types rather than one so a rule self-describes its
-	// stage and the structural validator can tell them apart without a type
-	// assertion. Append only: these values are never serialised numerically,
-	// but inserting anywhere but the end renumbers MATCH/AND/OR/NOT.
-	RuntimeOverlayClient
-	RuntimeOverlayEgress
 )
 
 type RuleType int
@@ -125,10 +118,6 @@ func (rt RuleType) String() string {
 		return "OR"
 	case NOT:
 		return "NOT"
-	case RuntimeOverlayClient:
-		return "RuntimeOverlayClient"
-	case RuntimeOverlayEgress:
-		return "RuntimeOverlayEgress"
 	default:
 		return "Unknown"
 	}

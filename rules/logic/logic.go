@@ -77,11 +77,7 @@ func (r Range) containRange(preStart, preEnd int) bool {
 func (logic *Logic) payloadToRule(subPayload string, parseRule common.ParseRuleFunc) (C.Rule, error) {
 	tp, payload, target, param := common.ParseRulePayload(subPayload, false)
 	switch tp {
-	// RUNTIME-OVERLAY is refused here because the structural validator locates
-	// the anchors by their index in the top-level rule list. An anchor nested
-	// inside a logic rule is invisible to that check, and payloadToRule parses
-	// with needTarget=false so its stage would arrive empty anyway.
-	case "MATCH", "SUB-RULE", "RUNTIME-OVERLAY":
+	case "MATCH", "SUB-RULE":
 		return nil, fmt.Errorf("unsupported rule type [%s] on logic rule", tp)
 	case "":
 		return nil, fmt.Errorf("[%s] format is error", subPayload)
@@ -187,7 +183,7 @@ func matchSubRules(metadata *C.Metadata, name string, subRules map[string][]C.Ru
 				m, a = matchSubRules(metadata, rule.Adapter(), subRules, helper)
 			}
 			if m && (a == "PASS-RULE" || (helper.CheckPassRule != nil && helper.CheckPassRule(a))) {
-				continue
+				continue 
 			}
 			return m, a
 		}
@@ -261,13 +257,3 @@ func (logic *Logic) ProviderNames() (names []string) {
 }
 
 var _ C.Rule = (*Logic)(nil)
-
-// Rules exposes the child rules of a logic expression.
-//
-// The runtime-overlay anchor validator needs it: a rule that precedes the
-// egress anchor is acceptable when it carries a negative inbound qualifier
-// excluding the processor's own listener, and recognising that requires looking
-// at the expression tree rather than at its rendered payload string.
-func (logic *Logic) Rules() []C.Rule {
-	return logic.rules
-}

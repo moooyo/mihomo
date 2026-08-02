@@ -325,16 +325,6 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate the whole payload before the first side effect. The body below
-	// applies each field independently with no rollback and unconditionally
-	// recreates nine listeners partway through, so a guard placed next to the
-	// field it protects would leave every earlier mutation already committed.
-	if reason := overlayRejectsPatch(general); reason != "" {
-		render.Status(r, http.StatusConflict)
-		render.JSON(w, r, newError(reason))
-		return
-	}
-
 	if general.AllowLan != nil {
 		listener.SetAllowLan(*general.AllowLan)
 	}

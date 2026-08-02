@@ -97,8 +97,6 @@ func ApplyConfig(cfg *config.Config, force bool) {
 
 	updateExperimental(cfg.Experimental)
 	updateUsers(cfg.Users)
-	appliedProcessors = cfg.OverlayProcessors
-	advanceCoreRevisionLocked(cfg.OverlayClosure)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updateSniffer(cfg.Sniffer)
@@ -117,12 +115,6 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
-	// Rebind the overlay to the new rule list before the data plane opens.
-	// tunnel.OnRunning below is what starts handling non-internal traffic, so
-	// this is the last point at which a persisted generation can be re-checked
-	// without a window in which listeners accept traffic the overlay has not
-	// been validated against.
-	rebindRuntimeOverlay(cfg)
 	runtime.GC()
 	tunnel.OnRunning()
 	updateUpdater(cfg)
@@ -392,16 +384,6 @@ func updateUpdater(cfg *config.Config) {
 //go:linkname temporaryUpdateGeneral github.com/metacubex/mihomo/config.temporaryUpdateGeneral
 func temporaryUpdateGeneral(general *config.General) func() {
 	oldGeneral := GetGeneral()
-	// This shim runs during config *parsing*, outside mux, so any concurrent
-	// PUT /configs, SIGHUP or `mihomo -t` would otherwise be able to flip the
-	// live tunnel out of rule mode for the duration of a parse. With an active
-	// overlay that is a real bypass window, not a cosmetic race, so the mode is
-	// pinned while a generation is bound to this process.
-	if tunnel.OverlaySnapshot().RequiresAnchors() {
-		pinned := *general
-		pinned.Mode = tunnel.Mode()
-		general = &pinned
-	}
 	updateGeneral(general, false)
 	return func() {
 		updateGeneral(oldGeneral, false)

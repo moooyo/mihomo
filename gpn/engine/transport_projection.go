@@ -157,14 +157,14 @@ func projectedModuleHostMatcher(cfg Config, module Module) *compiledHostMatcher 
 	return newCompiledHostMatcher(module.CaptureHosts)
 }
 
-func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (socksTarget, bool) {
+func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (netTarget, bool) {
 	if !p.enabled {
-		return socksTarget{}, false
+		return netTarget{}, false
 	}
 	host := canonicalHost(rawHost)
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return socksTarget{}, false
+		return netTarget{}, false
 	}
 	if (port == 80 || port == 443) && p.activeHosts.Match(host) {
 		bestPattern := ""
@@ -183,15 +183,15 @@ func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (sock
 				}
 			}
 		}
-		return socksTarget{Host: target, Port: port}, true
+		return netTarget{Host: target, Port: port}, true
 	}
 	if !p.networkGrant {
-		return socksTarget{}, false
+		return netTarget{}, false
 	}
-	return socksTarget{Host: host, Port: port}, true
+	return netTarget{Host: host, Port: port}, true
 }
 
-func (a inboundUDPAuthorization) allows(target socksTarget) bool {
+func (a inboundUDPAuthorization) allows(target netTarget) bool {
 	if !a.enabled || target.Port != 443 {
 		return false
 	}

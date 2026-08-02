@@ -761,7 +761,7 @@ func canonicalHost(value string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
-func allowedInboundSOCKSTarget(cfg Config, target socksTarget) bool {
+func allowedInboundSOCKSTarget(cfg Config, target netTarget) bool {
 	if !cfg.MITM.Enabled || (target.Port != 80 && target.Port != 443) {
 		return false
 	}

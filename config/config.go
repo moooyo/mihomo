@@ -23,7 +23,6 @@ import (
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/geodata"
-	"github.com/metacubex/mihomo/component/overlay"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/sniffer"
@@ -112,37 +111,6 @@ type Controller struct {
 	ExternalDohServer             string
 	Secret                        string
 	Cors                          Cors
-
-	// RuntimeOverlayOwner enables the runtime overlay for one owner. Empty
-	// disables the feature entirely, including both sockets.
-	RuntimeOverlayOwner string
-	// RuntimeOverlayControl is the coordinator's read-write socket path.
-	RuntimeOverlayControl string
-	// RuntimeOverlayGeneration is the processor's read-only socket path.
-	RuntimeOverlayGeneration string
-	// RuntimeOverlayControlPeer and RuntimeOverlayGenerationPeer restrict which
-	// local process may connect to each socket. They are separate because the
-	// two sockets admit different processes: the coordinator may mutate, the
-	// processor may only read. One shared policy would have to admit both, and
-	// admitting the processor to the mutation endpoint is precisely what the
-	// separation exists to prevent. -1 means unrestricted, which is only safe
-	// because the sockets are 0600 inside a 0700 directory owned by the runtime
-	// user.
-	RuntimeOverlayControlPeerUID    int
-	RuntimeOverlayControlPeerGID    int
-	RuntimeOverlayGenerationPeerUID int
-	RuntimeOverlayGenerationPeerGID int
-	// RuntimeOverlayControlSocketGID and RuntimeOverlayGenerationSocketGID own
-	// the socket files, so the admitted peer can open them at all. This is a
-	// different question from which peer is admitted: the peer check reads the
-	// connecting process's own group, while changing a file's group requires
-	// mihomo to be a member of the target one. Using the peer's primary group
-	// for both would mean granting mihomo membership of it, widening what the
-	// core can read for no reason. A dedicated group per socket, owning nothing
-	// else, keeps the two concerns apart. -1 leaves the socket private to the
-	// runtime user.
-	RuntimeOverlayControlSocketGID    int
-	RuntimeOverlayGenerationSocketGID int
 }
 
 type Cors struct {
@@ -243,63 +211,6 @@ type Config struct {
 	Tunnels       []LC.Tunnel
 	Sniffer       *sniffer.Config
 	TLS           *TLS
-
-	// OverlayClosure fingerprints everything outside the runtime overlay that
-	// the overlay depends on. Its Sum() is the core configuration revision a
-	// generation commit compares against, so a config change inside the closure
-	// invalidates a commit that was validated before it.
-	OverlayClosure overlay.DependencyClosureDigest
-	// OverlayProcessors names the proxies flagged as external traffic
-	// processors. They are absent from GLOBAL, from include-all groups and from
-	// the reserved provider.
-	OverlayProcessors map[string]struct{}
-}
-
-// RawRuntimeOverlay configures the runtime overlay and its two machine-only
-// sockets. Leaving owner empty disables the feature; neither socket is created
-// and every anchor in the rule list is inert.
-type RawRuntimeOverlay struct {
-	Owner            string `yaml:"owner" json:"owner"`
-	ControlSocket    string `yaml:"control-socket" json:"control-socket"`
-	GenerationSocket string `yaml:"generation-socket" json:"generation-socket"`
-	// PeerUID and PeerGID restrict which local process may connect. A negative
-	// value, or the absent default of -1, means unrestricted. They apply to
-	// both sockets, and exist for the single-user deployment where that is
-	// what is wanted.
-	PeerUID *int `yaml:"peer-uid" json:"peer-uid"`
-	PeerGID *int `yaml:"peer-gid" json:"peer-gid"`
-	// The per-socket forms override the shared ones. A deployment that runs the
-	// coordinator and the processor as different users needs them: the shared
-	// policy would have to admit both identities on both sockets, which would
-	// let a compromised processor reach the mutation endpoint — the one thing
-	// the two-socket split is there to stop.
-	ControlPeerUID    *int `yaml:"control-peer-uid" json:"control-peer-uid"`
-	ControlPeerGID    *int `yaml:"control-peer-gid" json:"control-peer-gid"`
-	GenerationPeerUID *int `yaml:"generation-peer-uid" json:"generation-peer-uid"`
-	GenerationPeerGID *int `yaml:"generation-peer-gid" json:"generation-peer-gid"`
-	// The group each socket file belongs to, so the admitted peer can open it.
-	// mihomo must itself be a member of these — an unprivileged process cannot
-	// give a file away to a group it does not belong to — which is why they are
-	// dedicated groups rather than the peers' own primary ones.
-	ControlSocketGID    *int `yaml:"control-socket-gid" json:"control-socket-gid"`
-	GenerationSocketGID *int `yaml:"generation-socket-gid" json:"generation-socket-gid"`
-}
-
-// peerIDOrUnrestricted maps an absent peer id onto the unrestricted sentinel,
-// so "not configured" and "uid 0" stay distinguishable.
-// firstPeerID prefers the per-socket setting and falls back to the shared one.
-func firstPeerID(specific, shared *int) *int {
-	if specific != nil {
-		return specific
-	}
-	return shared
-}
-
-func peerIDOrUnrestricted(v *int) int {
-	if v == nil {
-		return -1
-	}
-	return *v
 }
 
 type RawCors struct {
@@ -515,7 +426,6 @@ type RawConfig struct {
 	ExternalUIURL                 string                  `yaml:"external-ui-url" json:"external-ui-url"`
 	ExternalUIName                string                  `yaml:"external-ui-name" json:"external-ui-name"`
 	ExternalDohServer             string                  `yaml:"external-doh-server" json:"external-doh-server"`
-	RuntimeOverlay                RawRuntimeOverlay       `yaml:"runtime-overlay" json:"runtime-overlay"`
 	Secret                        string                  `yaml:"secret" json:"secret"`
 	Interface                     string                  `yaml:"interface-name" json:"interface-name"`
 	RoutingMark                   int                     `yaml:"routing-mark" json:"routing-mark"`
@@ -711,17 +621,6 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	log.Infoln("Start initial configuration in progress") //Segment finished in xxm
 	startTime := time.Now()
 
-	// Fingerprint the overlay's dependency closure before anything mutates the
-	// raw document. proxyGroupsDagSort reorders rawCfg.ProxyGroup in place
-	// during parseProxies, so a digest taken later would depend on dependency
-	// topology rather than on content.
-	closure, err := OverlayClosureDigest(rawCfg)
-	if err != nil {
-		return nil, err
-	}
-	config.OverlayClosure = closure
-	config.OverlayProcessors = overlayProcessorNames(rawCfg)
-
 	general, err := parseGeneral(rawCfg)
 	if err != nil {
 		return nil, err
@@ -844,14 +743,6 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 
-	// Last, because it is the only point where rules, listeners, tunnels,
-	// hosts, sniffer and mode are all populated. requireAnchors is taken from
-	// live state: if a generation is durably persisted, a configuration that
-	// cannot evaluate the anchors must not be applied at all.
-	if err := validateRuntimeOverlay(rawCfg, config, T.OverlaySnapshot().RequiresAnchors()); err != nil {
-		return nil, err
-	}
-
 	elapsedTime := time.Since(startTime) / time.Millisecond                     // duration in ms
 	log.Infoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm
 
@@ -927,19 +818,6 @@ func parseController(cfg *RawConfig) (*Controller, error) {
 		ExternalControllerUnix:        cfg.ExternalControllerUnix,
 		ExternalControllerTLS:         cfg.ExternalControllerTLS,
 		ExternalDohServer:             cfg.ExternalDohServer,
-		RuntimeOverlayOwner:           cfg.RuntimeOverlay.Owner,
-		RuntimeOverlayControl:         cfg.RuntimeOverlay.ControlSocket,
-		RuntimeOverlayGeneration:      cfg.RuntimeOverlay.GenerationSocket,
-		RuntimeOverlayControlPeerUID: peerIDOrUnrestricted(
-			firstPeerID(cfg.RuntimeOverlay.ControlPeerUID, cfg.RuntimeOverlay.PeerUID)),
-		RuntimeOverlayControlPeerGID: peerIDOrUnrestricted(
-			firstPeerID(cfg.RuntimeOverlay.ControlPeerGID, cfg.RuntimeOverlay.PeerGID)),
-		RuntimeOverlayGenerationPeerUID: peerIDOrUnrestricted(
-			firstPeerID(cfg.RuntimeOverlay.GenerationPeerUID, cfg.RuntimeOverlay.PeerUID)),
-		RuntimeOverlayGenerationPeerGID: peerIDOrUnrestricted(
-			firstPeerID(cfg.RuntimeOverlay.GenerationPeerGID, cfg.RuntimeOverlay.PeerGID)),
-		RuntimeOverlayControlSocketGID:    peerIDOrUnrestricted(cfg.RuntimeOverlay.ControlSocketGID),
-		RuntimeOverlayGenerationSocketGID: peerIDOrUnrestricted(cfg.RuntimeOverlay.GenerationSocketGID),
 		Cors: Cors{
 			AllowOrigins:        cfg.ExternalControllerCors.AllowOrigins,
 			AllowPrivateNetwork: cfg.ExternalControllerCors.AllowPrivateNetwork,
@@ -1015,10 +893,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	proxyList = append(proxyList, "DIRECT", "REJECT")
 
 	// parse proxy
-	processors := overlayProcessorNames(cfg)
-	if err := validateOverlayProcessorIsolation(cfg, processors); err != nil {
-		return nil, nil, err
-	}
 	for idx, mapping := range proxiesConfig {
 		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel))
 		if err != nil {
@@ -1029,16 +903,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
 		}
 		proxies[proxy.Name()] = proxy
-		if _, isProcessor := processors[proxy.Name()]; isProcessor {
-			// An external traffic processor stays addressable by name — the
-			// overlay's capture rules target it — but must never become
-			// selectable policy. Withholding it from proxyList keeps it out of
-			// the reserved compatible provider and out of the auto-created
-			// GLOBAL selector; withholding it from AllProxies keeps it out of
-			// every include-all-proxies group. Both are required: they are
-			// different slices with different consumers.
-			continue
-		}
 		proxyList = append(proxyList, proxy.Name())
 		AllProxies = append(AllProxies, proxy.Name())
 	}
@@ -1236,17 +1100,10 @@ func parseRules(rulesConfig []string, proxies map[string]C.Proxy, ruleProviders 
 		}
 
 		if _, ok := proxies[target]; !ok {
-			switch tp {
-			case "SUB-RULE":
-				if _, ok = subRules[target]; !ok {
-					return nil, fmt.Errorf("%s[%d] [%s] error: sub-rule [%s] not found", format, idx, line, target)
-				}
-			case "RUNTIME-OVERLAY":
-				// The third field of an anchor line is its stage, not a proxy.
-				// NewRuntimeOverlay validates the token; the anchor's runtime
-				// target comes from the committed generation, not from here.
-			default:
+			if tp != "SUB-RULE" {
 				return nil, fmt.Errorf("%s[%d] [%s] error: proxy [%s] not found", format, idx, line, target)
+			} else if _, ok = subRules[target]; !ok {
+				return nil, fmt.Errorf("%s[%d] [%s] error: sub-rule [%s] not found", format, idx, line, target)
 			}
 		}
 

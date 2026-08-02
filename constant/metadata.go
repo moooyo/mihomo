@@ -217,15 +217,6 @@ type Metadata struct {
 	RawDstAddr net.Addr `json:"-"`
 	// Only domain rule
 	SniffHost string `json:"sniffHost"`
-
-	// OverlayGeneration records which runtime-overlay generation selected this
-	// connection. Revocation enumerates live trackers by this value, so it must
-	// be stamped at match time rather than derived later.
-	OverlayGeneration string `json:"overlayGeneration,omitempty"`
-	// OverlayCapability is the opaque egress capability the processor
-	// presented. It is deliberately not serialised: it is a credential, and
-	// /connections is readable by anything that can reach the controller.
-	OverlayCapability string `json:"-"`
 }
 
 func (m *Metadata) RemoteAddress() string {

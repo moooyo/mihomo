@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/netip"
-	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/arc"
@@ -49,33 +48,6 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
-
-	// epoch namespaces every cache and singleflight key. A runtime-overlay
-	// commit that changes the resolver profile advances it in the same critical
-	// section as the snapshot swap, which retires the previous profile's
-	// answers instantly instead of waiting out their TTLs.
-	epoch atomic.Uint64
-}
-
-// BumpEpoch retires every cached answer and in-flight singleflight result
-// without walking the cache.
-//
-// This is O(1) and synchronous, which matters: resolver.ClearCache spawns
-// goroutines and returns before anything is cleared, so it cannot serve as a
-// commit fence.
-func (r *Resolver) BumpEpoch() uint64 {
-	if r == nil {
-		return 0
-	}
-	return r.epoch.Add(1)
-}
-
-// Epoch reports the current cache epoch.
-func (r *Resolver) Epoch() uint64 {
-	if r == nil {
-		return 0
-	}
-	return r.epoch.Load()
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -194,7 +166,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 
 	q := m.Question[0]
 	domain := msgToDomain(m)
-	msg, expireTime, hit := getMsgFromCache(r.cache, r.epoch.Load(), q)
+	msg, expireTime, hit := getMsgFromCache(r.cache, q)
 	if hit {
 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
@@ -213,11 +185,6 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 // ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
 func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	q := m.Question[0]
-	// Captured once, at entry. fn also runs from the detached stale-refetch
-	// goroutine in ExchangeContext, which can land its write up to five seconds
-	// later; writing under the captured epoch means a post-bump write lands in
-	// a keyspace nobody reads any more instead of poisoning the new epoch.
-	epoch := r.epoch.Load()
 
 	retryNum := 0
 	retryMax := 3
@@ -235,7 +202,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			}
 
 			if cache {
-				putMsgToCache(r.cache, epoch, q, result)
+				putMsgToCache(r.cache, q, result)
 			}
 		}()
 
@@ -253,8 +220,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		return
 	}
 
-	sfKey := cacheKey(epoch, q)
-	ch := r.group.DoChan(sfKey, fn)
+	ch := r.group.DoChan(q.String(), fn)
 
 	var result singleflight.Result[*D.Msg]
 
@@ -270,7 +236,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
 				if err != nil && !shared && ret.Opcode < retryMax { // retry
-					r.group.DoChan(sfKey, fn)
+					r.group.DoChan(q.String(), fn)
 				}
 			}()
 			return nil, ctx.Err()
@@ -279,7 +245,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 
 	ret, err, shared := result.Val, result.Err, result.Shared
 	if err != nil && !shared && ret.Opcode < retryMax { // retry
-		r.group.DoChan(sfKey, fn)
+		r.group.DoChan(q.String(), fn)
 	}
 
 	if err == nil {
@@ -535,17 +501,6 @@ type Resolvers struct {
 	*Resolver
 	ProxyResolver  *Resolver
 	DirectResolver *Resolver
-}
-
-// BumpEpoch advances the cache epoch on all three resolvers together. They must
-// move as one: an overlay generation binds origin resolution as a whole, and a
-// partial bump would leave the proxy or direct resolver answering from the
-// previous profile.
-func (rs Resolvers) BumpEpoch() uint64 {
-	e := rs.Resolver.BumpEpoch()
-	rs.ProxyResolver.BumpEpoch()
-	rs.DirectResolver.BumpEpoch()
-	return e
 }
 
 func (rs Resolvers) ClearCache() {

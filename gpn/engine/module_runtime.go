@@ -737,7 +737,7 @@ func (r *scriptRuntime) savePersistent(snapshot *persistentSnapshot) error {
 	// durable: a power cut could leave the directory entry naming the old inode,
 	// or a temp file that was then removed -- a storage.set that returned true to
 	// a script silently undone, or the whole store absent on the first write.
-	return syncBundleDir(filepath.Dir(r.statePath))
+	return syncDir(filepath.Dir(r.statePath))
 }
 
 func installConsoleAPI(vm *goja.Runtime, publisher engineLogPublisher, metadata EngineLog) {

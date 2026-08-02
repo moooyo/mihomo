@@ -67,24 +67,24 @@ func authorizeModuleRequestActionURL(cfg Config, module Module, rawURL string) e
 	return fmt.Errorf("current request origin %q is outside this extension's capture hosts and it holds no network permission", origin)
 }
 
-func activeModuleUpstreamTarget(cfg Config, rawHost, portText string) (socksTarget, bool) {
+func activeModuleUpstreamTarget(cfg Config, rawHost, portText string) (netTarget, bool) {
 	if !cfg.MITM.Enabled {
-		return socksTarget{}, false
+		return netTarget{}, false
 	}
 	host := canonicalHost(rawHost)
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return socksTarget{}, false
+		return netTarget{}, false
 	}
 	if (port == 80 || port == 443) && activeInterceptHost(cfg, host) {
-		return socksTarget{Host: mappedInterceptTarget(cfg, host), Port: port}, true
+		return netTarget{Host: mappedInterceptTarget(cfg, host), Port: port}, true
 	}
 	// Any module holding the network grant may reach any host, so an active
 	// grant makes every target servable. There is no list left to enumerate.
 	for _, module := range cfg.Modules {
 		if module.Enabled && module.Network {
-			return socksTarget{Host: host, Port: port}, true
+			return netTarget{Host: host, Port: port}, true
 		}
 	}
-	return socksTarget{}, false
+	return netTarget{}, false
 }

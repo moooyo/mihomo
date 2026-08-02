@@ -72,24 +72,6 @@ type Config struct {
 	DohServer      string
 	IsDebug        bool
 	Cors           Cors
-
-	// OverlayControlAddr and OverlayGenerationAddr are the two machine-only
-	// runtime-overlay sockets. They are separate transports with separate
-	// access control on purpose: a processor that can read the active
-	// generation must not thereby be able to commit one.
-	OverlayControlAddr    string
-	OverlayGenerationAddr string
-	// OverlayControlPeer and OverlayGenerationPeer restrict which local process
-	// may connect to each socket. They are separate because the sockets admit
-	// different processes — the coordinator mutates, the processor only reads —
-	// and a single policy covering both would have to admit the processor to
-	// the mutation endpoint.
-	OverlayControlPeer    PeerPolicy
-	OverlayGenerationPeer PeerPolicy
-	// OverlaySocketGID values own the socket files so the admitted peer can
-	// open them. -1 leaves a socket private to the runtime user.
-	OverlayControlSocketGID    int
-	OverlayGenerationSocketGID int
 }
 
 type Cors struct {
@@ -114,8 +96,6 @@ func ReCreateServer(cfg *Config) {
 	if inbound.SupportNamedPipe {
 		go startPipe(cfg)
 	}
-	go startOverlayControl(cfg)
-	go startOverlayGeneration(cfg)
 }
 
 func SetUIPath(path string) {
@@ -153,15 +133,6 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Mount("/providers/proxies", proxyProviderRouter())
 		r.Mount("/providers/rules", ruleProviderRouter())
 		r.Mount("/cache", cacheRouter())
-		// Read-only overlay views, for the console to render what the gateway
-		// is enforcing. Deliberately GET-only and deliberately not the control
-		// router: staging, committing, aborting and readiness stay on the
-		// machine-only socket, because the claim that mihomo's constraints
-		// survive a processor compromise rests on the mutation surface not
-		// being reachable over an HTTP listener at all. Observing state is a
-		// different act from changing it.
-		r.Get("/capabilities", getOverlayCapabilities)
-		r.Get("/runtime-overlays/{owner}", getOverlayReadback)
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/storage", storageRouter())
 		if !embedMode { // disallow restart in embed mode

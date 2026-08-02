@@ -220,7 +220,7 @@ func performModuleNetworkRequest(
 type moduleNetworkRequest struct {
 	url     *url.URL
 	origin  string
-	target  socksTarget
+	target  netTarget
 	method  string
 	headers http.Header
 	body    []byte
@@ -382,7 +382,7 @@ func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitFo
 	}, nil
 }
 
-func (r *moduleNetworkRequester) transport(origin string, target socksTarget) (*http.Transport, error) {
+func (r *moduleNetworkRequester) transport(origin string, target netTarget) (*http.Transport, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -421,7 +421,7 @@ func (r *moduleNetworkRequester) transport(origin string, target socksTarget) (*
 			if splitErr != nil || canonicalHost(host) != target.Host || port != strconv.Itoa(target.Port) {
 				return nil, errors.New("transport attempted a target outside the permitted origin")
 			}
-			return dialSOCKS5TCP(dialCtx, r.proxy, target)
+			return dialUpstream(dialCtx, target)
 		},
 	}
 	r.transports[origin] = transport
@@ -437,22 +437,22 @@ func (r *moduleNetworkRequester) closeTransportIfRequesterClosed(transport *http
 	}
 }
 
-func parseModuleNetworkRequestURL(raw string) (*url.URL, string, socksTarget, error) {
+func parseModuleNetworkRequestURL(raw string) (*url.URL, string, netTarget, error) {
 	if strings.Contains(raw, "#") {
-		return nil, "", socksTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
+		return nil, "", netTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" || parsed.Hostname() == "" {
-		return nil, "", socksTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
+		return nil, "", netTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
 	}
 	originInput := strings.ToLower(parsed.Scheme) + "://" + parsed.Host
 	origin, err := canonicalModuleNetworkOrigin(originInput)
 	if err != nil {
-		return nil, "", socksTarget{}, err
+		return nil, "", netTarget{}, err
 	}
 	originURL, err := url.Parse(origin)
 	if err != nil {
-		return nil, "", socksTarget{}, err
+		return nil, "", netTarget{}, err
 	}
 	portText := originURL.Port()
 	if portText == "" {
@@ -464,14 +464,14 @@ func parseModuleNetworkRequestURL(raw string) (*url.URL, string, socksTarget, er
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil {
-		return nil, "", socksTarget{}, err
+		return nil, "", netTarget{}, err
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
 	parsed.Host = canonicalHost(parsed.Hostname())
 	if originURL.Port() != "" {
 		parsed.Host = net.JoinHostPort(parsed.Host, originURL.Port())
 	}
-	return parsed, origin, socksTarget{Host: canonicalHost(originURL.Hostname()), Port: port}, nil
+	return parsed, origin, netTarget{Host: canonicalHost(originURL.Hostname()), Port: port}, nil
 }
 
 func validateModuleNetworkHeaders(headers http.Header) error {

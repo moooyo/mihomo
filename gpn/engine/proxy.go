@@ -192,76 +192,6 @@ func (p *interceptProxy) setEngineLogPublisher(logs engineLogPublisher) {
 	p.tlsErrors.logs = logs
 }
 
-func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error {
-	var connections sync.WaitGroup
-	defer func() {
-		connections.Wait()
-		p.closeUpstreamTransports()
-	}()
-	go func() {
-		<-ctx.Done()
-		_ = listener.Close()
-	}()
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return err
-		}
-		connections.Add(1)
-		go func(conn net.Conn) {
-			defer connections.Done()
-			sessionDone := make(chan struct{})
-			defer close(sessionDone)
-			go func() {
-				select {
-				case <-ctx.Done():
-					_ = conn.Close()
-				case <-sessionDone:
-				}
-			}()
-			if err := p.handleSOCKSConnection(ctx, conn); err != nil && ctx.Err() == nil {
-				log.Printf("intercept: SOCKS session failed: %v", err)
-			}
-		}(conn)
-	}
-}
-
-func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Conn) error {
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	cfg, err := p.config.Current()
-	if err != nil {
-		return err
-	}
-	command, target, err := readSOCKSRequest(conn, cfg.Username, cfg.Password)
-	if err != nil {
-		return err
-	}
-	switch command {
-	case socksCommandConnect:
-		if !allowedInboundSOCKSTarget(cfg, target) {
-			_ = writeSOCKSReply(conn, 2, nil)
-			return errors.New("SOCKS CONNECT target is outside the active extension allowlist")
-		}
-		if err := writeSOCKSReply(conn, 0, conn.LocalAddr()); err != nil {
-			return err
-		}
-		_ = conn.SetDeadline(time.Time{})
-		if target.Port == 80 {
-			return p.servePlainHTTPConnection(conn)
-		}
-		return p.serveTLSConnection(conn, target.Host)
-	case socksCommandUDP:
-		return p.serveUDPAssociation(ctx, conn)
-	default:
-		_ = writeSOCKSReply(conn, 7, nil)
-		return fmt.Errorf("unsupported SOCKS command %d", command)
-	}
-}
-
 func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
@@ -371,81 +301,6 @@ func mitmTLSNextProtos(http2 bool) []string {
 	return []string{"http/1.1"}
 }
 
-func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Conn) error {
-	localHost, _, err := net.SplitHostPort(control.LocalAddr().String())
-	if err != nil {
-		return err
-	}
-	udpAddress := &net.UDPAddr{IP: net.ParseIP(localHost).To4(), Port: 0}
-	udpConn, err := net.ListenUDP("udp4", udpAddress)
-	if err != nil {
-		_ = writeSOCKSReply(control, 1, nil)
-		return err
-	}
-	remoteHost, _, err := net.SplitHostPort(control.RemoteAddr().String())
-	if err != nil {
-		udpConn.Close()
-		return err
-	}
-	cfg, err := p.config.Current()
-	if err != nil {
-		udpConn.Close()
-		return err
-	}
-	authorization := newInboundUDPAuthorization(cfg)
-	fallbackProtection := cfg.MITM.QUICFallbackProtection
-	cfg = Config{}
-	packetConn := &socksServerPacketConn{conn: udpConn, allowedIP: net.ParseIP(remoteHost), authorization: authorization}
-	defer packetConn.Close()
-	if err := writeSOCKSReply(control, 0, udpConn.LocalAddr()); err != nil {
-		packetConn.Close()
-		return err
-	}
-	_ = control.SetDeadline(time.Time{})
-	if fallbackProtection {
-		return discardQUICAssociation(ctx, control, packetConn)
-	}
-	server := &http3.Server{
-		Handler:        p,
-		MaxHeaderBytes: 64 << 10,
-		IdleTimeout:    90 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion:     tls.VersionTLS13,
-			GetCertificate: p.certificates.GetCertificate,
-		},
-		QUICConfig: &quic.Config{
-			Versions: []quic.Version{quic.Version1, quic.Version2},
-			// Same reason as the upstream transport: a 20s keepalive alongside a
-			// 90s idle timeout means the connection never idles out, so an idle
-			// client kept its association, its UDP socket and this server alive
-			// until the SOCKS control connection went away. Here the association
-			// bounds the leak, so this is consistency rather than a slot bug --
-			// but IdleTimeout above says 90 seconds and should mean it.
-			MaxIdleTimeout: 90 * time.Second,
-			Allow0RTT:      false,
-		},
-	}
-	defer server.Close()
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.Serve(packetConn) }()
-	controlClosed := make(chan struct{})
-	go func() {
-		var one [1]byte
-		_, _ = control.Read(one[:])
-		close(controlClosed)
-	}()
-	select {
-	case <-ctx.Done():
-	case <-controlClosed:
-	case err := <-serverErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			return err
-		}
-	}
-	_ = server.Close()
-	_ = packetConn.Close()
-	return nil
-}
 
 func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn net.PacketConn) error {
 	controlClosed := make(chan struct{})
@@ -1007,7 +862,7 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 			// forever, and no transport timeout starts until it returns.
 			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
 			defer cancel()
-			return dialSOCKS5TCP(dialCtx, projection.proxy, target)
+			return dialUpstream(dialCtx, target)
 		},
 	}
 }
@@ -1052,7 +907,7 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 			releaseSlot := func() { <-slots }
 			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
 			defer cancel()
-			packetConn, err := dialSOCKS5UDP(dialCtx, generation.projection.proxy, target)
+			packetConn, err := listenPacketUpstream(dialCtx, target)
 			if err != nil {
 				releaseSlot()
 				return nil, err
