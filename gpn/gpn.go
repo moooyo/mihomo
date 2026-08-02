@@ -14,6 +14,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/gpn/api"
 	"github.com/metacubex/mihomo/gpn/dial"
+	"github.com/metacubex/mihomo/gpn/dns"
 	"github.com/metacubex/mihomo/gpn/engine"
 	"github.com/metacubex/mihomo/gpn/state"
 	"github.com/metacubex/mihomo/log"
@@ -23,6 +24,7 @@ import (
 var (
 	stateDir  atomic.Pointer[string]
 	engineRef atomic.Pointer[engine.Engine]
+	dnsRef    atomic.Pointer[dns.Service]
 	installed atomic.Bool
 )
 
@@ -55,8 +57,32 @@ func Start(home string) error {
 	api.Advertise("gpn-core", api.Feature{Version: 1})
 	installed.Store(true)
 	log.Infoln("[GPN] state directory %s", dir)
+
+	// The resolver comes up here rather than in StartInterception because it is
+	// not optional: it is the reason a client points at this box at all. A
+	// document it cannot parse is fatal, since starting with an empty policy
+	// would resolve names the operator meant to block and steer nothing they
+	// meant to steer.
+	svc, err := dns.Open(dir)
+	if err != nil {
+		return err
+	}
+	dnsRef.Store(svc)
+	api.SetDNSService(svc)
+	api.Advertise("gpn-dns", api.Feature{Version: 1})
+
+	// Binding is a separate outcome. A gateway whose certificate has not been
+	// issued yet must still come up, serve its API and let an operator finish
+	// the bootstrap -- refusing to start would leave them with no surface on
+	// which to fix the thing that stopped it.
+	if err := svc.Listen(); err != nil {
+		log.Warnln("[GPN/DNS] listeners not bound: %v", err)
+	}
 	return nil
 }
+
+// DNS returns the resolver service, or nil before Start.
+func DNS() *dns.Service { return dnsRef.Load() }
 
 // StateDir reports where 5gpn documents live, or "" before Start.
 func StateDir() string {
@@ -84,6 +110,12 @@ func StartInterception(configPath string) error {
 	api.Advertise("gpn-interception", api.Feature{})
 	api.SetInterceptionSource(nil)
 	engineRef.Store(nil)
+	// The resolver must forget the capture table in the same breath. A stale
+	// lookup would keep steering hosts the current document no longer names,
+	// at a gateway with nothing left to terminate them.
+	if svc := dnsRef.Load(); svc != nil {
+		svc.Resolver().SetCaptureLookup(nil)
+	}
 
 	if configPath == "" {
 		tunnel.SetInterceptor(nil)
@@ -101,6 +133,22 @@ func StartInterception(configPath string) error {
 	engineRef.Store(e)
 	api.SetInterceptionSource(func() (any, error) { return e.Snapshot() })
 	api.Advertise("gpn-interception", api.Feature{Version: 1})
+	if svc := dnsRef.Load(); svc != nil {
+		svc.Resolver().SetCaptureLookup(func(name string) (dns.Capture, bool) {
+			binding, ok := e.CaptureFor(name)
+			if !ok {
+				return dns.Capture{}, false
+			}
+			return dns.Capture{
+				ExtensionID:   binding.ModuleID,
+				ExtensionName: binding.ModuleName,
+				Pattern:       binding.Pattern,
+				Resolver:      binding.CaptureDNS,
+				Ready:         binding.Ready,
+			}, true
+		})
+		svc.Resolver().FlushCache()
+	}
 	log.Infoln("[GPN] interception engine installed from %s", configPath)
 	return nil
 }

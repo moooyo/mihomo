@@ -82,6 +82,7 @@ func noStore(next http.Handler) http.Handler {
 func init() {
 	route.Register(func(r chi.Router) {
 		r.Mount("/gpn/interception", interceptionRouter())
+		r.Mount("/gpn/dns", dnsRouter())
 		r.With(noStore).Get("/capabilities", func(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, capabilitiesResponse{
 				ControllerAPI: ControllerAPI,
