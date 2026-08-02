@@ -53,6 +53,7 @@ func WithSecret(secret string) Option {
 
 // ApplyConfig dispatch configure to all parts include ExternalController
 func ApplyConfig(cfg *config.Config) {
+	startGPN()
 	applyRoute(cfg)
 	executor.ApplyConfig(cfg, true)
 }
