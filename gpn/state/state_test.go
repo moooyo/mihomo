@@ -164,3 +164,41 @@ func TestWriteFileIsAtomic(t *testing.T) {
 		t.Errorf("directory holds %v, want only doc.json", names)
 	}
 }
+
+// A mutator must not be able to reach the memory readers are holding.
+//
+// Doc publishes through an atomic pointer precisely so readers never take the
+// lock, which means anything a writer touches in place is a data race against
+// them. Passing T by value is not enough: the struct copies, its slices and
+// maps do not. This caught a real one -- the resolver's subscription goroutine
+// ranged over Policy.Rules while a console edit assigned to Rules[0].
+func TestUpdateGivesTheMutatorPrivateMemory(t *testing.T) {
+	d, _ := newDoc(t)
+	if _, err := d.Update("", func(v doc) (doc, error) {
+		v.Hosts = []string{"first", "second"}
+		return v, nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	published := d.Get().Value
+
+	// Mutate an element in place, the way an edit to one rule reads, then fail
+	// the update so nothing is written. The published slice must be untouched:
+	// if the mutator's argument aliased it, the write already happened and no
+	// error can take it back.
+	wantErr := errors.New("refused")
+	if _, err := d.Update("", func(v doc) (doc, error) {
+		v.Hosts[0] = "clobbered"
+		return v, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("Update: %v, want %v", err, wantErr)
+	}
+
+	if published.Hosts[0] != "first" {
+		t.Errorf("the mutator wrote through to the published document: %q", published.Hosts[0])
+	}
+	if got := d.Get().Value.Hosts[0]; got != "first" {
+		t.Errorf("a failed update changed the current value: %q", got)
+	}
+}

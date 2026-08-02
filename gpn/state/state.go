@@ -104,7 +104,29 @@ func (d *Doc[T]) Update(expected string, mutate func(T) (T, error)) (Snapshot[T]
 	if expected != "" && expected != current.Revision {
 		return current, ErrRevisionConflict
 	}
-	next, err := mutate(current.Value)
+	// The mutator gets a private copy, never the published value.
+	//
+	// T is a struct, so passing it by value copies the top level -- but every
+	// slice and map inside it still points at the published document's memory.
+	// A mutator that writes d.Policy.Rules[0].Intent, which is the obvious way
+	// to say "change this one rule", would be writing into the value every
+	// reader is holding. Readers deliberately do not take d.mu; that is the
+	// whole point of publishing through an atomic pointer, and it is what makes
+	// the write a race rather than merely surprising.
+	//
+	// Returning a fresh document from the mutator is not enough on its own,
+	// because the natural way to build one is to start from the argument. The
+	// copy has to happen here, where it cannot be forgotten.
+	//
+	// It goes through the same JSON the write below does, so it cannot drift
+	// from what is persisted: anything a round trip loses was never going to
+	// survive the write either. One extra marshal per update, against updates
+	// that happen a few times an hour.
+	private, err := clonePrivate(current.Value)
+	if err != nil {
+		return current, err
+	}
+	next, err := mutate(private)
 	if err != nil {
 		return current, err
 	}
@@ -112,6 +134,20 @@ func (d *Doc[T]) Update(expected string, mutate func(T) (T, error)) (Snapshot[T]
 		return current, err
 	}
 	return d.Get(), nil
+}
+
+// clonePrivate deep-copies a document so a mutator cannot reach published memory.
+func clonePrivate[T any](value T) (T, error) {
+	var zero T
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return zero, fmt.Errorf("gpn/state: clone document: %w", err)
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return zero, fmt.Errorf("gpn/state: clone document: %w", err)
+	}
+	return out, nil
 }
 
 // write marshals, persists durably, then publishes. Callers hold d.mu.
