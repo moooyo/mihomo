@@ -154,13 +154,19 @@ func (e *Engine) mutate(revision string, fn func(*Config) error) (Snapshot, stri
 // The compiled snapshot is shared with every in-flight request, so mutating its
 // backing arrays in place would change what a running session is matching
 // against, halfway through matching against it.
+//
+// Every copy below preserves emptiness rather than collapsing it to nil.
+// `append([]string(nil), empty...)` returns nil, nil marshals to `null`, and
+// the decode that follows a write rejects a null execution order — so on a
+// gateway with no extensions installed, which is every gateway on its first
+// day, the very first write failed with "execution_order must be an array".
 func cloneConfig(c Config) Config {
 	out := c
 	out.runtime = nil
-	out.ExecutionOrder = append([]string(nil), c.ExecutionOrder...)
+	out.ExecutionOrder = copyStrings(c.ExecutionOrder)
 	out.Modules = make([]Module, len(c.Modules))
 	for i, m := range c.Modules {
-		m.CaptureHosts = append([]string(nil), m.CaptureHosts...)
+		m.CaptureHosts = copyStrings(m.CaptureHosts)
 		m.Settings = append([]ModuleSetting(nil), m.Settings...)
 		m.Scripts = append([]ScriptRule(nil), m.Scripts...)
 		m.HostMappings = append([]HostMapping(nil), m.HostMappings...)
@@ -168,6 +174,12 @@ func cloneConfig(c Config) Config {
 		out.Modules[i] = m
 	}
 	return out
+}
+
+// copyStrings returns a non-nil copy, so a field that serialises without
+// omitempty stays `[]` rather than becoming `null`.
+func copyStrings(in []string) []string {
+	return append(make([]string, 0, len(in)), in...)
 }
 
 func findModule(c *Config, id string) (*Module, error) {

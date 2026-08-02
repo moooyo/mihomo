@@ -9,6 +9,7 @@ package gpn
 import (
 	"context"
 	"net"
+	"path/filepath"
 	"sync/atomic"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -85,6 +86,20 @@ func Start(home string) error {
 	// which to fix the thing that stopped it.
 	if err := svc.Listen(); err != nil {
 		log.Warnln("[GPN/DNS] listeners not bound: %v", err)
+	}
+
+	// The interception engine comes up from a document beside the resolver's.
+	// Both failures below are warnings for the same reason: interception is
+	// optional relative to resolving and forwarding, and a gateway that cannot
+	// read its extension document should still carry traffic rather than refuse
+	// to boot.
+	interceptPath := filepath.Join(dir, "intercept.json")
+	if err := engine.EnsureDocument(interceptPath); err != nil {
+		log.Warnln("[GPN] interception document unavailable: %v", err)
+		return nil
+	}
+	if err := StartInterception(interceptPath); err != nil {
+		log.Warnln("[GPN] interception engine not installed: %v", err)
 	}
 	return nil
 }

@@ -376,3 +376,69 @@ func TestReloadKeepsTheLastValidSnapshot(t *testing.T) {
 		t.Errorf("%d modules after a rejected reload, want the previous 2", len(cfg.Modules))
 	}
 }
+
+// A gateway with no extensions installed is every gateway on its first day, and
+// its very first write used to fail: append([]string(nil), empty...) is nil,
+// nil marshals to null, and the decode that follows a write rejects a null
+// execution order. Found on a live box, not here, which is why it is here now.
+func TestFirstWriteOnAnEmptyGatewaySucceeds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "intercept.json")
+	if err := EnsureDocument(path); err != nil {
+		t.Fatalf("EnsureDocument: %v", err)
+	}
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatalf("newConfigStore: %v", err)
+	}
+	e := &Engine{config: store}
+
+	if _, _, err := e.SetSettings(e.Revision(), MITMSettings{Enabled: true, HTTP2: true}); err != nil {
+		t.Fatalf("turning the master on for a gateway with no extensions: %v", err)
+	}
+
+	cfg, _ := e.ReadDocument()
+	if !cfg.MITM.Enabled {
+		t.Error("the master did not turn on")
+	}
+	// And it survives a reopen, which is what proves the persisted bytes are
+	// something this program can read back.
+	if _, err := newConfigStore(path); err != nil {
+		t.Errorf("the persisted document does not reload: %v", err)
+	}
+}
+
+// The seeded document is what a fresh install starts from, so it has to be
+// valid on its own terms before anything writes to it.
+func TestSeededDocumentIsValidAndInert(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "intercept.json")
+	if err := EnsureDocument(path); err != nil {
+		t.Fatalf("EnsureDocument: %v", err)
+	}
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatalf("the seeded document does not load: %v", err)
+	}
+	cfg, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MITM.Enabled {
+		t.Error("a fresh gateway starts with the MITM master on")
+	}
+	if len(cfg.Modules) != 0 {
+		t.Errorf("a fresh gateway starts with %d extensions", len(cfg.Modules))
+	}
+
+	// EnsureDocument must not touch a document that already exists -- doing so
+	// would discard whatever the operator had installed.
+	before, _ := os.ReadFile(path)
+	if err := EnsureDocument(path); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Error("EnsureDocument rewrote an existing document")
+	}
+}
