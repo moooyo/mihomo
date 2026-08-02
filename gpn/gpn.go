@@ -21,6 +21,7 @@ import (
 
 var (
 	stateDir  atomic.Pointer[string]
+	engineRef atomic.Pointer[engine.Engine]
 	installed atomic.Bool
 )
 
@@ -62,6 +63,37 @@ func StateDir() string {
 	}
 	return ""
 }
+
+// StartInterception assembles the plugin engine and installs it as the core's
+// capture stage. Calling it with an empty path, or not calling it at all,
+// leaves the core routing every connection normally.
+//
+// Separate from Start because interception is optional and failible in a way
+// the rest is not: a malformed interception document, or a certificate whose
+// SAN set no longer covers the enabled capture hosts, must leave a working
+// gateway rather than refusing to boot. The error is returned for the caller to
+// log; it is not fatal.
+func StartInterception(configPath string) error {
+	if configPath == "" {
+		tunnel.SetInterceptor(nil)
+		return nil
+	}
+	e, err := engine.New(configPath, StateDir())
+	if err != nil {
+		// Explicitly clear rather than leave whatever was installed before. A
+		// failed reload that silently kept the previous capture set would have
+		// the gateway intercepting hosts the current document no longer names.
+		tunnel.SetInterceptor(nil)
+		return err
+	}
+	tunnel.SetInterceptor(e.Interceptor())
+	engineRef.Store(e)
+	log.Infoln("[GPN] interception engine installed from %s", configPath)
+	return nil
+}
+
+// Engine returns the installed plugin engine, or nil.
+func Engine() *engine.Engine { return engineRef.Load() }
 
 // SetInterceptor installs the capture stage into the core, or removes it with
 // nil. Exported here rather than letting callers reach tunnel directly so the
