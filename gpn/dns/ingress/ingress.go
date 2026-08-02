@@ -41,6 +41,17 @@ type Config struct {
 	// loopback: it answers the same policy as the public listener without TLS,
 	// so a non-loopback bind is an open resolver.
 	Debug string
+	// Origin is the boundary mihomo's own resolver queries after the sniffer
+	// recovers a hostname, conventionally 127.0.0.1:5354, bound on both UDP and
+	// TCP. It must be loopback for the same reason Debug must: it answers
+	// without policy, without TLS and without client identity.
+	//
+	// It exists as a socket rather than a function call because mihomo reaches
+	// its resolver through package-level globals that hub/executor reassigns on
+	// every ApplyConfig. A loopback nameserver named in the operator's own
+	// config is the one seam that survives a reload without a single edit to an
+	// upstream-owned file.
+	Origin string
 	// Certificate supplies the DoT leaf. Required when DoT is set.
 	Certificate CertificateSource
 }
@@ -59,9 +70,9 @@ type Ingress struct {
 // silently lost name resolution. Serve errors after a successful bind are logged
 // instead, since by then the socket is up and the caller has nothing useful to
 // decide.
-func (i *Ingress) Start(cfg Config, handler D.Handler) error {
-	if handler == nil {
-		return errors.New("gpn/dns/ingress: no handler")
+func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
+	if client == nil {
+		return errors.New("gpn/dns/ingress: no client handler")
 	}
 
 	i.mu.Lock()
@@ -81,11 +92,11 @@ func (i *Ingress) Start(cfg Config, handler D.Handler) error {
 		if err != nil {
 			return fmt.Errorf("gpn/dns/ingress: DoT listen %s: %w", cfg.DoT, err)
 		}
-		i.serve(&D.Server{Listener: ln, Handler: handler}, "DoT "+cfg.DoT)
+		i.serve(&D.Server{Listener: ln, Handler: client}, "DoT "+cfg.DoT)
 	}
 
 	if cfg.Debug != "" {
-		if err := requireLoopback(cfg.Debug); err != nil {
+		if err := requireLoopback("debug", cfg.Debug); err != nil {
 			i.shutdownLocked()
 			return err
 		}
@@ -94,7 +105,33 @@ func (i *Ingress) Start(cfg Config, handler D.Handler) error {
 			i.shutdownLocked()
 			return fmt.Errorf("gpn/dns/ingress: debug listen %s: %w", cfg.Debug, err)
 		}
-		i.serve(&D.Server{PacketConn: pc, Handler: handler}, "debug UDP "+cfg.Debug)
+		i.serve(&D.Server{PacketConn: pc, Handler: client}, "debug UDP "+cfg.Debug)
+	}
+
+	if cfg.Origin != "" {
+		if originHandler == nil {
+			i.shutdownLocked()
+			return errors.New("gpn/dns/ingress: origin address set with no handler")
+		}
+		if err := requireLoopback("origin", cfg.Origin); err != nil {
+			i.shutdownLocked()
+			return err
+		}
+		pc, err := net.ListenPacket("udp", cfg.Origin)
+		if err != nil {
+			i.shutdownLocked()
+			return fmt.Errorf("gpn/dns/ingress: origin listen %s: %w", cfg.Origin, err)
+		}
+		i.serve(&D.Server{PacketConn: pc, Handler: originHandler}, "origin UDP "+cfg.Origin)
+		// TCP as well: mihomo retries over TCP when a reply comes back
+		// truncated, and a boundary that only speaks UDP turns a large answer
+		// into a resolution failure at the exact moment egress needs it.
+		ln, err := net.Listen("tcp", cfg.Origin)
+		if err != nil {
+			i.shutdownLocked()
+			return fmt.Errorf("gpn/dns/ingress: origin listen tcp %s: %w", cfg.Origin, err)
+		}
+		i.serve(&D.Server{Listener: ln, Handler: originHandler}, "origin TCP "+cfg.Origin)
 	}
 
 	return nil
@@ -135,22 +172,22 @@ func (i *Ingress) shutdownLocked() {
 	i.servers = nil
 }
 
-// requireLoopback refuses a debug listener that would be an open resolver.
+// requireLoopback refuses a listener that would be an open resolver.
 //
-// The debug listener answers the same policy as the public one with no TLS and
-// no client identity. On a public address that is an open resolver -- usable for
+// The debug and origin listeners answer without TLS and without client
+// identity. On a public address either is an open resolver -- usable for
 // amplification, and answering for a network it was never meant to serve.
-func requireLoopback(addr string) error {
+func requireLoopback(what, addr string) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Errorf("gpn/dns/ingress: debug address %q must be host:port: %w", addr, err)
+		return fmt.Errorf("gpn/dns/ingress: %s address %q must be host:port: %w", what, addr, err)
 	}
 	if port == "" || port == "0" {
-		return fmt.Errorf("gpn/dns/ingress: debug address %q must name a port", addr)
+		return fmt.Errorf("gpn/dns/ingress: %s address %q must name a port", what, addr)
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("gpn/dns/ingress: debug address %q must be a loopback IP", addr)
+		return fmt.Errorf("gpn/dns/ingress: %s address %q must be a loopback IP", what, addr)
 	}
 	return nil
 }

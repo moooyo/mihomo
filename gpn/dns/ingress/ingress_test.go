@@ -69,7 +69,7 @@ func TestDoTServesQueries(t *testing.T) {
 	if err := ing.Start(Config{
 		DoT:         "127.0.0.1:0",
 		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
-	}, h); err != nil {
+	}, h, nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer ing.Shutdown(context.Background())
@@ -120,7 +120,7 @@ func TestStartFailsLoudlyOnABusyPort(t *testing.T) {
 	err = ing.Start(Config{
 		DoT:         busy.Addr().String(),
 		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
-	}, &answering{seen: make(chan string, 1)})
+	}, &answering{seen: make(chan string, 1)}, nil)
 	if err == nil {
 		ing.Shutdown(context.Background())
 		t.Fatal("Start accepted a port already in use")
@@ -138,12 +138,12 @@ func TestDebugListenerMustBeLoopback(t *testing.T) {
 		"127.0.0.1",      // no port at all
 	}
 	for _, addr := range refused {
-		if err := requireLoopback(addr); err == nil {
+		if err := requireLoopback("debug", addr); err == nil {
 			t.Errorf("requireLoopback(%q) accepted it", addr)
 		}
 	}
 	for _, addr := range []string{"127.0.0.1:5353", "[::1]:5353"} {
-		if err := requireLoopback(addr); err != nil {
+		if err := requireLoopback("debug", addr); err != nil {
 			t.Errorf("requireLoopback(%q) rejected a loopback address: %v", addr, err)
 		}
 	}
@@ -158,7 +158,7 @@ func TestPartialStartLeavesNothingBound(t *testing.T) {
 		DoT:         "127.0.0.1:0",
 		Debug:       "0.0.0.0:5353", // refused: not loopback
 		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
-	}, &answering{seen: make(chan string, 1)})
+	}, &answering{seen: make(chan string, 1)}, nil)
 	if err == nil {
 		ing.Shutdown(context.Background())
 		t.Fatal("Start accepted a non-loopback debug address")
