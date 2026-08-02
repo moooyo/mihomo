@@ -201,7 +201,7 @@ func TestRejectedWriteLeavesTheDocumentRunning(t *testing.T) {
 // separate decision about letting it see traffic.
 func TestInstallAlwaysLandsDisabled(t *testing.T) {
 	e := newTestEngine(t, twoExtensionDocument)
-	_, revision, err := e.Install(e.Revision(), Module{
+	_, revision, err := e.install(e.Revision(), Module{
 		ID:           "third",
 		Version:      "0.1.0",
 		Name:         "Third",
@@ -249,7 +249,7 @@ func TestReinstallCarriesOperatorStateForward(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := e.Install(e.Revision(), Module{
+	if _, _, err := e.install(e.Revision(), Module{
 		ID:           "second",
 		Version:      "2.1.0",
 		Name:         "Second",

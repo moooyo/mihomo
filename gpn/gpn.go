@@ -71,6 +71,14 @@ func Start(home string) error {
 	api.SetDNSService(svc)
 	api.Advertise("gpn-dns", api.Feature{Version: 1})
 
+	// Extension fetches resolve through the gateway's own trust group. Using
+	// the host resolver instead would let the box's /etc/resolv.conf decide
+	// where an operator's plugin code comes from, and on a gateway that is
+	// frequently pointed back at this very process.
+	engine.SetImporter(engine.NewImporter(func(ctx context.Context, host string) ([]string, error) {
+		return svc.Resolver().OriginResolve(ctx, host)
+	}))
+
 	// Binding is a separate outcome. A gateway whose certificate has not been
 	// issued yet must still come up, serve its API and let an operator finish
 	// the bootstrap -- refusing to start would leave them with no surface on

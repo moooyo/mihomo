@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
@@ -47,15 +48,104 @@ func interceptionRouter() http.Handler {
 	r.Get("/", getInterception)
 	r.Put("/settings", putInterceptionSettings)
 	r.Put("/order", putInterceptionOrder)
+	r.Post("/review", postReview)
+	r.Post("/extensions", postInstall)
 	r.Route("/extensions/{id}", func(r chi.Router) {
 		r.Get("/", getExtension)
 		r.Delete("/", deleteExtension)
+		r.Get("/update", getUpdate)
+		r.Post("/update", postUpdate)
 		r.Put("/enabled", putExtensionEnabled)
 		r.Put("/egress", putExtensionEgress)
 		r.Put("/capture-dns", putExtensionCaptureDNS)
 		r.Put("/settings/{key}", putExtensionSetting)
 	})
 	return r
+}
+
+// postReview fetches a candidate and reports what it is, without installing it.
+//
+// It takes no revision because it changes nothing. The digest it returns is
+// what the install must quote back, and that is where the concurrency control
+// lives -- reviewing something twice is free, installing something you did not
+// review is not possible.
+func postReview(w http.ResponseWriter, r *http.Request) {
+	e := currentEngine()
+	if e == nil {
+		unavailable(w, r, "the interception engine is not installed")
+		return
+	}
+	var body engine.ImportRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&body); err != nil {
+		badRequest(w, r, "malformed request body: "+err.Error())
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	candidate, err := e.Fetch(ctx, body)
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	render.JSON(w, r, render.M{"candidate": candidate, "revision": e.Revision()})
+}
+
+type installRequest struct {
+	Revision string `json:"revision"`
+	engine.InstallRequest
+}
+
+func (b *installRequest) revision() string { return b.Revision }
+
+func postInstall(w http.ResponseWriter, r *http.Request) {
+	var body installRequest
+	e, ok := decodeWrite(w, r, &body)
+	if !ok {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	snapshot, revision, err := e.Install(ctx, body.Revision, body.InstallRequest)
+	respondEngine(w, r, snapshot, revision, err, e)
+}
+
+func getUpdate(w http.ResponseWriter, r *http.Request) {
+	e := currentEngine()
+	if e == nil {
+		unavailable(w, r, "the interception engine is not installed")
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	candidate, err := e.CheckUpdate(ctx, chi.URLParam(r, "id"))
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	render.JSON(w, r, render.M{"candidate": candidate, "revision": e.Revision()})
+}
+
+type updateRequest struct {
+	Revision string `json:"revision"`
+	Digest   string `json:"digest"`
+}
+
+func (b *updateRequest) revision() string { return b.Revision }
+
+func postUpdate(w http.ResponseWriter, r *http.Request) {
+	var body updateRequest
+	e, ok := decodeWrite(w, r, &body)
+	if !ok {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	snapshot, revision, err := e.ApplyUpdate(ctx, body.Revision, chi.URLParam(r, "id"), body.Digest)
+	respondEngine(w, r, snapshot, revision, err, e)
 }
 
 // interceptionResponse is what every read and every successful write returns,

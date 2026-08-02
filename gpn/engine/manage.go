@@ -301,13 +301,16 @@ func (e *Engine) SetSettingValue(revision, id, key string, value json.RawMessage
 	})
 }
 
-// Install adds an extension, always disabled.
+// install adds or replaces an extension, always disabled.
 //
 // Disabled is not a default a caller can override. An import is a decision to
 // have the code on the box; enabling it is a separate decision about letting it
-// see traffic, and collapsing the two would mean a single click on a
-// marketplace entry starts decrypting.
-func (e *Engine) Install(revision string, m Module) (Snapshot, string, error) {
+// see traffic, and collapsing the two would mean one click on a marketplace
+// entry starts decrypting.
+//
+// Unexported because there is exactly one way in: a reviewed, digest-checked
+// fetch. See updates.go.
+func (e *Engine) install(revision string, m Module) (Snapshot, string, error) {
 	return e.mutate(revision, func(c *Config) error {
 		m.Enabled = false
 		if strings.TrimSpace(m.CaptureDNS) == "" {
