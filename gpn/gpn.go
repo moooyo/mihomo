@@ -82,6 +82,7 @@ func StartInterception(configPath string) error {
 	// worse failure than an absent panel: the operator would read its emptiness
 	// as "no extensions enabled".
 	api.Advertise("gpn-interception", api.Feature{})
+	api.SetInterceptionSource(nil)
 	engineRef.Store(nil)
 
 	if configPath == "" {
@@ -98,6 +99,7 @@ func StartInterception(configPath string) error {
 	}
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
+	api.SetInterceptionSource(func() (any, error) { return e.Snapshot() })
 	api.Advertise("gpn-interception", api.Feature{Version: 1})
 	log.Infoln("[GPN] interception engine installed from %s", configPath)
 	return nil
