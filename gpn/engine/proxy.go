@@ -1,0 +1,1461 @@
+package engine
+
+import (
+	"context"
+	"crypto/rand"
+	"github.com/metacubex/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"github.com/metacubex/http"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
+)
+
+type interceptProxy struct {
+	config        *configStore
+	certificates  *certificateStore
+	upstreamRoots *x509.CertPool
+	scripts       *scriptRuntime
+	tlsErrors     *tlsHandshakeErrorReporter
+	// logs is set by setEngineLogPublisher alongside scripts.logs and
+	// tlsErrors.logs. A proxy assembled field by field in a test has to set it
+	// too, or its capacity and transformation reports go nowhere.
+	logs       engineLogPublisher
+	bodyBudget *moduleBodyBudget
+
+	transportMu sync.Mutex
+	upstream    *upstreamTransportGeneration
+	http3Slots  chan struct{}
+
+	// The client-facing TLS leg's shared session ticket keys. Every connection
+	// clones a config from these rather than building its own, which is what
+	// makes resumption possible at all; see mitmTLSConfig.
+	tlsMu      sync.Mutex
+	tlsKeys    [][32]byte
+	tlsKeysSet time.Time
+	tlsNow     func() time.Time
+}
+
+const (
+	// How long one client-facing session ticket key issues tickets for, and how
+	// many are kept so a ticket issued just before a rotation still resumes.
+	// This is what crypto/tls does for a server that manages its own keys; the
+	// keys are set explicitly here only because a per-connection clone cannot
+	// inherit ones the template never generated.
+	mitmTicketKeyLifetime = 24 * time.Hour
+	mitmTicketKeyHistory  = 2
+)
+
+const (
+	maxIdleUpstreamHTTPConnections        = 64
+	maxIdleUpstreamHTTPConnectionsPerHost = 8
+	maxUpstreamHTTP3Connections           = 64
+	upstreamHTTPIdleTimeout               = 90 * time.Second
+	// A handshake through the mihomo leg is the same order of work as the connect
+	// in front of it, which dialSOCKS5TCP already caps at 10s, and it is what
+	// net/http's own DefaultTransport allows.
+	upstreamHandshakeTimeout = 10 * time.Second
+	// Time to first byte only: ResponseHeaderTimeout starts after the request
+	// body has been written, so a slow upload never starts this clock. 90s is the
+	// silence budget this file already spends three times, and it sits above the
+	// common origin-side ceilings a proxy meets.
+	upstreamResponseHeaderTimeout = 90 * time.Second
+	// The data plane's silence budget for a peer that goes quiet inside a request
+	// rather than between them, which is the same 90s the three idle timeouts
+	// above already spend. Re-armed per read and per write, so a slow but
+	// progressing transfer is never truncated.
+	interceptTransferStallTimeout = 90 * time.Second
+	interceptTransferWriteChunk   = 32 << 10
+	// A reservation is held until its request finishes, so a saturated pool does
+	// not clear inside this window. What the wait buys is the burst that clears in
+	// milliseconds; waiting longer would only pin this request's connection, and
+	// its upstream one, behind a shortage it cannot outlast.
+	moduleBodySlotWait = 250 * time.Millisecond
+
+	// Enough that a burst across a handful of origins keeps resuming, small
+	// enough that a retired generation's cache is trivial to drop.
+	upstreamSessionCacheEntries = 64
+
+	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
+	interceptCertificateTrustLogInterval = time.Minute
+	interceptCertificateTrustMessage     = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
+)
+
+type upstreamTransportGeneration struct {
+	generation uint64
+	projection upstreamTransportProjection
+
+	mu              sync.Mutex
+	httpTransport   *http.Transport
+	http3Transports map[quic.Version]*http3.Transport
+	http3Versions   map[string]quic.Version
+	closed          bool
+	closeOnce       sync.Once
+
+	// refs and retired are protected by interceptProxy.transportMu.
+	refs    int
+	retired bool
+}
+
+type tlsHandshakeErrorReporter struct {
+	mu               sync.Mutex
+	lastTrustWarning time.Time
+	now              func() time.Time
+	logs             engineLogPublisher
+	logger           *log.Logger
+}
+
+type tlsHandshakeErrorWriter struct {
+	reporter *tlsHandshakeErrorReporter
+	target   string
+}
+
+func newTLSHandshakeErrorReporter() *tlsHandshakeErrorReporter {
+	return &tlsHandshakeErrorReporter{now: time.Now, logger: log.Default()}
+}
+
+func (r *tlsHandshakeErrorReporter) writer(target string) io.Writer {
+	return &tlsHandshakeErrorWriter{reporter: r, target: target}
+}
+
+func (w *tlsHandshakeErrorWriter) Write(payload []byte) (int, error) {
+	if w != nil && w.reporter != nil {
+		w.reporter.report(w.target, strings.TrimSpace(string(payload)))
+	}
+	return len(payload), nil
+}
+
+func (r *tlsHandshakeErrorReporter) report(target, message string) {
+	if r == nil || message == "" {
+		return
+	}
+	logger := r.logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf("intercept: target=%q %s", target, message)
+	if !strings.Contains(strings.ToLower(message), "remote error: tls: unknown certificate") {
+		return
+	}
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	r.mu.Lock()
+	if !r.lastTrustWarning.IsZero() && now.Before(r.lastTrustWarning.Add(interceptCertificateTrustLogInterval)) {
+		r.mu.Unlock()
+		return
+	}
+	r.lastTrustWarning = now
+	r.mu.Unlock()
+
+	logger.Printf("intercept: target=%q %s", target, interceptCertificateTrustMessage)
+	if engineLogPublishingEnabled(r.logs) {
+		r.logs.Publish(EngineLog{
+			Level: "warn", Source: "engine", URL: "https://" + target,
+			Message: interceptCertificateTrustMessage,
+		})
+	}
+}
+
+// interceptStoreFile is the extensions' persistent store, kept in the same state
+// directory as the bundle store.
+//
+// It is a sibling of meta.json and pointer.json rather than a path of its own so
+// that --bundle-store moves all of this sidecar's durable state at once. Naming
+// the directory twice is how an operator ends up with extension state orphaned in
+// the directory they thought they had moved away from, and with two instances
+// silently overwriting each other's store.json.
+const interceptStoreFile = "store.json"
+
+func newInterceptProxy(config *configStore, certificates *certificateStore, stateDir string) *interceptProxy {
+	scripts := newScriptRuntime(filepath.Join(stateDir, interceptStoreFile))
+	return &interceptProxy{
+		config: config, certificates: certificates, scripts: scripts, tlsErrors: newTLSHandshakeErrorReporter(),
+		bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),
+	}
+}
+
+func (p *interceptProxy) setEngineLogPublisher(logs engineLogPublisher) {
+	p.logs = logs
+	p.scripts.logs = logs
+	p.tlsErrors.logs = logs
+}
+
+func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error {
+	var connections sync.WaitGroup
+	defer func() {
+		connections.Wait()
+		p.closeUpstreamTransports()
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+		connections.Add(1)
+		go func(conn net.Conn) {
+			defer connections.Done()
+			sessionDone := make(chan struct{})
+			defer close(sessionDone)
+			go func() {
+				select {
+				case <-ctx.Done():
+					_ = conn.Close()
+				case <-sessionDone:
+				}
+			}()
+			if err := p.handleSOCKSConnection(ctx, conn); err != nil && ctx.Err() == nil {
+				log.Printf("intercept: SOCKS session failed: %v", err)
+			}
+		}(conn)
+	}
+}
+
+func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Conn) error {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	cfg, err := p.config.Current()
+	if err != nil {
+		return err
+	}
+	command, target, err := readSOCKSRequest(conn, cfg.Username, cfg.Password)
+	if err != nil {
+		return err
+	}
+	switch command {
+	case socksCommandConnect:
+		if !allowedInboundSOCKSTarget(cfg, target) {
+			_ = writeSOCKSReply(conn, 2, nil)
+			return errors.New("SOCKS CONNECT target is outside the active extension allowlist")
+		}
+		if err := writeSOCKSReply(conn, 0, conn.LocalAddr()); err != nil {
+			return err
+		}
+		_ = conn.SetDeadline(time.Time{})
+		if target.Port == 80 {
+			return p.servePlainHTTPConnection(conn)
+		}
+		return p.serveTLSConnection(conn, target.Host)
+	case socksCommandUDP:
+		return p.serveUDPAssociation(ctx, conn)
+	default:
+		_ = writeSOCKSReply(conn, 7, nil)
+		return fmt.Errorf("unsupported SOCKS command %d", command)
+	}
+}
+
+func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
+	listener := newSingleConnListener(conn)
+	server := &http.Server{
+		Handler:           p,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	err := server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error {
+	cfg, err := p.config.Current()
+	if err != nil {
+		return err
+	}
+	tlsConfig, err := p.mitmTLSConfig(cfg.MITM.HTTP2)
+	if err != nil {
+		return err
+	}
+	listener := newSingleConnListener(conn)
+	server := &http.Server{
+		Handler:           p,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
+		TLSConfig:         tlsConfig,
+	}
+	err = server.ServeTLS(listener, "", "")
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+// mitmTLSConfig builds this connection's client-facing TLS config from keys the
+// whole process shares.
+//
+// Every connection used to construct its own tls.Config, and a server's session
+// ticket keys belong to its config: a ticket issued on one connection could
+// never be decrypted on the next, so the MITM leg never resumed and every
+// connection paid a full handshake and a signature. Measured against this
+// certificate: a fresh config per connection resumes on no connection, a clone
+// of a template whose keys were never set resumes on none either, and a clone of
+// one carrying explicit keys resumes from the second connection on, under both
+// TLS 1.2 and TLS 1.3.
+//
+// The clone is not incidental. http.Server.ServeTLS hands its TLSConfig to
+// http2ConfigureServer, which writes to it, and this proxy builds one
+// http.Server per connection -- so a config shared by pointer would be written
+// by every connection at once. Each connection gets its own object and only the
+// keys are shared.
+//
+// NextProtos comes from the caller's snapshot rather than the template because
+// MITM.HTTP2 can change under a running process.
+func (p *interceptProxy) mitmTLSConfig(http2 bool) (*tls.Config, error) {
+	keys, err := p.sessionTicketKeys()
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: p.certificates.GetCertificate,
+		NextProtos:     mitmTLSNextProtos(http2),
+	}
+	config.SetSessionTicketKeys(keys)
+	return config, nil
+}
+
+// sessionTicketKeys returns the keys to issue and accept tickets under, newest
+// first, rotating them on the same daily schedule crypto/tls uses for a server
+// that manages its own. The previous key is kept so a ticket issued just before
+// a rotation still resumes rather than silently falling back to a full
+// handshake.
+func (p *interceptProxy) sessionTicketKeys() ([][32]byte, error) {
+	now := time.Now
+	if p.tlsNow != nil {
+		now = p.tlsNow
+	}
+	p.tlsMu.Lock()
+	defer p.tlsMu.Unlock()
+	if len(p.tlsKeys) > 0 && now().Sub(p.tlsKeysSet) < mitmTicketKeyLifetime {
+		return append([][32]byte(nil), p.tlsKeys...), nil
+	}
+	var fresh [32]byte
+	if _, err := rand.Read(fresh[:]); err != nil {
+		return nil, fmt.Errorf("session ticket key: %w", err)
+	}
+	rotated := append([][32]byte{fresh}, p.tlsKeys...)
+	if len(rotated) > mitmTicketKeyHistory {
+		rotated = rotated[:mitmTicketKeyHistory]
+	}
+	p.tlsKeys = rotated
+	p.tlsKeysSet = now()
+	return append([][32]byte(nil), rotated...), nil
+}
+
+func mitmTLSNextProtos(http2 bool) []string {
+	if http2 {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
+}
+
+func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Conn) error {
+	localHost, _, err := net.SplitHostPort(control.LocalAddr().String())
+	if err != nil {
+		return err
+	}
+	udpAddress := &net.UDPAddr{IP: net.ParseIP(localHost).To4(), Port: 0}
+	udpConn, err := net.ListenUDP("udp4", udpAddress)
+	if err != nil {
+		_ = writeSOCKSReply(control, 1, nil)
+		return err
+	}
+	remoteHost, _, err := net.SplitHostPort(control.RemoteAddr().String())
+	if err != nil {
+		udpConn.Close()
+		return err
+	}
+	cfg, err := p.config.Current()
+	if err != nil {
+		udpConn.Close()
+		return err
+	}
+	authorization := newInboundUDPAuthorization(cfg)
+	fallbackProtection := cfg.MITM.QUICFallbackProtection
+	cfg = Config{}
+	packetConn := &socksServerPacketConn{conn: udpConn, allowedIP: net.ParseIP(remoteHost), authorization: authorization}
+	defer packetConn.Close()
+	if err := writeSOCKSReply(control, 0, udpConn.LocalAddr()); err != nil {
+		packetConn.Close()
+		return err
+	}
+	_ = control.SetDeadline(time.Time{})
+	if fallbackProtection {
+		return discardQUICAssociation(ctx, control, packetConn)
+	}
+	server := &http3.Server{
+		Handler:        p,
+		MaxHeaderBytes: 64 << 10,
+		IdleTimeout:    90 * time.Second,
+		TLSConfig: &tls.Config{
+			MinVersion:     tls.VersionTLS13,
+			GetCertificate: p.certificates.GetCertificate,
+		},
+		QUICConfig: &quic.Config{
+			Versions: []quic.Version{quic.Version1, quic.Version2},
+			// Same reason as the upstream transport: a 20s keepalive alongside a
+			// 90s idle timeout means the connection never idles out, so an idle
+			// client kept its association, its UDP socket and this server alive
+			// until the SOCKS control connection went away. Here the association
+			// bounds the leak, so this is consistency rather than a slot bug --
+			// but IdleTimeout above says 90 seconds and should mean it.
+			MaxIdleTimeout: 90 * time.Second,
+			Allow0RTT:      false,
+		},
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.Serve(packetConn) }()
+	controlClosed := make(chan struct{})
+	go func() {
+		var one [1]byte
+		_, _ = control.Read(one[:])
+		close(controlClosed)
+	}()
+	select {
+	case <-ctx.Done():
+	case <-controlClosed:
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			return err
+		}
+	}
+	_ = server.Close()
+	_ = packetConn.Close()
+	return nil
+}
+
+func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn net.PacketConn) error {
+	controlClosed := make(chan struct{})
+	go func() {
+		var one [1]byte
+		_, _ = control.Read(one[:])
+		close(controlClosed)
+	}()
+	discardErr := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 64<<10)
+		for {
+			if _, _, err := packetConn.ReadFrom(buffer); err != nil {
+				discardErr <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-controlClosed:
+		return nil
+	case err := <-discardErr:
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host := canonicalHost(r.Host)
+	if requestHasPayload(r) {
+		controller := http.NewResponseController(w)
+		// Armed before the first read as well: when this handler answers without
+		// draining the body, net/http drains up to maxPostHandlerReadBytes of it
+		// outside the wrapper, and the synthetic-response path relies on that.
+		_ = controller.SetReadDeadline(time.Now().Add(interceptTransferStallTimeout))
+		serverBody := r.Body
+		r.Body = &transferDeadlineBody{ReadCloser: serverBody, controller: controller, timeout: interceptTransferStallTimeout}
+		// Handed back so net/http still recognises its own body type after the
+		// handler returns: chunkWriter.writeHeader only skips draining an already
+		// rejected oversize upload when Request.Body is the concrete type it
+		// created, and that is what keeps those bytes off the wire.
+		defer func() { r.Body = serverBody }()
+	}
+	cfg, err := p.config.Current()
+	if err != nil {
+		http.Error(w, "interception configuration unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !activeInterceptHost(cfg, host) {
+		http.Error(w, "unrecognized interception host", http.StatusMisdirectedRequest)
+		return
+	}
+	requestProbe := moduleRequestProbe(r, host)
+	requestRules := matchingScriptRules(cfg, "request", requestProbe)
+	bodySlotHeld := requestNeedsModuleBodyReservation(r, requestRules)
+	bodyReserved := moduleBodyReservation(r, requestRules)
+	if bodySlotHeld && !p.acquireBodySlot(r.Context(), bodyReserved) {
+		p.reportModuleBodyCapacityBusy(r, host, "request", requestProbe)
+		http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() {
+		if bodySlotHeld {
+			p.releaseBodySlot(bodyReserved)
+		}
+	}()
+	prepared, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
+	if bodySlotHeld && !prepared.bodyBufferRetained {
+		p.releaseBodySlot(bodyReserved)
+		bodySlotHeld = false
+	} else if bodySlotHeld && prepared.bodyBufferBytes < bodyReserved {
+		// The reservation was taken before the length was known, so an
+		// undeclared-length request reserved everything it was allowed to read.
+		// Now the buffer exists: hold what it actually costs for the round trip
+		// rather than the worst case it might have been. Every HTTP/3 request is
+		// undeclared -- quic-go reports ContentLength -1 unconditionally -- so
+		// without this a plain H3 GET pinned the whole budget end to end.
+		p.releaseBodySlot(bodyReserved - prepared.bodyBufferBytes)
+		bodyReserved = prepared.bodyBufferBytes
+	}
+	if prepared.handled {
+		return
+	}
+	if prepareErr != nil {
+		p.reportTransformFailure("request", requestProbe.URL, prepareErr)
+		log.Printf("intercept: request transformation failed host=%s protocol=%s", host, r.Proto)
+		http.Error(w, "interception request transformation failed", http.StatusBadGateway)
+		return
+	}
+
+	outbound := prepared.outbound
+	response, cleanup, err := p.roundTrip(outbound, cfg)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		log.Printf("intercept: upstream request failed host=%s protocol=%s: %v", host, r.Proto, err)
+		http.Error(w, "interception upstream unavailable", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	responseProbe := scriptMessage{
+		URL: outbound.URL.String(), Method: outbound.Method, StatusCode: response.StatusCode,
+	}
+	// Filtered from the probe taken while the outbound headers were built, which
+	// is a superset of this match: the status code was the only thing it could
+	// not evaluate. Walking every rule again would also re-parse the URL.
+	responseRules := responseRulesForStatus(prepared.responseCandidates, response.StatusCode)
+	// A rule set that never reads the body streams. See responseRulesStreamable:
+	// the buffered path holds the whole response in memory -- up to the global
+	// 64 MiB, because moduleBodyReadLimit skips "none" mode rules -- so one
+	// header edit scoped `^/` used to buffer every download on that host, delay
+	// its first byte until the origin finished, hold a process body slot
+	// throughout, and 502 above the cap on an exchange that had succeeded.
+	if responseRulesStreamable(responseRules) {
+		if err := p.applyStreamingResponseHeaderEdits(outbound, response, cfg, responseRules); err != nil {
+			p.reportTransformFailure("response", responseProbe.URL, err)
+			log.Printf("intercept: response header edit failed host=%s protocol=%s", host, r.Proto)
+			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
+			return
+		}
+		if copyErr := writeStreamingProxyResponse(w, r.ProtoMajor, r.Method, response); copyErr != nil {
+			log.Printf("intercept: upstream response copy failed host=%s protocol=%s: %v", host, r.Proto, copyErr)
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
+	if len(responseRules) > 0 {
+		// The upstream leg has already run, so a capacity rejection here cannot be
+		// an "unavailable, try again": the request was made. This is the same
+		// condition as any other unrunnable response action and takes the same
+		// fail-closed exit rather than passing the raw response through.
+		//
+		// Reserved separately from the request leg rather than reusing whatever
+		// that leg happened to leave held: when the request buffer was retained
+		// both bodies are resident at once, and the previous form skipped the
+		// response reservation entirely in exactly that case. What is reserved is
+		// what transformModuleResponse will actually read, which is not the widest
+		// declared limit -- see moduleResponseBodyReservation.
+		responseReserved := moduleResponseBodyReservation(response, responseRules)
+		if !p.acquireBodySlot(r.Context(), responseReserved) {
+			p.reportModuleBodyCapacityBusy(r, host, "response", responseProbe)
+			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
+			return
+		}
+		defer p.releaseBodySlot(responseReserved)
+	}
+
+	transformed, transformErr := p.transformModuleResponse(outbound, response, cfg, responseRules)
+	if transformErr != nil {
+		p.reportTransformFailure("response", responseProbe.URL, transformErr)
+		log.Printf("intercept: response transformation failed host=%s protocol=%s", host, r.Proto)
+		http.Error(w, "interception response transformation failed", http.StatusBadGateway)
+		return
+	}
+	if transformed != nil {
+		if writeErr := writeBufferedModuleResponse(w, r.Method, transformed.StatusCode, transformed.Header, transformed.Trailer, transformed.Body); writeErr != nil {
+			log.Printf("intercept: transformed response write failed host=%s protocol=%s: %v", host, r.Proto, writeErr)
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
+
+	if copyErr := writeStreamingProxyResponse(w, r.ProtoMajor, r.Method, response); copyErr != nil {
+		log.Printf("intercept: upstream response copy failed host=%s protocol=%s: %v", host, r.Proto, copyErr)
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// handleSOCKSConnection clears the SOCKS-phase deadline before the HTTP phase
+// begins, and MaxBytesReader bounds only bytes, so a downstream peer that stops
+// sending its request body or stops reading its response otherwise pins this
+// handler and its mihomo SOCKS connection for as long as it likes. Re-arming per
+// read and per write is what a flat ReadTimeout/WriteTimeout cannot do: a bound
+// large enough for a legitimate 64 MiB transfer over a slow link is no bound at
+// all, and a flat write deadline would truncate a long download.
+//
+// This is the shape the engine log socket already uses for its own frames, and
+// going through ResponseController covers all three servers: net/http applies it
+// to the connection, HTTP/2 and http3 to the one stream.
+type transferDeadlineBody struct {
+	io.ReadCloser
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+func (b *transferDeadlineBody) Read(buffer []byte) (int, error) {
+	_ = b.controller.SetReadDeadline(time.Now().Add(b.timeout))
+	return b.ReadCloser.Read(buffer)
+}
+
+type transferDeadlineWriter struct {
+	io.Writer
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+// A Write must place every byte it is given, so unlike a Read it can outlive any
+// single window: writeBufferedModuleResponse hands over a whole body at once, and
+// io.Copy collapses to a single Write whenever the source implements WriterTo.
+// Re-arm per chunk, the unit io.Copy already moves.
+func (w *transferDeadlineWriter) Write(payload []byte) (int, error) {
+	written := 0
+	for written < len(payload) {
+		chunk := payload[written:]
+		if len(chunk) > interceptTransferWriteChunk {
+			chunk = chunk[:interceptTransferWriteChunk]
+		}
+		_ = w.controller.SetWriteDeadline(time.Now().Add(w.timeout))
+		count, err := w.Writer.Write(chunk)
+		written += count
+		if err != nil {
+			return written, err
+		}
+		if count < len(chunk) {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func (p *interceptProxy) acquireBodySlot(ctx context.Context, bytes int64) bool {
+	if p.bodyBudget == nil {
+		return true
+	}
+	return p.bodyBudget.acquire(ctx, bytes, moduleBodySlotWait)
+}
+
+// A capacity rejection is the one handler exit that is not a fault, which is what
+// makes it easy to lose: report it on the operator log like every other exit, and
+// on the engine log stream the console reads, so an extension that stopped
+// running is visible as something other than silence.
+func (p *interceptProxy) reportModuleBodyCapacityBusy(r *http.Request, host, phase string, probe scriptMessage) {
+	log.Printf("intercept: module body capacity is busy host=%s protocol=%s phase=%s", host, r.Proto, phase)
+	if !engineLogPublishingEnabled(p.logs) {
+		return
+	}
+	p.logs.Publish(EngineLog{
+		Level: "warn", Source: "engine", Phase: phase, URL: sanitizeEngineLogURL(probe.URL),
+		Message: "interception body capacity is busy; the matched extension action did not run",
+	})
+}
+
+// A transformation error can quote a script's own exception text and the URL a
+// script asked to rewrite to, so the cause goes to the engine log, where
+// truncateEngineLogField bounds the message, and never to journald.
+func (p *interceptProxy) reportTransformFailure(phase, requestURL string, err error) {
+	if !engineLogPublishingEnabled(p.logs) {
+		return
+	}
+	p.logs.Publish(EngineLog{
+		Level: "error", Source: "engine", Phase: phase, URL: sanitizeEngineLogURL(requestURL),
+		Message: phase + " transformation failed: " + err.Error(),
+	})
+}
+
+func (p *interceptProxy) releaseBodySlot(bytes int64) {
+	if p.bodyBudget != nil {
+		p.bodyBudget.release(bytes)
+	}
+}
+
+func requestHasPayload(request *http.Request) bool {
+	return request != nil && request.Body != nil && (request.ContentLength != 0 || len(request.TransferEncoding) > 0)
+}
+
+func requestHasBodySection(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	return requestHasPayload(request) || len(request.Trailer) > 0
+}
+
+func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Response, func(), error) {
+	generation, cleanup := p.acquireUpstreamTransportGeneration(cfg)
+	if request.ProtoMajor == 3 {
+		response, err := p.roundTripHTTP3(request, generation)
+		return response, cleanup, err
+	}
+	transport, err := generation.getHTTPTransport(p)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	response, err := transport.RoundTrip(request)
+	return response, cleanup, err
+}
+
+func newUpstreamTransportGeneration(cfg Config) *upstreamTransportGeneration {
+	projection := newUpstreamTransportProjection(cfg)
+	return &upstreamTransportGeneration{
+		generation:      projection.generation,
+		projection:      projection,
+		http3Transports: make(map[quic.Version]*http3.Transport, 2),
+		http3Versions:   make(map[string]quic.Version),
+	}
+}
+
+func (p *interceptProxy) acquireUpstreamTransportGeneration(cfg Config) (*upstreamTransportGeneration, func()) {
+	var closeIdle *upstreamTransportGeneration
+	var closeNow *upstreamTransportGeneration
+
+	p.transportMu.Lock()
+	generation := p.upstream
+	switch {
+	case cfg.generation == 0:
+		generation = newUpstreamTransportGeneration(cfg)
+		generation.retired = true
+	case generation == nil || cfg.generation > generation.generation:
+		// A newer document is not by itself a reason to drop warm connections.
+		// The generation number advances on any content change, and almost none
+		// of them reach the upstream leg -- a setting, an enable toggle, a
+		// script body, a match pattern all leave the proxy, the protocol and the
+		// target authorization untouched. Only when the fingerprint moves has
+		// this pool stopped being authorized for what it holds.
+		if generation != nil && newUpstreamTransportProjection(cfg).fingerprint == generation.projection.fingerprint {
+			generation.generation = cfg.generation
+			break
+		}
+		previous := generation
+		generation = newUpstreamTransportGeneration(cfg)
+		p.upstream = generation
+		if previous != nil {
+			previous.retired = true
+			if previous.refs == 0 {
+				closeNow = previous
+			} else {
+				closeIdle = previous
+			}
+		}
+	case cfg.generation < generation.generation:
+		generation = newUpstreamTransportGeneration(cfg)
+		generation.retired = true
+	}
+	generation.refs++
+	p.transportMu.Unlock()
+
+	if closeIdle != nil {
+		closeIdle.closeIdleConnections()
+	}
+	if closeNow != nil {
+		closeNow.close()
+	}
+
+	var once sync.Once
+	return generation, func() {
+		once.Do(func() { p.releaseUpstreamTransportGeneration(generation) })
+	}
+}
+
+func (p *interceptProxy) releaseUpstreamTransportGeneration(generation *upstreamTransportGeneration) {
+	closeNow := false
+	p.transportMu.Lock()
+	if generation.refs > 0 {
+		generation.refs--
+	}
+	closeNow = generation.retired && generation.refs == 0
+	p.transportMu.Unlock()
+	if closeNow {
+		generation.close()
+	}
+}
+
+func (p *interceptProxy) closeUpstreamTransports() {
+	var closeIdle *upstreamTransportGeneration
+	var closeNow *upstreamTransportGeneration
+	p.transportMu.Lock()
+	if p.upstream != nil {
+		p.upstream.retired = true
+		if p.upstream.refs == 0 {
+			closeNow = p.upstream
+		} else {
+			closeIdle = p.upstream
+		}
+		p.upstream = nil
+	}
+	p.transportMu.Unlock()
+	if closeIdle != nil {
+		closeIdle.closeIdleConnections()
+	}
+	if closeNow != nil {
+		closeNow.close()
+	}
+}
+
+func (generation *upstreamTransportGeneration) getHTTPTransport(p *interceptProxy) (*http.Transport, error) {
+	generation.mu.Lock()
+	defer generation.mu.Unlock()
+	if generation.closed {
+		return nil, errors.New("upstream transport generation is closed")
+	}
+	if generation.httpTransport == nil {
+		generation.httpTransport = p.newHTTPTransportForProjection(generation.projection)
+	}
+	return generation.httpTransport, nil
+}
+
+func (generation *upstreamTransportGeneration) getHTTP3Transport(p *interceptProxy, version quic.Version) (*http3.Transport, error) {
+	generation.mu.Lock()
+	defer generation.mu.Unlock()
+	if generation.closed {
+		return nil, errors.New("upstream transport generation is closed")
+	}
+	if transport := generation.http3Transports[version]; transport != nil {
+		return transport, nil
+	}
+	transport := p.newHTTP3Transport(generation, version)
+	generation.http3Transports[version] = transport
+	return transport, nil
+}
+
+func (generation *upstreamTransportGeneration) preferredHTTP3Version(authority string) quic.Version {
+	generation.mu.Lock()
+	defer generation.mu.Unlock()
+	if version := generation.http3Versions[authority]; version != 0 {
+		return version
+	}
+	return quic.Version1
+}
+
+func (generation *upstreamTransportGeneration) preferHTTP3Version2(authority string) {
+	generation.mu.Lock()
+	generation.http3Versions[authority] = quic.Version2
+	generation.mu.Unlock()
+}
+
+func (generation *upstreamTransportGeneration) closeIdleConnections() {
+	generation.mu.Lock()
+	if generation.closed {
+		generation.mu.Unlock()
+		return
+	}
+	httpTransport := generation.httpTransport
+	generation.mu.Unlock()
+
+	if httpTransport != nil {
+		httpTransport.CloseIdleConnections()
+	}
+}
+
+func (generation *upstreamTransportGeneration) closeIdleHTTP3Connections() {
+	generation.mu.Lock()
+	if generation.closed {
+		generation.mu.Unlock()
+		return
+	}
+	transports := make([]*http3.Transport, 0, len(generation.http3Transports))
+	for _, transport := range generation.http3Transports {
+		transports = append(transports, transport)
+	}
+	generation.mu.Unlock()
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
+func (p *interceptProxy) acquireHTTP3ConnectionSlot(ctx context.Context, generation *upstreamTransportGeneration) (chan struct{}, error) {
+	p.transportMu.Lock()
+	if p.http3Slots == nil {
+		p.http3Slots = make(chan struct{}, maxUpstreamHTTP3Connections)
+	}
+	slots := p.http3Slots
+	p.transportMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		return slots, nil
+	default:
+	}
+
+	// The HTTP/3 transport keeps authority connections alive. Under capacity
+	// pressure, recycle them only when this is the generation's sole request;
+	// otherwise an apparently idle client may still own a streaming body.
+	//
+	// Decide under the lock, act outside it -- the shape acquireUpstreamTransport-
+	// Generation and closeUpstreamTransports already use. closeIdleHTTP3Connections
+	// takes generation.mu itself and snapshots the transports before releasing it,
+	// so it never needed transportMu; holding that process-wide lock across up to
+	// maxUpstreamHTTP3Connections blocking CloseWithError calls stalled every
+	// other request's refcount bump behind a pile of QUIC teardowns.
+	p.transportMu.Lock()
+	soleRequest := generation.refs == 1
+	p.transportMu.Unlock()
+	if !soleRequest {
+		return nil, errors.New("upstream HTTP/3 connection capacity is busy")
+	}
+	generation.closeIdleHTTP3Connections()
+
+	timer := time.NewTimer(upstreamHTTP3RecycleTimeout)
+	defer timer.Stop()
+	select {
+	case slots <- struct{}{}:
+		return slots, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, errors.New("upstream HTTP/3 connection capacity is busy")
+	}
+}
+
+func (generation *upstreamTransportGeneration) close() {
+	generation.closeOnce.Do(func() {
+		generation.mu.Lock()
+		generation.closed = true
+		httpTransport := generation.httpTransport
+		http3Transports := make([]*http3.Transport, 0, len(generation.http3Transports))
+		for _, transport := range generation.http3Transports {
+			http3Transports = append(http3Transports, transport)
+		}
+		generation.httpTransport = nil
+		generation.http3Transports = nil
+		generation.mu.Unlock()
+
+		if httpTransport != nil {
+			httpTransport.CloseIdleConnections()
+		}
+		for _, transport := range http3Transports {
+			_ = transport.Close()
+		}
+	})
+}
+
+func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
+	return p.newHTTPTransportForProjection(newUpstreamTransportProjection(cfg))
+}
+
+func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransportProjection) *http.Transport {
+	return &http.Transport{
+		Proxy:                  nil,
+		ForceAttemptHTTP2:      projection.http2,
+		MaxIdleConns:           maxIdleUpstreamHTTPConnections,
+		MaxIdleConnsPerHost:    maxIdleUpstreamHTTPConnectionsPerHost,
+		IdleConnTimeout:        upstreamHTTPIdleTimeout,
+		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
+		ResponseHeaderTimeout:  upstreamResponseHeaderTimeout,
+		TLSHandshakeTimeout:    upstreamHandshakeTimeout,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    p.upstreamRoots,
+			// Without a cache every re-dial to an origin is a full handshake
+			// through the mihomo leg. The cache belongs to the transport, so it
+			// dies with the generation that owns it and never outlives the
+			// allowlist that authorized those origins.
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
+		},
+		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+			host, portText, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
+			}
+			target, permitted := projection.targets.upstreamTarget(host, portText)
+			if !permitted {
+				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
+			}
+			// dialSOCKS5TCP bounds only the connect. Without a deadline on the
+			// context its greeting, auth and CONNECT exchange with mihomo waits
+			// forever, and no transport timeout starts until it returns.
+			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
+			defer cancel()
+			return dialSOCKS5TCP(dialCtx, projection.proxy, target)
+		},
+	}
+}
+
+func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGeneration, version quic.Version) *http3.Transport {
+	return &http3.Transport{
+		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
+		TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS13,
+			RootCAs:            p.upstreamRoots,
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
+		},
+		QUICConfig: &quic.Config{
+			Versions: []quic.Version{version},
+			// No KeepAlivePeriod. A keepalive shorter than MaxIdleTimeout makes
+			// the idle timeout dead code -- the connection is never idle, so it
+			// never closes, so the slot acquireHTTP3ConnectionSlot took is never
+			// released and the 64-connection budget only ever shrinks. The two
+			// settings arrived together in the initial HTTP/3 commit and cancel
+			// each other out.
+			//
+			// Letting the idle timeout govern makes HTTP/3 behave like the
+			// HTTP/1 and HTTP/2 pool, which reclaims on the same 90 seconds
+			// through IdleConnTimeout. The cost is a fresh handshake for an
+			// origin untouched for 90 seconds, which is what the other two
+			// protocols already pay.
+			MaxIdleTimeout: upstreamHTTPIdleTimeout,
+		},
+		Dial: func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+			host, portText, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
+			}
+			target, permitted := generation.projection.targets.upstreamTarget(host, portText)
+			if !permitted {
+				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
+			}
+			slots, err := p.acquireHTTP3ConnectionSlot(ctx, generation)
+			if err != nil {
+				return nil, err
+			}
+			releaseSlot := func() { <-slots }
+			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
+			defer cancel()
+			packetConn, err := dialSOCKS5UDP(dialCtx, generation.projection.proxy, target)
+			if err != nil {
+				releaseSlot()
+				return nil, err
+			}
+			quicTransport := &quic.Transport{Conn: packetConn}
+			connection, err := quicTransport.Dial(ctx, target, tlsConfig, quicConfig)
+			if err != nil {
+				_ = quicTransport.Close()
+				_ = packetConn.Close()
+				releaseSlot()
+				return nil, err
+			}
+			go func() {
+				<-connection.Context().Done()
+				_ = quicTransport.Close()
+				_ = packetConn.Close()
+				releaseSlot()
+			}()
+			return connection, nil
+		},
+	}
+}
+
+func (p *interceptProxy) roundTripHTTP3(request *http.Request, generation *upstreamTransportGeneration) (*http.Response, error) {
+	authority, err := canonicalHTTP3Authority(request)
+	if err != nil {
+		return nil, err
+	}
+	version := generation.preferredHTTP3Version(authority)
+	transport, err := generation.getHTTP3Transport(p, version)
+	if err != nil {
+		return nil, err
+	}
+	response, err := transport.RoundTrip(request)
+	if err == nil || version == quic.Version2 {
+		return response, err
+	}
+	var versionError *quic.VersionNegotiationError
+	if !errors.As(err, &versionError) || !containsQUICVersion(versionError.Theirs, quic.Version2) {
+		return nil, err
+	}
+	if bodyErr := resetHTTP3RequestBodyForReplay(request); bodyErr != nil {
+		return nil, bodyErr
+	}
+	transport, transportErr := generation.getHTTP3Transport(p, quic.Version2)
+	if transportErr != nil {
+		return nil, transportErr
+	}
+	response, err = transport.RoundTrip(request)
+	if err == nil {
+		generation.preferHTTP3Version2(authority)
+	}
+	return response, err
+}
+
+func resetHTTP3RequestBodyForReplay(request *http.Request) error {
+	if !requestHasBodySection(request) {
+		request.Body = nil
+		return nil
+	}
+	if request.GetBody == nil {
+		return errors.New("upstream HTTP/3 request body is not replayable")
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return err
+	}
+	request.Body = body
+	return nil
+}
+
+func canonicalHTTP3Authority(request *http.Request) (string, error) {
+	if request == nil || request.URL == nil {
+		return "", errors.New("upstream QUIC request URL is missing")
+	}
+	host := canonicalHost(request.URL.Hostname())
+	if host == "" {
+		return "", errors.New("upstream QUIC target is outside the active extension allowlist")
+	}
+	portText := request.URL.Port()
+	if portText == "" {
+		portText = "443"
+	}
+	return net.JoinHostPort(host, portText), nil
+}
+
+func containsQUICVersion(versions []quic.Version, want quic.Version) bool {
+	for _, version := range versions {
+		if version == want {
+			return true
+		}
+	}
+	return false
+}
+
+func readBounded(reader io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return body, nil
+}
+
+func cloneProxyHeaders(source http.Header) http.Header {
+	clone := make(http.Header, len(source))
+	for name, values := range source {
+		clone[name] = append([]string(nil), values...)
+	}
+	return clone
+}
+
+func copyResponseHeaders(destination, source http.Header) {
+	for name, values := range source {
+		if isHopByHopHeader(name) || connectionListsHeader(source, name) {
+			continue
+		}
+		destination[name] = append([]string(nil), values...)
+	}
+}
+
+func removeHopByHopHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if validModuleNetworkHeaderName(name) {
+				header.Del(name)
+			}
+		}
+	}
+	for name := range header {
+		if isHopByHopHeader(name) {
+			header.Del(name)
+		}
+	}
+}
+
+func validateNativePatchHeaders(headers http.Header, response bool) error {
+	if !response {
+		if err := normalizeRequestTEHeader(headers); err != nil {
+			return err
+		}
+	}
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !isHopByHopHeader(name) || (!response && strings.EqualFold(name, "Te")) {
+			continue
+		}
+		phase := "request"
+		if response {
+			phase = "response"
+		}
+		return fmt.Errorf("header %q is not permitted in a native %s patch", name, phase)
+	}
+	return nil
+}
+
+func sanitizeForwardRequestHeaders(headers http.Header) {
+	preserveTrailers := requestTEIsTrailers(headers)
+	removeHopByHopHeaders(headers)
+	if preserveTrailers {
+		headers.Set("Te", "trailers")
+	}
+}
+
+func requestTEIsTrailers(headers http.Header) bool {
+	var values []string
+	fields := 0
+	for name, fieldValues := range headers {
+		if strings.EqualFold(name, "Te") {
+			fields++
+			values = append(values, fieldValues...)
+		}
+	}
+	return fields == 1 && len(values) == 1 && strings.EqualFold(strings.TrimSpace(values[0]), "trailers")
+}
+
+func connectionListsHeader(headers http.Header, want string) bool {
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(name), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeRequestTEHeader(headers http.Header) error {
+	var names []string
+	for name := range headers {
+		if strings.EqualFold(name, "Te") {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names)
+	if len(names) != 1 {
+		return fmt.Errorf("duplicate TE header names %q", names)
+	}
+	values := headers[names[0]]
+	if len(values) != 1 || !strings.EqualFold(strings.TrimSpace(values[0]), "trailers") {
+		return errors.New("TE header must contain exactly trailers")
+	}
+	delete(headers, names[0])
+	headers.Set("Te", "trailers")
+	return nil
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func validResponseTrailerName(name string) bool {
+	if !validModuleNetworkHeaderName(name) {
+		return false
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if strings.HasPrefix(canonical, "If-") {
+		return false
+	}
+	switch canonical {
+	case "Authorization", "Cache-Control", "Connection", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type",
+		"Expect", "Host", "Keep-Alive", "Max-Forwards", "Pragma", "Proxy-Authenticate", "Proxy-Authorization",
+		"Proxy-Connection", "Range", "Realm", "Te", "Trailer", "Transfer-Encoding", "Www-Authenticate":
+		return false
+	default:
+		return true
+	}
+}
+
+func responseTrailerNames(trailers http.Header) []string {
+	seen := make(map[string]struct{}, len(trailers))
+	for name := range trailers {
+		canonical := http.CanonicalHeaderKey(name)
+		if !validResponseTrailerName(canonical) {
+			continue
+		}
+		seen[canonical] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func declareResponseTrailers(header, trailers http.Header) []string {
+	header.Del("Trailer")
+	names := responseTrailerNames(trailers)
+	if len(names) == 0 {
+		return nil
+	}
+	header.Del("Content-Length")
+	header.Set("Trailer", strings.Join(names, ", "))
+	return names
+}
+
+func publishResponseTrailers(header, trailers http.Header, declared []string) {
+	declaredSet := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		declaredSet[name] = struct{}{}
+	}
+	for _, name := range responseTrailerNames(trailers) {
+		values := responseTrailerValues(trailers, name)
+		if _, exists := declaredSet[name]; exists {
+			header[name] = values
+			continue
+		}
+		header[http.TrailerPrefix+name] = values
+	}
+}
+
+func responseTrailerValues(trailers http.Header, name string) []string {
+	var values []string
+	for candidate, candidateValues := range trailers {
+		if strings.EqualFold(candidate, name) {
+			values = append(values, candidateValues...)
+		}
+	}
+	return values
+}
+
+// Neither the HTTP/2 nor the HTTP/3 response writer implements io.ReaderFrom, and
+// no upstream body implements io.WriterTo, so io.Copy would allocate a fresh
+// 32 KiB buffer for every streamed response on those legs. io.CopyBuffer consults
+// both interfaces before it looks at the buffer, so the HTTP/1 writer keeps its
+// own ReadFrom fast path and never reaches this pool.
+//
+// Reuse across responses is the only thing new here: io.Copy already reuses one
+// buffer for every write of a single response, so a writer that retained the
+// slice past Write would have been broken before this change too.
+var streamingResponseBuffers = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 32<<10)
+		return &buffer
+	},
+}
+
+func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
+	controller := http.NewResponseController(w)
+	announcedTrailers, err := wireTrailers(response.Trailer)
+	if err != nil {
+		return fmt.Errorf("upstream response trailers: %w", err)
+	}
+	canHaveBody := responseCanHaveBody(method, response.StatusCode)
+	if len(responseTrailerNames(announcedTrailers)) > 0 && !canHaveBody {
+		return errors.New("response trailers require a response body section")
+	}
+	// copyResponseHeaders reads its source and copies every value slice it keeps,
+	// so the wireHeaders clone this used to take was garbage by the time it
+	// returned -- one map plus one slice per field, on the hot path for every
+	// response no action transforms.
+	copyResponseHeaders(w.Header(), response.Header)
+	declaredTrailers := declareResponseTrailers(w.Header(), announcedTrailers)
+	forceChunked := downstreamProtoMajor == 1 && response.ProtoMajor >= 2 && canHaveBody
+	if forceChunked {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(response.StatusCode)
+	if forceChunked {
+		if err := controller.Flush(); err != nil {
+			return err
+		}
+	}
+	buffer := streamingResponseBuffers.Get().(*[]byte)
+	defer streamingResponseBuffers.Put(buffer)
+	streamed := &transferDeadlineWriter{Writer: w, controller: controller, timeout: interceptTransferStallTimeout}
+	if _, err := io.CopyBuffer(streamed, response.Body, *buffer); err != nil {
+		return err
+	}
+	responseTrailers, err := wireTrailers(response.Trailer)
+	if err != nil {
+		return fmt.Errorf("upstream response trailers: %w", err)
+	}
+	if len(responseTrailerNames(responseTrailers)) > 0 && !canHaveBody {
+		return errors.New("response trailers require a response body section")
+	}
+	if len(responseTrailerNames(responseTrailers)) > 0 {
+		if err := controller.Flush(); err != nil {
+			return err
+		}
+	}
+	publishResponseTrailers(w.Header(), responseTrailers, declaredTrailers)
+	return nil
+}
+
+func responseCanHaveBody(method string, status int) bool {
+	if method == http.MethodHead || status >= 100 && status <= 199 {
+		return false
+	}
+	return status != http.StatusNoContent && status != http.StatusNotModified
+}
+
+type singleConnListener struct {
+	conn net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	done := make(chan struct{})
+	return &singleConnListener{conn: &closeNotifyConn{Conn: conn, done: done}, done: done}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	accepted := false
+	l.once.Do(func() { accepted = true })
+	if accepted {
+		return l.conn, nil
+	}
+	<-l.done
+	return nil, net.ErrClosed
+}
+
+func (l *singleConnListener) Close() error {
+	return l.conn.Close()
+}
+
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+type closeNotifyConn struct {
+	net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *closeNotifyConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { close(c.done) })
+	return err
+}
