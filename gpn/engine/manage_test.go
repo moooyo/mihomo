@@ -442,3 +442,86 @@ func TestSeededDocumentIsValidAndInert(t *testing.T) {
 		t.Error("EnsureDocument rewrote an existing document")
 	}
 }
+
+// The certificate request is what a root oneshot holding the CA signing key
+// reads to decide what to mint. It must exist from the moment the document
+// does, and it must follow every change to the enabled capture set.
+func TestCertificateRequestIsPublishedAndFollowsTheDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "intercept.json")
+	if err := os.WriteFile(path, []byte(twoExtensionDocument), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{config: store}
+
+	requestPath := filepath.Join(dir, "certificate-request")
+	read := func() (string, []string) {
+		t.Helper()
+		raw, err := os.ReadFile(requestPath)
+		if err != nil {
+			t.Fatalf("the certificate request is not published: %v", err)
+		}
+		lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+		return lines[0], lines[1:]
+	}
+
+	digest, hosts := read()
+	if len(digest) != 64 {
+		t.Errorf("digest %q is not a sha256 hex string", digest)
+	}
+	// Only "first" is enabled, so only its hosts are covered. A leaf naming a
+	// disabled extension's hosts would let capture begin the moment it was
+	// enabled, with no reissue and therefore no record of the widening.
+	if !equalUnordered(hosts, []string{"*.first.example", "shared.example.com"}) {
+		t.Errorf("hosts %v, want only the enabled extension's", hosts)
+	}
+
+	// Enabling the second widens the set, and the digest has to move with it --
+	// the oneshot compares digests to decide whether to reissue.
+	if _, _, err := e.SetEgressGroup(e.Revision(), "second", "Proxies"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.SetEnabled(e.Revision(), "second", true); err != nil {
+		t.Fatal(err)
+	}
+	widened, hosts := read()
+	if widened == digest {
+		t.Error("the digest did not move when an extension was enabled")
+	}
+	if !equalUnordered(hosts, []string{"*.first.example", "*.second.example", "shared.example.com"}) {
+		t.Errorf("hosts %v after enabling the second extension", hosts)
+	}
+
+	// An edit that does not change what must be covered must NOT move the
+	// digest: reissuing on every unrelated change burns the CA and churns the
+	// leaf under live sessions.
+	if _, _, err := e.SetCaptureDNS(e.Revision(), "first", "china"); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := read(); again != widened {
+		t.Error("an unrelated edit moved the certificate digest")
+	}
+}
+
+func equalUnordered(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, v := range a {
+		seen[v]++
+	}
+	for _, v := range b {
+		seen[v]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}

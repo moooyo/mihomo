@@ -193,11 +193,43 @@ func revisionOf(raw []byte) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// WritePublicFile persists data readable by anyone, for the one kind of
+// document that another program must read.
+//
+// Everything else here is 0600, and stays that way: the interception document
+// carries script bodies and typed settings an operator may have put a
+// credential in. The exception is the certificate request, whose entire content
+// ends up in a leaf's SAN list — a list every client that connects is handed.
+// Publishing it 0600 and then widening the consumer's privileges to read it
+// would be protecting a secret that is not one, by giving a process that holds
+// the CA signing key a capability it does not otherwise need.
+func WritePublicFile(path string, data []byte) error {
+	if err := WriteFile(path, data); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		return fmt.Errorf("gpn/state: chmod %s: %w", path, err)
+	}
+	return nil
+}
+
 // Dir returns the 5gpn state directory beneath mihomo's home, creating it.
+//
+// 0711 rather than 0700: the certificate oneshot runs as root with an empty
+// capability bounding set, so it is subject to ordinary permission checks and
+// cannot traverse a directory owned by the service user. Execute-without-read
+// lets it reach the one file it is meant to while still refusing a listing —
+// and every document in here is 0600 regardless, so traversal alone opens
+// nothing.
 func Dir(home string) (string, error) {
 	dir := filepath.Join(home, "gpn")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o711); err != nil {
 		return "", fmt.Errorf("gpn/state: create %s: %w", dir, err)
+	}
+	// MkdirAll leaves an existing directory's mode alone, and a gateway
+	// installed before this change has one at 0700.
+	if err := os.Chmod(dir, 0o711); err != nil {
+		return "", fmt.Errorf("gpn/state: chmod %s: %w", dir, err)
 	}
 	return dir, nil
 }

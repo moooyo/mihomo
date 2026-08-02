@@ -1657,6 +1657,11 @@ func newConfigStore(path string) (*configStore, error) {
 	cfg.generation = 1
 	store := &configStore{path: path, revision: documentRevision(body), generation: 1}
 	store.cur.Store(&cfg)
+	// Published at startup as well as on every write, so a gateway edited while
+	// the certificate oneshot was not running still converges.
+	if err := publishCertificateRequest(path, cfg); err != nil {
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -1718,6 +1723,12 @@ func (s *configStore) Update(expected string, mutate func(Config) (Config, error
 	compiled.generation = s.generation
 	s.cur.Store(&compiled)
 	s.revision = documentRevision(raw)
+	// After the document is durable, never before: the oneshot that reads this
+	// mints a leaf, and a leaf covering hosts a crash would un-declare is worse
+	// than a leaf that is briefly one edit behind.
+	if err := publishCertificateRequest(s.path, compiled); err != nil {
+		s.publishEngineLog("warn", err.Error())
+	}
 	s.publishEngineLog("info", "configuration updated")
 	return compiled, s.revision, nil
 }
@@ -1747,6 +1758,9 @@ func (s *configStore) Reload() error {
 	cfg.generation = s.generation
 	s.cur.Store(&cfg)
 	s.revision = revision
+	if err := publishCertificateRequest(s.path, cfg); err != nil {
+		s.publishEngineLog("warn", err.Error())
+	}
 	s.publishEngineLog("info", "configuration reloaded")
 	return nil
 }
