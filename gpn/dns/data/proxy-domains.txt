@@ -1,0 +1,5 @@
+# Forced-proxy domains (one per line, suffix match).
+# Add a domain here to ALWAYS route it through the proxy regardless of resolved IP.
+# Ships empty on purpose: this list is the operator's, not the project's.
+# Hosts captured by an enabled interception module are matched by the engine
+# directly and must not be duplicated here.

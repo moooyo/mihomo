@@ -1,0 +1,8 @@
+# 5gpn block seed: encrypted-DNS bypass block (keyword / substring match).
+# Any FQDN containing one of these substrings gets NXDOMAIN — catches unlisted
+# *httpdns* app resolvers (httpdns.*, *-httpdns.*, *.httpdns.*, etc.) without
+# enumerating every vendor. Companion to block-dns-bypass.txt (suffix rules).
+# Keep this list SHORT and SPECIFIC — a broad token (e.g. "doh", "dns") would
+# over-match legitimate domains. "httpdns"/"httpsdns" are distinctive enough.
+httpdns
+httpsdns

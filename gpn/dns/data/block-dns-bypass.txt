@@ -1,0 +1,130 @@
+# 5gpn block seed: encrypted-DNS / HTTPDNS bypass block (suffix match).
+#
+# Purpose: return NXDOMAIN for known DoH/DoT and app-HTTPDNS resolver hostnames
+# so a client that tries to bypass 5gpn-dns falls back to the system resolver
+# (= 5gpn-dns). This is name-based only: a resolver reached by HARDCODED IP (no
+# DNS lookup) cannot be blocked here — on the intranet/peer topology that traffic
+# never transits the gateway. See docs/DESIGN.md.
+#
+# Match type: suffix (bare = suffix). A companion block.keyword.txt carries the
+# `httpdns`/`httpsdns` substring rules that catch unlisted *httpdns* endpoints.
+# Tradeoff: a client in STRICT DoH/DoT mode (Android Private DNS "hostname", or a
+# browser forced to a provider) fails closed (no DNS) rather than falling back.
+# Sourced 2026-07 from kelee.one Block_HTTPDNS (app HTTPDNS) + curated browser
+# DoH/DoT providers. Operator-editable; re-install does not clobber this file.
+
+# ── Browser / OS DoH & DoT providers ───────────────────────────────────────
+# Cloudflare
+cloudflare-dns.com
+one.one.one.one
+# Google
+dns.google
+dns.google.com
+# Quad9
+dns.quad9.net
+dns9.quad9.net
+dns10.quad9.net
+dns11.quad9.net
+# AdGuard
+adguard-dns.com
+dns.adguard.com
+dns-family.adguard.com
+dns-unfiltered.adguard.com
+# NextDNS
+dns.nextdns.io
+# OpenDNS / Cisco
+doh.opendns.com
+dns.opendns.com
+doh.familyshield.opendns.com
+# Mullvad
+dns.mullvad.net
+doh.mullvad.net
+# DNS.SB
+dns.sb
+doh.dns.sb
+# ControlD
+dns.controld.com
+freedns.controld.com
+# CleanBrowsing
+doh.cleanbrowsing.org
+# Hurricane Electric
+ordns.he.net
+# LibreDNS / Digitale Gesellschaft / others
+doh.libredns.gr
+dnsforge.de
+doh.ffmuc.net
+dns.digitale-gesellschaft.ch
+# China public DoH
+doh.pub
+dns.pub
+doh.360.cn
+dns.alidns.com
+doh.alidns.com
+# Firefox DoH canary — NXDOMAIN makes Firefox auto-disable DoH ("network opt-out")
+use-application-dns.net
+
+# ── App HTTPDNS resolvers (from kelee.one Block_HTTPDNS, domain rules only) ──
+aedns.weixin.qq.com
+amdc.alipay.com
+apidns-js.kwd.inkuai.com
+apidns.kwd.inkuai.com
+cdndns.kwd.inkuai.com
+dns.iqiyi.com
+dns.jd.com
+dns.qiyipic.iqiyi.com
+dns.weibo.cn
+dns.weixin.qq.com
+dns.weixin.qq.com.cn
+dns2.q2cdn.com
+doh.iqiyi.com
+doh.ptqy.gitv.tv
+dotserver.douyucdn.cn
+hd.xiaojukeji.com
+hdns.k-dyn.com
+hdns.ksyun.com
+httpdns-api.aliyuncs.com
+httpdns-browser.platform.dbankcloud.cn
+httpdns-sc.aliyuncs.com
+httpdns-sdk.n.netease.com
+httpdns-v6.gslb.yy.com
+httpdns.alicdn.com
+httpdns.baidu.com
+httpdns.baidubce.com
+httpdns.bcelive.com
+httpdns.bilivideo.com
+httpdns.browser.miui.com
+httpdns.c.cdnhwc2.com
+httpdns.calorietech.com
+httpdns.cctv.com
+httpdns.danuoyi.tbcache.com
+httpdns.huaweicloud.com
+httpdns.immomo.com
+httpdns.kg.qq.com
+httpdns.kwd.inkuai.com
+httpdns.meituan.com
+httpdns.music.163.com
+httpdns.n.netease.com
+httpdns.n.shifen.com
+httpdns.ocloud.heytapmobi.com
+httpdns.ocloud.oppomobile.com
+httpdns.platform.dbankcloud.cn
+httpdns.platform.dbankcloud.com
+httpdns.push.heytapmobi.com
+httpdns.push.oppomobile.com
+httpdns.yunxindns.com
+httpdns.zybang.com
+httpdns1.cc.cdnhwc5.com
+httpdnsmultiapi.meituan.com
+httpdnsmultiapivip.meituan.com
+httpsdns.baidu.com
+kuaishou.httpdns.pro
+lofter.httpdns.c.163.com
+music.httpdns.c.163.com
+resolver.msg.xiaomi.net
+serveraddr.service.kugou.com
+tp2p.kg.qq.com
+twns.p2ptun.qq.com
+ucdc.upaas.quark.cn
+union-httpdns.gslb.yy.com
+yuyin-httpdns.gslb.yy.com
+yyapp-httpdns.gslb.yy.com
