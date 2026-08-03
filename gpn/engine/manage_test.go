@@ -63,9 +63,8 @@ func newTestEngine(t *testing.T, document string) *Engine {
 	if err != nil {
 		t.Fatalf("newConfigStore: %v", err)
 	}
-	// Only the store is under test here. Assembling the certificate store and
-	// the proxy would need a real leaf on disk and buys nothing: every method
-	// below reads and writes the document and nothing else.
+	// Only the store is under test here. Assembling the proxy buys nothing:
+	// every method below reads and writes the document and nothing else.
 	return &Engine{config: store}
 }
 

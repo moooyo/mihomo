@@ -34,10 +34,7 @@ func New(configPath, stateDir string) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gpn/engine: load %s: %w", configPath, err)
 	}
-	certs, err := newCertificateStore(config)
-	if err != nil {
-		return nil, fmt.Errorf("gpn/engine: certificates: %w", err)
-	}
+	certs := newCertificateStore(config)
 
 	// The ring is wired before the proxy exists so that configuration events
 	// raised during assembly are not published into nothing. The sidecar had

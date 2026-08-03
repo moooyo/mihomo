@@ -23,12 +23,24 @@ type certificateStore struct {
 	certificate *tls.Certificate
 }
 
-func newCertificateStore(config *configStore) (*certificateStore, error) {
-	store := &certificateStore{config: config}
-	if _, err := store.currentCertificate(); err != nil {
-		return nil, err
-	}
-	return store, nil
+// newCertificateStore prepares the leaf source. It cannot fail, and that is the
+// point: constructing a source of certificates is not the same act as resolving
+// one, and only the second can be refused.
+//
+// This used to load the leaf eagerly and refuse to build without it. A gateway
+// with no enabled extension has requested no capture hosts, so the root oneshot
+// has minted no leaf, so there is no file to load -- an interception authority
+// of zero extent, not a broken engine. Refusing to construct made the two
+// indistinguishable, and the consequence was a deadlock: every
+// /gpn/interception route answered 503, including the review that installing a
+// first extension has to begin with, so a fresh gateway could never enable one.
+//
+// Resolution stays where it always was, in currentCertificate, which every
+// handshake already calls and which already reports a missing pair. A capture
+// with no leaf to present fails that handshake. It no longer stops the engine
+// from existing.
+func newCertificateStore(config *configStore) *certificateStore {
+	return &certificateStore{config: config}
 }
 
 func (s *certificateStore) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
