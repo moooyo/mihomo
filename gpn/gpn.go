@@ -8,12 +8,15 @@ package gpn
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/gpn/api"
+	"github.com/metacubex/mihomo/gpn/bot"
 	"github.com/metacubex/mihomo/gpn/dial"
 	"github.com/metacubex/mihomo/gpn/dns"
 	"github.com/metacubex/mihomo/gpn/engine"
@@ -26,6 +29,7 @@ var (
 	stateDir  atomic.Pointer[string]
 	engineRef atomic.Pointer[engine.Engine]
 	dnsRef    atomic.Pointer[dns.Service]
+	botRef    atomic.Pointer[bot.Service]
 	installed atomic.Bool
 )
 
@@ -101,7 +105,117 @@ func Start(home string) error {
 	if err := StartInterception(interceptPath); err != nil {
 		log.Warnln("[GPN] interception engine not installed: %v", err)
 	}
+
+	// The bot comes up last because it reports on everything above it. Its
+	// failures are warnings for the same reason interception's are: a gateway
+	// that cannot read its bot document should still resolve and forward.
+	if err := startBot(filepath.Join(dir, "bot.json")); err != nil {
+		log.Warnln("[GPN] Telegram bot not installed: %v", err)
+	}
 	return nil
+}
+
+// startBot opens the bot document and starts the poll loop if it is enabled.
+//
+// The Facts it is given are the whole of what a chat command can reach. They
+// are assembled here rather than in gpn/bot because the bot package must not
+// import the resolver or the engine: what it cannot reach, no command added
+// later can reach either.
+func startBot(configPath string) error {
+	api.Advertise("gpn-bot", api.Feature{})
+	api.SetBotService(nil)
+	botRef.Store(nil)
+
+	svc, err := bot.Open(configPath, bot.Facts{
+		Status:  gatewayStatus,
+		Resolve: explainName,
+	}, func(ctx context.Context, host string, port int) (net.Conn, error) {
+		// Through the core's own rules, exactly as an engine upstream goes.
+		// api.telegram.org is unreachable from a good number of the networks
+		// this gateway runs on, and the operator has already configured how to
+		// reach such places.
+		return dial.TCP(ctx, host, port)
+	})
+	if err != nil {
+		return err
+	}
+	botRef.Store(svc)
+	api.SetBotService(svc)
+	api.Advertise("gpn-bot", api.Feature{Version: 1})
+	svc.Apply()
+	return nil
+}
+
+// Bot returns the Telegram control plane, or nil.
+func Bot() *bot.Service { return botRef.Load() }
+
+// gatewayStatus collects what the bot may report. Every field is something a
+// console page already shows.
+func gatewayStatus() bot.Status {
+	status := bot.Status{}
+	if svc := dnsRef.Load(); svc != nil {
+		resolver := svc.Resolver()
+		stats := resolver.Stats()
+		china, trust := resolver.Upstreams()
+		status.ResolverUp = true
+		status.Queries = stats.Total
+		status.Blocked = stats.Block
+		status.CacheHits = stats.CacheHits
+		status.CacheMisses = stats.CacheMisses
+		status.ChinaUpstreams = china
+		status.TrustUpstreams = trust
+		if gateway := resolver.Gateway(); gateway.IsValid() {
+			status.Gateway = gateway.String()
+		}
+		for _, sub := range svc.Subscriptions() {
+			status.Subscriptions = append(status.Subscriptions, bot.Subscription{
+				Name:  sub.RuleID,
+				OK:    sub.Error == "",
+				Error: sub.Error,
+			})
+		}
+	}
+	if e := engineRef.Load(); e != nil {
+		if snapshot, err := e.Snapshot(); err == nil {
+			status.InterceptionInstalled = true
+			status.InterceptionEnabled = snapshot.Enabled
+			status.HTTP3 = snapshot.HTTP3
+			status.Extensions = len(snapshot.Modules)
+			for _, m := range snapshot.Modules {
+				if m.Enabled {
+					status.EnabledExtensions++
+				}
+			}
+			status.CertificateLoaded = snapshot.Certificate.Loaded
+			status.CertificateCovers = snapshot.Certificate.CoveredAll
+			status.MissingHosts = snapshot.Certificate.Missing
+			if snapshot.Certificate.NotAfter > 0 {
+				status.CertificateNotAfter = time.Unix(snapshot.Certificate.NotAfter, 0)
+			}
+		}
+	}
+	return status
+}
+
+// explainName runs the same name-only decision live resolution runs.
+func explainName(name string) (bot.Explanation, error) {
+	svc := dnsRef.Load()
+	if svc == nil {
+		return bot.Explanation{}, errors.New("the resolver is not running")
+	}
+	decision := svc.Resolver().Decide(name)
+	explanation := bot.Explanation{
+		Name:    name,
+		Verdict: decision.Verdict.Verdict,
+		Reason:  decision.Verdict.Reason,
+	}
+	if decision.Capture != nil {
+		explanation.Extension = decision.Capture.ExtensionName
+		if !decision.Capture.Ready {
+			explanation.Reason = "the extension declares this host, but the interception master switch is off"
+		}
+	}
+	return explanation, nil
 }
 
 // DNS returns the resolver service, or nil before Start.
