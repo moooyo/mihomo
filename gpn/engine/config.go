@@ -56,10 +56,19 @@ type Config struct {
 	generation uint64
 }
 
+// MITMSettings is the master switch and the two protocol decisions.
+//
+// HTTP3 is capture over QUIC. It is off by default and separate from HTTP2
+// because it decides something HTTP2 does not: whether gateway QUIC is
+// terminated here or refused so the client retries over TCP. The seed
+// template's fixed AND,((NETWORK,UDP),(DST-PORT,443)),REJECT is what performs
+// the refusal, and it stays in place either way — capture is consulted before
+// rule resolution, so with HTTP3 on the reject only ever sees the datagrams
+// capture did not want.
 type MITMSettings struct {
-	Enabled                bool `json:"enabled"`
-	HTTP2                  bool `json:"http2"`
-	QUICFallbackProtection bool `json:"quic_fallback_protection"`
+	Enabled bool `json:"enabled"`
+	HTTP2   bool `json:"http2"`
+	HTTP3   bool `json:"http3"`
 }
 
 type ModuleSource struct {

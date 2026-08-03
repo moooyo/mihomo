@@ -37,6 +37,13 @@ type interceptProxy struct {
 	upstream    *upstreamTransportGeneration
 	http3Slots  chan struct{}
 
+	// The shared QUIC capture listener, started on the first captured datagram
+	// association and kept for the process. See quiccapture.go for why there is
+	// one rather than one per association.
+	quicMu     sync.Mutex
+	quicBridge *quicBridge
+	quicServer *http3.Server
+
 	// The client-facing TLS leg's shared session ticket keys. Every connection
 	// clones a config from these rather than building its own, which is what
 	// makes resumption possible at all; see mitmTLSConfig.

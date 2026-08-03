@@ -185,10 +185,10 @@ func getExtension(w http.ResponseWriter, r *http.Request) {
 }
 
 type settingsRequest struct {
-	Revision               string `json:"revision"`
-	Enabled                bool   `json:"enabled"`
-	HTTP2                  bool   `json:"http2"`
-	QUICFallbackProtection bool   `json:"quicFallbackProtection"`
+	Revision string `json:"revision"`
+	Enabled  bool   `json:"enabled"`
+	HTTP2    bool   `json:"http2"`
+	HTTP3    bool   `json:"http3"`
 }
 
 func putInterceptionSettings(w http.ResponseWriter, r *http.Request) {
@@ -198,9 +198,9 @@ func putInterceptionSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snapshot, revision, err := e.SetSettings(body.Revision, engine.MITMSettings{
-		Enabled:                body.Enabled,
-		HTTP2:                  body.HTTP2,
-		QUICFallbackProtection: body.QUICFallbackProtection,
+		Enabled: body.Enabled,
+		HTTP2:   body.HTTP2,
+		HTTP3:   body.HTTP3,
 	})
 	respondEngine(w, r, snapshot, revision, err, e)
 }

@@ -8,13 +8,13 @@ package engine
 // them would make opening the extensions page expensive in proportion to what
 // is installed. Detail reads fetch those individually.
 type Snapshot struct {
-	Enabled                bool             `json:"enabled"`
-	HTTP2                  bool             `json:"http2"`
-	QUICFallbackProtection bool             `json:"quic_fallback_protection"`
-	Modules                []ModuleSummary  `json:"modules"`
-	ExecutionOrder         []string         `json:"execution_order"`
-	ActiveCaptureHosts     []string         `json:"active_capture_hosts"`
-	Certificate            CertificateState `json:"certificate"`
+	Enabled            bool             `json:"enabled"`
+	HTTP2              bool             `json:"http2"`
+	HTTP3              bool             `json:"http3"`
+	Modules            []ModuleSummary  `json:"modules"`
+	ExecutionOrder     []string         `json:"execution_order"`
+	ActiveCaptureHosts []string         `json:"active_capture_hosts"`
+	Certificate        CertificateState `json:"certificate"`
 }
 
 // ModuleSummary is one installed extension, without its bodies.
@@ -54,11 +54,11 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 	}
 
 	out := Snapshot{
-		Enabled:                cfg.MITM.Enabled,
-		HTTP2:                  cfg.MITM.HTTP2,
-		QUICFallbackProtection: cfg.MITM.QUICFallbackProtection,
-		ExecutionOrder:         append([]string(nil), cfg.ExecutionOrder...),
-		Modules:                make([]ModuleSummary, 0, len(cfg.Modules)),
+		Enabled:        cfg.MITM.Enabled,
+		HTTP2:          cfg.MITM.HTTP2,
+		HTTP3:          cfg.MITM.HTTP3,
+		ExecutionOrder: append([]string(nil), cfg.ExecutionOrder...),
+		Modules:        make([]ModuleSummary, 0, len(cfg.Modules)),
 	}
 
 	for _, m := range cfg.Modules {

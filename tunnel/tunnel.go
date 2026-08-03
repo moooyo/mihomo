@@ -457,6 +457,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
 
+			if ic := captureUDPFor(metadata); ic != nil {
+				return dialCapturedUDP(ic, packet, sender, originMetadata, metadata, key)
+			}
+
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())

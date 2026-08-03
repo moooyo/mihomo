@@ -18,7 +18,7 @@ const twoExtensionDocument = `{
   "execution_order": ["first", "second"],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": true, "http2": true, "quic_fallback_protection": false},
+  "mitm": {"enabled": true, "http2": true, "http3": false},
   "modules": [
     {
       "id": "first",

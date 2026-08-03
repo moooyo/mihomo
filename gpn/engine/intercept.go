@@ -77,13 +77,31 @@ func (i *Interceptor) HandleTCP(conn net.Conn, metadata *C.Metadata) {
 	}
 }
 
-// MatchUDP always reports false for now: the datagram capture path is not
-// wired, and claiming a QUIC association the engine cannot serve would black
-// hole it. Gateway QUIC is handled by the fixed UDP/443 reject instead, which
-// makes a capable client retry over TCP.
-func (i *Interceptor) MatchUDP(*C.Metadata) bool { return false }
+// MatchUDP reports whether this association is QUIC for a captured host.
+//
+// Port 443 only, and only with HTTP3 enabled. The narrower port set than
+// MatchTCP is not caution: :80 has no datagram form, so a UDP association to it
+// is not something the engine could terminate. Everything this refuses meets
+// the fixed UDP/443 reject instead and comes back as TCP, which is captured --
+// so a false answer here costs a round trip, never the capture.
+func (i *Interceptor) MatchUDP(metadata *C.Metadata) bool {
+	if metadata.Host == "" || metadata.DstPort != 443 {
+		return false
+	}
+	cfg, err := i.proxy.config.Current()
+	if err != nil || !cfg.MITM.Enabled || !cfg.MITM.HTTP3 {
+		return false
+	}
+	return activeInterceptHost(cfg, metadata.Host)
+}
 
-// HandleUDP is unreachable while MatchUDP reports false.
-func (i *Interceptor) HandleUDP(*C.Metadata) (C.PacketConn, error) {
-	return nil, errUpstreamUnwired
+// HandleUDP takes ownership of a captured association and returns the packet
+// conn the core will drive as the remote.
+//
+// Unlike HandleTCP this returns rather than serves: the core owns the pump in
+// both directions and the engine owns what sits behind the conn. A failure here
+// is not fatal to the client -- the core drops the association, and the client's
+// QUIC attempt times out into its own TCP fallback, where capture succeeds.
+func (i *Interceptor) HandleUDP(metadata *C.Metadata) (C.PacketConn, error) {
+	return i.proxy.captureQUIC(metadata)
 }

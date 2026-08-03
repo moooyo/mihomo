@@ -3,6 +3,7 @@ package tunnel
 import (
 	"sync/atomic"
 
+	"github.com/metacubex/mihomo/component/nat"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -46,13 +47,9 @@ func captureTCPFor(metadata *C.Metadata) C.Interceptor {
 
 // captureUDPFor is the datagram equivalent, used for QUIC.
 //
-// Not called yet. The UDP path cannot simply hand a connection away: it builds
-// an association, so a capture there also owns nat.NewWriteBackProxy and the
-// handleUDPToLocal pump. That plumbing deserves its own change with its own
-// tests rather than a guess appended to the TCP one, and until it exists
-// gateway QUIC is handled by the fixed UDP/443 reject, which makes a capable
-// client fall back to TCP.
-func captureUDPFor(metadata *C.Metadata) C.Interceptor { //nolint:unused // wired with the H3 capture path
+// Same INNER guard and for the same reason: the engine reaches its own H3
+// upstreams by listening on a packet conn dialled back through this tunnel.
+func captureUDPFor(metadata *C.Metadata) C.Interceptor {
 	p := interceptor.Load()
 	if p == nil || metadata.Type == C.INNER {
 		return nil
@@ -62,6 +59,38 @@ func captureUDPFor(metadata *C.Metadata) C.Interceptor { //nolint:unused // wire
 		return nil
 	}
 	return ic
+}
+
+// dialCapturedUDP completes an association the interceptor has claimed.
+//
+// It lives here rather than at the call site so the hook in tunnel.go stays
+// three lines. The bookkeeping is deliberately the same as the uncaptured path
+// below it -- the destination NAT mapping, the write-back proxy, the reader
+// pump -- because the core still owns both directions of the association. What
+// capture replaces is only where the datagrams go: the interceptor's packet
+// conn instead of an outbound's.
+//
+// There is no statistic tracker and no rule, for the same reason the TCP
+// capture has neither: this association was never routed. The engine's own
+// upstream is dialled back through the tunnel and appears in the connection
+// table there, which is the row that describes an egress choice actually made.
+func dialCapturedUDP(
+	ic C.Interceptor,
+	packet C.PacketAdapter,
+	sender C.PacketSender,
+	originMetadata *C.Metadata,
+	metadata *C.Metadata,
+	key string,
+) (C.PacketConn, C.WriteBackProxy, error) {
+	pc, err := ic.HandleUDP(metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	dialMetadata := metadata.Pure()
+	sender.AddMapping(originMetadata, dialMetadata)
+	writeBackProxy := nat.NewWriteBackProxy(packet)
+	go handleUDPToLocal(writeBackProxy, pc, sender, key, dialMetadata.AddrPort())
+	return pc, writeBackProxy, nil
 }
 
 // ResolveMetadata exposes rule evaluation to fork-owned packages.
