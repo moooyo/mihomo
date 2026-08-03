@@ -147,6 +147,22 @@ func Open(stateDir string) (*Service, error) {
 	if err := current.Validate(); err != nil {
 		return nil, err
 	}
+	// A document written before the seed emitted an explicit list carries a nil
+	// slice, which marshals back as `null` on every subsequent write. Normalise
+	// it on the way in so an upgraded gateway converges to `[]` the first time
+	// anything writes, rather than keeping the foot-gun until an operator
+	// happens to add a rule.
+	if current.Policy.Rules == nil {
+		if _, err := doc.Update("", func(d Document) (Document, error) {
+			if d.Policy.Rules == nil {
+				d.Policy.Rules = []Rule{}
+			}
+			return d, nil
+		}); err != nil {
+			return nil, fmt.Errorf("gpn/dns: normalise the policy list: %w", err)
+		}
+		current = doc.Get().Value
+	}
 
 	tuning := current.Tuning
 	s := &Service{

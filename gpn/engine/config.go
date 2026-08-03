@@ -50,10 +50,13 @@ type Config struct {
 	TLSKey         string       `json:"tls_key"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
-	// Catalogs are the extension sources the operator has configured. They are
-	// discovery only: nothing here grants authority, and an install from a
-	// catalog runs the same reviewed, digest-checked path a pasted URL runs.
-	Catalogs []CatalogSource `json:"catalogs,omitempty"`
+	// Catalogs are the operator's, but a document written before they existed
+	// has no key at all -- and without this every already-installed gateway
+	// would get extension discovery shipped dark. An absent key seeds the
+	// default; an explicitly empty list does not, which is why the field is not
+	// omitempty: `[]` has to survive a round trip as a decision the operator
+	// made, distinct from never having had one.
+	Catalogs []CatalogSource `json:"catalogs"`
 	runtime  *compiledScriptConfig
 	// generation is assigned by configStore and advances only when validated
 	// document content changes. Directly decoded test/check configs leave it zero.
@@ -464,6 +467,9 @@ func decodeConfig(body []byte) (Config, error) {
 	}
 	if err := requireJSONEOF(decoder); err != nil {
 		return Config{}, err
+	}
+	if cfg.Catalogs == nil {
+		cfg.Catalogs = defaultCatalogSources()
 	}
 	programs := make(map[scriptProgramKey]*goja.Program)
 	if err := cfg.validate(programs); err != nil {

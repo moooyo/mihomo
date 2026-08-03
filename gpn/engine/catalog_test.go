@@ -430,3 +430,51 @@ func TestAnOrdinaryDocumentIsNotRewritten(t *testing.T) {
 		t.Errorf("an ordinary document was rewritten:\n got %s\nwant %s", out, body)
 	}
 }
+
+// A document written before catalogs existed has no key at all. Seeding the
+// default there is what stops extension discovery from shipping dark on every
+// gateway that was already installed.
+func TestADocumentWithNoCatalogKeySeedsTheDefault(t *testing.T) {
+	body := []byte(`{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": false, "http2": true}
+}`)
+	cfg, err := decodeConfig(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Catalogs) != 1 || cfg.Catalogs[0].ID != officialCatalogID {
+		t.Fatalf("an upgraded document did not get the default catalog: %+v", cfg.Catalogs)
+	}
+}
+
+// An operator who removed every catalog decided something, and that decision
+// has to survive a restart. It is why the field is not omitempty: `[]` must
+// round-trip as distinct from an absent key.
+func TestAnExplicitlyEmptyCatalogListIsNotReseeded(t *testing.T) {
+	body := []byte(`{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": false, "http2": true},
+  "catalogs": []
+}`)
+	cfg, err := decodeConfig(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Catalogs) != 0 {
+		t.Fatalf("an emptied catalog list was re-seeded: %+v", cfg.Catalogs)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"catalogs":[]`) {
+		t.Errorf("an empty list did not survive the write: %s", raw)
+	}
+}
