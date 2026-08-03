@@ -141,9 +141,12 @@ func (e *Engine) Fetch(ctx context.Context, request ImportRequest) (Candidate, e
 // CheckUpdate re-fetches an installed extension from the URL it came from.
 //
 // Only a URL-sourced extension can be checked. A pasted manifest has no
-// authority to re-read, and inventing one -- guessing at a registry, or reusing
-// a marketplace entry that merely happens to share an id -- would silently
-// change where an operator's code comes from.
+// authority to re-read, and inventing one -- guessing at a registry -- would
+// silently change where an operator's code comes from.
+//
+// A catalog can change it, but only because the operator picked that entry:
+// see ApplyCatalogUpdate. The distinction that matters is not "may the source
+// ever change" but "may it change without being asked".
 func (e *Engine) CheckUpdate(ctx context.Context, id string) (Candidate, error) {
 	cfg, err := e.config.Current()
 	if err != nil {
@@ -212,42 +215,73 @@ func (e *Engine) Install(ctx context.Context, revision string, request InstallRe
 // operator disables, updates, reviews and re-enables, which is three deliberate
 // steps and one clear state at each of them.
 func (e *Engine) ApplyUpdate(ctx context.Context, revision, id, digest string) (Snapshot, string, error) {
-	if strings.TrimSpace(digest) == "" {
-		return Snapshot{}, revision, fmt.Errorf("%w: digest is required; check for an update first and quote what it returned", ErrInvalidRequest)
-	}
 	cfg, err := e.config.Current()
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
-	var installed *Module
-	for i := range cfg.Modules {
-		if cfg.Modules[i].ID == id {
-			installed = &cfg.Modules[i]
-		}
-	}
-	if installed == nil {
-		return Snapshot{}, revision, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
-	}
-	if installed.Enabled {
-		return Snapshot{}, revision, fmt.Errorf("%w: disable extension %q before updating it", ErrInvalidRequest, id)
+	installed, err := updatableModule(cfg, id)
+	if err != nil {
+		return Snapshot{}, revision, err
 	}
 	if strings.TrimSpace(installed.Source.URL) == "" {
 		return Snapshot{}, revision, fmt.Errorf("%w: extension %q has no source URL to update from", ErrInvalidRequest, id)
 	}
+	return e.applyUpdateFrom(ctx, revision, id, installed.Source.URL, digest, nil)
+}
 
+// updatableModule finds an installed extension that is in a state an update may
+// replace.
+//
+// Disabled is the requirement. An update swaps every script the engine is
+// running, and doing that underneath live captured sessions would have requests
+// mid-flight served partly by the old code and partly by the new -- so the
+// operator disables, updates, reviews and re-enables, which is three deliberate
+// steps and one clear state at each of them.
+func updatableModule(cfg Config, id string) (Module, error) {
+	for _, m := range cfg.Modules {
+		if m.ID != id {
+			continue
+		}
+		if m.Enabled {
+			return Module{}, fmt.Errorf("%w: disable extension %q before updating it", ErrInvalidRequest, id)
+		}
+		return m, nil
+	}
+	return Module{}, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
+}
+
+// applyUpdateFrom is the shared tail of both update paths: fetch, prove it is
+// still the same extension, prove it is what was reviewed, install.
+//
+// verify is the catalog path's extra check and is nil for the ordinary one.
+func (e *Engine) applyUpdateFrom(
+	ctx context.Context,
+	revision, id, sourceURL, digest string,
+	verify func(Module) error,
+) (Snapshot, string, error) {
+	if strings.TrimSpace(digest) == "" {
+		return Snapshot{}, revision, fmt.Errorf("%w: digest is required; check for an update first and quote what it returned", ErrInvalidRequest)
+	}
 	imp, err := currentImporter()
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
-	module, err := imp.Import(ctx, ImportRequest{URL: installed.Source.URL})
+	module, err := imp.Import(ctx, ImportRequest{URL: sourceURL})
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
 	if module.ID != id {
-		return Snapshot{}, revision, fmt.Errorf("%w: %s now serves extension %q, not %q", ErrInvalidRequest, installed.Source.URL, module.ID, id)
+		// Applying it would replace one extension with another under the
+		// operator's existing bindings, which is not an update.
+		return Snapshot{}, revision, fmt.Errorf("%w: %s now serves extension %q, not %q", ErrInvalidRequest, sourceURL, module.ID, id)
 	}
 	if got := SnapshotDigest(module); got != digest {
 		return Snapshot{}, revision, fmt.Errorf("%w: the extension changed since you reviewed it (%s, not %s)", ErrInvalidRequest, got, digest)
+	}
+	if verify != nil {
+		if err := verify(module); err != nil {
+			return Snapshot{}, revision, err
+		}
 	}
 	return e.install(revision, module)
 }

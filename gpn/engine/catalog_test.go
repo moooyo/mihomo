@@ -478,3 +478,148 @@ func TestAnExplicitlyEmptyCatalogListIsNotReseeded(t *testing.T) {
 		t.Errorf("an empty list did not survive the write: %s", raw)
 	}
 }
+
+// installFromCatalog is the setup the update tests share: an extension already
+// installed from some other URL, disabled, ready to be moved onto a catalog.
+func installFromCatalog(t *testing.T, e *Engine, sourceURL string) string {
+	t.Helper()
+	_, revision, err := e.Install(context.Background(), e.Revision(), InstallRequest{
+		ImportRequest: ImportRequest{URL: sourceURL},
+		Digest:        SnapshotDigest(mustImport(t, sourceURL)),
+	})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	return revision
+}
+
+func mustImport(t *testing.T, sourceURL string) Module {
+	t.Helper()
+	imp, err := currentImporter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	module, err := imp.Import(context.Background(), ImportRequest{URL: sourceURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return module
+}
+
+// An update from a catalog entry moves where the extension's code comes from.
+// That is the whole point of the call and the reason it is not folded into the
+// ordinary update, so it is what the test asserts.
+func TestACatalogUpdateMovesTheExtensionsSource(t *testing.T) {
+	const oldURL = "https://elsewhere.example.com/example.yaml"
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+		oldURL:             validManifest,
+	})
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, oldURL)
+
+	before, _ := e.ReadDocument()
+	if got := before.Modules[0].Source.URL; got != oldURL {
+		t.Fatalf("setup installed from %q", got)
+	}
+
+	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest); err != nil {
+		t.Fatalf("ApplyCatalogUpdate: %v", err)
+	}
+	after, _ := e.ReadDocument()
+	if got := after.Modules[0].Source.URL; got != catalogManifestURL {
+		t.Errorf("source is %q, want the catalog entry's %q", got, catalogManifestURL)
+	}
+}
+
+// Everything the ordinary update path refuses, this one refuses too. Disabled
+// is the one that matters: an update swaps every script the engine is running.
+func TestACatalogUpdateRefusesAnEnabledExtension(t *testing.T) {
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+	})
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, catalogManifestURL)
+
+	// The extension declares an egress requirement, so bind one before enabling.
+	_, revision, err := e.SetEgressGroup(revision, "example.plugin", "Proxies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, revision, err = e.SetEnabled(revision, "example.plugin", true); err != nil {
+		t.Fatal(err)
+	}
+
+	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
+	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest)
+	if err == nil {
+		t.Fatal("an enabled extension was updated underneath its running scripts")
+	}
+	if !strings.Contains(err.Error(), "disable") {
+		t.Errorf("the refusal does not say what to do: %v", err)
+	}
+}
+
+// The entry's own claims are still checked on the update path. A catalog that
+// advertised one shape and updated to another would make the listing an
+// operator read meaningless at exactly the moment it matters.
+func TestACatalogUpdateStillChecksWhatTheEntryAdvertised(t *testing.T) {
+	understated := strings.Replace(honestCapabilities, `"network": true`, `"network": false`, 1)
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, understated, ""),
+		catalogManifestURL: validManifest,
+	})
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, catalogManifestURL)
+
+	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
+	_, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest)
+	if err == nil {
+		t.Fatal("an entry that understates the manifest updated anyway")
+	}
+	if !strings.Contains(err.Error(), "network grant") {
+		t.Errorf("the refusal does not name what diverged: %v", err)
+	}
+}
+
+// An update still has to quote a digest, and a wrong one is refused — the
+// catalog path must not become a way to skip the confirmation.
+func TestACatalogUpdateStillRequiresTheReviewedDigest(t *testing.T) {
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+	})
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, catalogManifestURL)
+
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", ""); err == nil {
+		t.Error("an update with no digest was applied")
+	}
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", strings.Repeat("b", 64)); err == nil {
+		t.Error("an update quoting the wrong digest was applied")
+	}
+}
+
+// CheckUpdate must keep re-reading only the installed source. A catalog that
+// merely exists must not redirect anything.
+func TestCheckUpdateStillReadsOnlyTheInstalledSource(t *testing.T) {
+	const oldURL = "https://elsewhere.example.com/example.yaml"
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+		oldURL:             validManifest,
+	})
+	e := catalogTestEngine(t)
+	installFromCatalog(t, e, oldURL)
+
+	if _, err := e.CheckUpdate(context.Background(), "example.plugin"); err != nil {
+		t.Fatalf("CheckUpdate: %v", err)
+	}
+	after, _ := e.ReadDocument()
+	if got := after.Modules[0].Source.URL; got != oldURL {
+		t.Errorf("checking for an update moved the source to %q", got)
+	}
+}

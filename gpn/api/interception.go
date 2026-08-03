@@ -53,6 +53,7 @@ func interceptionRouter() http.Handler {
 	r.Get("/catalog", getCatalog)
 	r.Put("/catalog/sources", putCatalogSources)
 	r.Post("/catalog/{source}/entries/{entry}/review", postCatalogReview)
+	r.Post("/catalog/{source}/entries/{entry}/update", postCatalogUpdate)
 	r.Route("/extensions/{id}", func(r chi.Router) {
 		r.Get("/", getExtension)
 		r.Delete("/", deleteExtension)
@@ -279,6 +280,34 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 	// The URL is returned so the install quotes the same source this review
 	// read, rather than the client reconstructing it from the listing.
 	render.JSON(w, r, render.M{"candidate": candidate, "url": url, "revision": e.Revision()})
+}
+
+type catalogUpdateRequest struct {
+	Revision string `json:"revision"`
+	Digest   string `json:"digest"`
+}
+
+func (b *catalogUpdateRequest) revision() string { return b.Revision }
+
+// postCatalogUpdate applies a catalog entry's version to an installed
+// extension, which moves where that extension's code comes from.
+//
+// Its own route rather than a flag on the ordinary update, because that is a
+// different decision: /extensions/{id}/update re-reads the source the operator
+// already chose, and this one replaces it. Collapsing them would make the
+// redirection a parameter of an operation that otherwise cannot redirect.
+func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
+	var body catalogUpdateRequest
+	e, ok := decodeWrite(w, r, &body)
+	if !ok {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	snapshot, revision, err := e.ApplyCatalogUpdate(
+		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.Digest)
+	respondEngine(w, r, snapshot, revision, err, e)
 }
 
 type orderRequest struct {

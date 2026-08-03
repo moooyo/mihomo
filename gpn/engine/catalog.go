@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 // Extension discovery.
@@ -33,10 +35,15 @@ import (
 // refused rather than reported, because the review is the screen where the
 // operator decides, and the wrong description reaching it is the failure.
 //
-// The catalog is not an update source. CheckUpdate re-reads the URL the
-// extension was installed from, never an entry that happens to share its id --
-// otherwise adding a catalog would silently change where installed code comes
-// from.
+// A catalog does not become an update source by existing. CheckUpdate re-reads
+// the URL an extension was installed from and never an entry that happens to
+// share its id, because a source that could change on its own would mean adding
+// a catalog silently redirects installed code.
+//
+// It can change one when asked. ApplyCatalogUpdate takes a specific entry in a
+// specific catalog for a specific extension, and moves that extension's source
+// to it. The distinction is not "may the source ever change" but "may it change
+// without being asked".
 
 const (
 	// The first-party catalog, seeded into every new document. An operator who
@@ -261,6 +268,44 @@ func (e *Engine) CatalogEntrySource(ctx context.Context, sourceID, entryID strin
 		return "", err
 	}
 	return entry.Manifest.URL, nil
+}
+
+// ApplyCatalogUpdate replaces an installed extension with a catalog entry's
+// version, and in doing so changes where that extension's code comes from.
+//
+// That is the whole weight of this call, and it is why it is a separate one.
+// CheckUpdate deliberately re-reads only the URL an extension was installed
+// from: a source that could change on its own would mean adding a catalog
+// silently redirects installed code. Here the operator picked this entry, in
+// this catalog, for this extension — so the redirection is the thing they
+// asked for rather than a side effect of configuration.
+//
+// Everything the ordinary update path checks still applies: the extension must
+// be disabled, the fetched manifest must still be the same extension id, and
+// its digest must match what was reviewed. On top of that the entry's own
+// claims are checked, so a catalog cannot advertise one shape and update to
+// another.
+func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, entryID, digest string) (Snapshot, string, error) {
+	entry, err := e.catalogEntry(ctx, sourceID, entryID)
+	if err != nil {
+		return Snapshot{}, revision, err
+	}
+	cfg, err := e.config.Current()
+	if err != nil {
+		return Snapshot{}, revision, err
+	}
+	installed, err := updatableModule(cfg, entry.ID)
+	if err != nil {
+		return Snapshot{}, revision, err
+	}
+	// Naming the move explicitly rather than performing it silently: an
+	// operator reading the log should see that the source changed.
+	if previous := strings.TrimSpace(installed.Source.URL); previous != "" && previous != entry.Manifest.URL {
+		log.Infoln("[GPN] extension %s updates from %s, previously %s", entry.ID, entry.Manifest.URL, previous)
+	}
+	return e.applyUpdateFrom(ctx, revision, entry.ID, entry.Manifest.URL, digest, func(module Module) error {
+		return e.verifyAgainstEntry(entry, Candidate{Detail: detailOf(module)})
+	})
 }
 
 func (e *Engine) catalogEntry(ctx context.Context, sourceID, entryID string) (CatalogEntry, error) {
