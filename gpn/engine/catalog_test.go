@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -360,5 +361,72 @@ func TestTheFirstPartyIndexAsPublishedDecodes(t *testing.T) {
 		if entry.Capabilities.RoutingRuleCount == nil {
 			t.Errorf("entry %q lost its routing rule count, which would leave it unverified", entry.ID)
 		}
+	}
+}
+
+// A document written by the build before HTTP/3 capture still opens.
+//
+// Renaming quic_fallback_protection to http3 made DisallowUnknownFields refuse
+// every deployed gateway's intercept.json at once -- and refusing it is a
+// warning, not a fatal, so the gateway came up resolving and forwarding with
+// interception silently absent. That is the worst shape a failure can have.
+//
+// The strictness is not relaxed. A typo in a hand-edited document must still be
+// refused; a key this program itself retired is not a typo.
+func TestADocumentFromBeforeTheHTTP3RenameStillOpens(t *testing.T) {
+	body := []byte(`{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": true, "http2": true, "quic_fallback_protection": true}
+}`)
+	cfg, err := decodeConfig(body)
+	if err != nil {
+		t.Fatalf("a pre-rename document was refused: %v", err)
+	}
+	if !cfg.MITM.Enabled || !cfg.MITM.HTTP2 {
+		t.Errorf("the operator's settings did not survive: %+v", cfg.MITM)
+	}
+	// Dropped, never mapped: an operator who had "fallback protection" on has
+	// not thereby asked for QUIC to be terminated here.
+	if cfg.MITM.HTTP3 {
+		t.Error("the retired flag was mapped onto http3 instead of being dropped")
+	}
+	// And it does not come back on the next write.
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "quic_fallback_protection") {
+		t.Errorf("the retired key was re-emitted: %s", raw)
+	}
+}
+
+// The strictness that made the rename dangerous is what catches a typo, so it
+// has to survive the fix.
+func TestAnUnknownFieldThatIsNotRetiredIsStillRefused(t *testing.T) {
+	body := []byte(`{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": true, "http2": true, "htp3": true}
+}`)
+	if _, err := decodeConfig(body); err == nil {
+		t.Fatal("a misspelled field was accepted")
+	}
+}
+
+// A document with nothing retired in it must be passed through untouched, or
+// every gateway's revision would move for no reason on first read.
+func TestAnOrdinaryDocumentIsNotRewritten(t *testing.T) {
+	body := []byte(`{"mitm": {"enabled": true}}`)
+	out, err := dropRetiredFields(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(body) {
+		t.Errorf("an ordinary document was rewritten:\n got %s\nwant %s", out, body)
 	}
 }

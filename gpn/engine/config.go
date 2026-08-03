@@ -377,8 +377,83 @@ func readConfigDocumentWithInfo(path string) ([]byte, os.FileInfo, error) {
 	return body, info, nil
 }
 
+// retiredDocumentFields are keys this build no longer understands but that a
+// document written by an earlier one still carries. Each is dropped before the
+// strict decode and never written again.
+//
+// This is a migration, not compatibility. The field is discarded rather than
+// mapped, the document is rewritten without it on the next write, and nothing
+// downstream can read it. What it buys is that an upgrade does not turn the
+// operator's installed extensions into a document the engine refuses to open --
+// which is what a rename does to every deployed gateway at once, silently,
+// because "interception engine not installed" is a warning and the gateway
+// still resolves and forwards.
+//
+// The strictness itself stays. DisallowUnknownFields is what stops a typo in a
+// hand-edited document from being ignored, and a *typo* is exactly what it
+// should refuse. A key this program itself retired is not a typo.
+var retiredDocumentFields = [][]string{
+	// Replaced by mitm.http3 when datagram capture was wired. It was stored,
+	// surfaced in the API and the snapshot, and read by nothing.
+	{"mitm", "quic_fallback_protection"},
+}
+
+// dropRetiredFields removes retired keys from a document's bytes.
+//
+// It re-marshals only when something was actually removed, so an ordinary
+// document is passed through byte for byte and its revision is unchanged.
+func dropRetiredFields(body []byte) ([]byte, error) {
+	touched := false
+	for _, path := range retiredDocumentFields {
+		if bytes.Contains(body, []byte(`"`+path[len(path)-1]+`"`)) {
+			touched = true
+			break
+		}
+	}
+	if !touched {
+		return body, nil
+	}
+
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		// Leave it to the strict decode below to produce the real message.
+		return body, nil
+	}
+	removed := false
+	for _, path := range retiredDocumentFields {
+		node := document
+		for _, key := range path[:len(path)-1] {
+			child, ok := node[key].(map[string]any)
+			if !ok {
+				node = nil
+				break
+			}
+			node = child
+		}
+		if node == nil {
+			continue
+		}
+		if _, present := node[path[len(path)-1]]; present {
+			delete(node, path[len(path)-1])
+			removed = true
+		}
+	}
+	if !removed {
+		return body, nil
+	}
+	rewritten, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("drop retired fields: %w", err)
+	}
+	return rewritten, nil
+}
+
 func decodeConfig(body []byte) (Config, error) {
 	if err := rejectDuplicateJSONKeys(body); err != nil {
+		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	body, err := dropRetiredFields(body)
+	if err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
