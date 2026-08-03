@@ -84,7 +84,11 @@ func DefaultDocument() Document {
 			Trust: []string{"22.22.22.22:53"},
 			ECS:   "112.96.32.0/24",
 		},
-		Policy: Policy{Fallback: FallbackAuto},
+		// An explicit empty list rather than a nil slice. Go marshals nil as
+		// `null`, and every consumer that iterates the policy -- the console,
+		// the acceptance suites, an operator's jq -- errors on it rather than
+		// seeing zero rules. `[]` says the same thing with nothing to trip on.
+		Policy: Policy{Rules: []Rule{}, Fallback: FallbackAuto},
 	}
 }
 
