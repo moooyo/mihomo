@@ -50,6 +50,9 @@ func interceptionRouter() http.Handler {
 	r.Put("/order", putInterceptionOrder)
 	r.Post("/review", postReview)
 	r.Post("/extensions", postInstall)
+	r.Get("/catalog", getCatalog)
+	r.Put("/catalog/sources", putCatalogSources)
+	r.Post("/catalog/{source}/entries/{entry}/review", postCatalogReview)
 	r.Route("/extensions/{id}", func(r chi.Router) {
 		r.Get("/", getExtension)
 		r.Delete("/", deleteExtension)
@@ -203,6 +206,79 @@ func putInterceptionSettings(w http.ResponseWriter, r *http.Request) {
 		HTTP3:   body.HTTP3,
 	})
 	respondEngine(w, r, snapshot, revision, err, e)
+}
+
+// getCatalog lists every configured extension source and what it advertises.
+//
+// It takes no revision because it changes nothing, and it fetches rather than
+// reading stored state: a catalog is not the gateway's data. `?refresh=1`
+// bypasses the few-minute cache, which is what an operator clicks when a
+// publisher has just released something.
+func getCatalog(w http.ResponseWriter, r *http.Request) {
+	e := currentEngine()
+	if e == nil {
+		unavailable(w, r, "the interception engine is not installed")
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	view, err := e.Catalog(ctx, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	render.JSON(w, r, render.M{"catalog": view, "revision": e.Revision()})
+}
+
+type catalogSourcesRequest struct {
+	Revision string                 `json:"revision"`
+	Sources  []engine.CatalogSource `json:"sources"`
+}
+
+func (b *catalogSourcesRequest) revision() string { return b.Revision }
+
+func putCatalogSources(w http.ResponseWriter, r *http.Request) {
+	var body catalogSourcesRequest
+	e, ok := decodeWrite(w, r, &body)
+	if !ok {
+		return
+	}
+	snapshot, revision, err := e.SetCatalogSources(body.Revision, body.Sources)
+	respondEngine(w, r, snapshot, revision, err, e)
+}
+
+// postCatalogReview reviews one catalog entry.
+//
+// It returns exactly what postReview returns, and for the same reason: the
+// install that follows is the same call with the same digest. What this adds is
+// the check that the manifest matches the listing the operator read -- the
+// digest the catalog published, and the capabilities it advertised. A
+// disagreement is refused here rather than surfaced next to a review, because
+// this is the screen where the operator decides.
+func postCatalogReview(w http.ResponseWriter, r *http.Request) {
+	e := currentEngine()
+	if e == nil {
+		unavailable(w, r, "the interception engine is not installed")
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
+	defer cancel()
+
+	source, entry := chi.URLParam(r, "source"), chi.URLParam(r, "entry")
+	candidate, err := e.ReviewCatalogEntry(ctx, source, entry)
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	url, err := e.CatalogEntrySource(ctx, source, entry)
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	// The URL is returned so the install quotes the same source this review
+	// read, rather than the client reconstructing it from the listing.
+	render.JSON(w, r, render.M{"candidate": candidate, "url": url, "revision": e.Revision()})
 }
 
 type orderRequest struct {

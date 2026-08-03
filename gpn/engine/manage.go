@@ -164,6 +164,7 @@ func cloneConfig(c Config) Config {
 	out := c
 	out.runtime = nil
 	out.ExecutionOrder = copyStrings(c.ExecutionOrder)
+	out.Catalogs = append([]CatalogSource(nil), c.Catalogs...)
 	out.Modules = make([]Module, len(c.Modules))
 	for i, m := range c.Modules {
 		m.CaptureHosts = copyStrings(m.CaptureHosts)

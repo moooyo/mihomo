@@ -19,20 +19,25 @@ const (
 )
 
 // DefaultDocument is an interception engine that is installed and doing
-// nothing: the master off, no extensions, HTTP/2 on.
+// nothing: the master off, no extensions, HTTP/2 on, HTTP/3 capture off.
 //
 // "Installed and doing nothing" is a state the system needs to be able to
 // represent, and an absent file cannot represent it. The API answers 503 for an
 // engine that failed to load and renders a panel for one that loaded and says
 // it is off, and those must not be the same thing — one is a gateway to
 // investigate and the other is a gateway working as configured.
+//
+// The first-party catalog is seeded because discovery has to work before an
+// operator knows a URL to type; it is a default they can disable or remove, and
+// it grants nothing on its own.
 func DefaultDocument() Config {
 	return Config{
 		Version:        configVersion,
 		ExecutionOrder: []string{},
 		TLSCert:        interceptCertPath,
 		TLSKey:         interceptKeyPath,
-		MITM:           MITMSettings{Enabled: false, HTTP2: true},
+		MITM:           MITMSettings{Enabled: false, HTTP2: true, HTTP3: false},
+		Catalogs:       defaultCatalogSources(),
 	}
 }
 

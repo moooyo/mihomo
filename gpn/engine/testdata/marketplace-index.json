@@ -1,0 +1,308 @@
+{
+  "apiVersion": "5gpn.io/marketplace/v1",
+  "kind": "ExtensionMarketplace",
+  "metadata": {
+    "id": "io.5gpn.official",
+    "name": "5gpn Official Extensions",
+    "description": "First-party reviewed native extensions for 5gpn.",
+    "homepage": "https://github.com/moooyo/5gpn-extensions",
+    "source": {
+      "repository": "https://github.com/moooyo/5gpn-extensions",
+      "revision": "baafb3800d692de5a2ff5321ecb672328f3694d7"
+    }
+  },
+  "entries": [
+    {
+      "id": "io.5gpn.apple-wloc",
+      "name": "Apple WLOC Location Override",
+      "version": "2.1.0",
+      "description": "Runs the reviewed Yu9191/wloc scripts against Apple Wi-Fi and cellular location responses.",
+      "tags": [
+        "apple",
+        "location",
+        "testing"
+      ],
+      "license": {
+        "spdx": "MIT",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/MIT.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/apple-wloc/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/apple-wloc/extension.yaml",
+        "sha256": "4de80d508b64294f2cee785b785b5b954d3286a393f83a60228b0433f5ddfd84",
+        "size": 3408
+      },
+      "resources": [
+        {
+          "path": "Yu9191/wloc/eec07a8dc8de6dbaee8eac1fb376e4d03020154a/dist/wloc-settings.js",
+          "url": "https://raw.githubusercontent.com/Yu9191/wloc/eec07a8dc8de6dbaee8eac1fb376e4d03020154a/dist/wloc-settings.js",
+          "sha256": "b4e9d69e69c703b3fab485a559825aaedc9e3a1fd9c06e81cb35d10bbdcd13d2",
+          "size": 12892
+        },
+        {
+          "path": "Yu9191/wloc/eec07a8dc8de6dbaee8eac1fb376e4d03020154a/dist/wloc.js",
+          "url": "https://raw.githubusercontent.com/Yu9191/wloc/eec07a8dc8de6dbaee8eac1fb376e4d03020154a/dist/wloc.js",
+          "sha256": "d385c624efd59bdd2cff56bf819a770b40c4abf0f970818877f1dca4174f256a",
+          "size": 40414
+        }
+      ],
+      "capabilities": {
+        "captureHostCount": 2,
+        "actionCount": 2,
+        "settingCount": 4,
+        "network": false,
+        "persistentStorage": true,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 0,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 4,
+        "policyRules": 0,
+        "captureRules": 4,
+        "digest": "be2c9dfcdc2df0d81238dadc9bc581aa50b7218b5e1c080f91ea9466af6d88c9"
+      }
+    },
+    {
+      "id": "io.5gpn.bilibili-cleaner",
+      "name": "Bilibili Cleaner",
+      "version": "4.1.0",
+      "description": "Runs the reviewed kokoryh/Sparkle Bilibili scripts and rewrite rules against the Bilibili app.",
+      "tags": [
+        "ads",
+        "bilibili",
+        "media"
+      ],
+      "license": {
+        "spdx": "GPL-3.0-only",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/GPL-3.0-only.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/bilibili-cleaner/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/bilibili-cleaner/extension.yaml",
+        "sha256": "bc049d9ab0ddce5ee65ec57e17103017cb29edfdce528becbb88ba88a0cf35f3",
+        "size": 25776
+      },
+      "resources": [
+        {
+          "path": "kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.json.js",
+          "url": "https://raw.githubusercontent.com/kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.json.js",
+          "sha256": "32ba00da58c598c4419e7cc86f50acf0279a1c819fa6e3f2a851e6582001a5b8",
+          "size": 19322
+        },
+        {
+          "path": "kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.protobuf.request.js",
+          "url": "https://raw.githubusercontent.com/kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.protobuf.request.js",
+          "sha256": "c1102bb6767c8361ad1722c44577303ae1caf3d68f2f1cb9ebe15017fc14f8ac",
+          "size": 63120
+        },
+        {
+          "path": "kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.protobuf.response.js",
+          "url": "https://raw.githubusercontent.com/kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/bilibili.protobuf.response.js",
+          "sha256": "9852cb5befe36a7fc10c9504d67e1a25cce971e5fc584f7da870c7b1dfc4ac0e",
+          "size": 95088
+        },
+        {
+          "path": "kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/webpage.bilibili.js",
+          "url": "https://raw.githubusercontent.com/kokoryh/Sparkle/a26c3412a760fb8d7d4d1bcc124d126e19d630e5/dist/webpage.bilibili.js",
+          "sha256": "9a18db34c6ccf68502a9935adcd6f9a2b6103e40f23dd7e841c660e77c652326",
+          "size": 5259
+        }
+      ],
+      "capabilities": {
+        "captureHostCount": 6,
+        "actionCount": 24,
+        "settingCount": 5,
+        "network": true,
+        "persistentStorage": true,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 5,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 17,
+        "policyRules": 5,
+        "captureRules": 12,
+        "digest": "a8cf8e306817244fa76361c4d3b987b79bdbe28fa1b54144a240e72048ea4f58"
+      }
+    },
+    {
+      "id": "io.5gpn.testflight-region-unlock",
+      "name": "TestFlight Region Unlock",
+      "version": "2.2.0",
+      "description": "Rewrites the TestFlight install storefront; needs a matching regional egress group to have any effect.",
+      "tags": [
+        "apple",
+        "region",
+        "testflight"
+      ],
+      "license": {
+        "spdx": "CC-BY-NC-SA-4.0",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/CC-BY-NC-SA-4.0.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/testflight-region-unlock/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/testflight-region-unlock/extension.yaml",
+        "sha256": "09e8c651cb4a5a47bd4d50fce3ee0abf46cae8c41c2a835ebeeee8ce84244c4b",
+        "size": 1521
+      },
+      "resources": [],
+      "capabilities": {
+        "captureHostCount": 1,
+        "actionCount": 1,
+        "settingCount": 1,
+        "network": false,
+        "persistentStorage": false,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 0,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 2,
+        "policyRules": 0,
+        "captureRules": 2,
+        "digest": "f624739a7ff76cba357dd2f0ccaf716d23a04f780123872fa6970ab221dc46b7"
+      }
+    },
+    {
+      "id": "io.5gpn.weatherkit",
+      "name": "WeatherKit Enhancer",
+      "version": "7.0.0",
+      "description": "Runs the reviewed NSRingo WeatherKit release bundles on the gateway, or sends the same three paths to the reviewed upstream cloud endpoint.",
+      "tags": [
+        "apple",
+        "weather",
+        "weatherkit"
+      ],
+      "license": {
+        "spdx": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/Apache-2.0.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/weatherkit/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/weatherkit/extension.yaml",
+        "sha256": "44851f5f7bf13411980dab6f41c3829c86d980bdf50b6d2f92732d9666ebcbf3",
+        "size": 9705
+      },
+      "resources": [
+        {
+          "path": "NSRingo/WeatherKit/releases/download/v3.2.0-beta5/request.bundle.js",
+          "url": "https://github.com/NSRingo/WeatherKit/releases/download/v3.2.0-beta5/request.bundle.js",
+          "sha256": "250c7970861e365501b1b0586bf3e951ed9e24e01af26391758c3a87051a2613",
+          "size": 236646
+        },
+        {
+          "path": "NSRingo/WeatherKit/releases/download/v3.2.0-beta5/response.bundle.js",
+          "url": "https://github.com/NSRingo/WeatherKit/releases/download/v3.2.0-beta5/response.bundle.js",
+          "sha256": "0c1f9d73ae82310073933be480f71f7eb7c142593159c0683d598ff2a8993482",
+          "size": 267124
+        }
+      ],
+      "capabilities": {
+        "captureHostCount": 1,
+        "actionCount": 6,
+        "settingCount": 11,
+        "network": true,
+        "persistentStorage": true,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 4,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 6,
+        "policyRules": 4,
+        "captureRules": 2,
+        "digest": "dc4b9d4d92edfc18091977b29146d97d18510c65bedb7c4766050639fc591b39"
+      }
+    },
+    {
+      "id": "io.5gpn.youtube-cleaner",
+      "name": "YouTube Application Cleaner",
+      "version": "5.1.0",
+      "description": "Runs the reviewed Maasea YouTube Enhance scripts against YouTube responses and the Onesie playback path.",
+      "tags": [
+        "ads",
+        "media",
+        "youtube"
+      ],
+      "license": {
+        "spdx": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/Apache-2.0.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/youtube-cleaner/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/youtube-cleaner/extension.yaml",
+        "sha256": "eccdfe4574b742611f7d062b84edbd261904a7c1c811864bde5c1d0bc7a0e4b5",
+        "size": 2648
+      },
+      "resources": [
+        {
+          "path": "Maasea/sgmodule/65075cdb388fc5e3094afd7e7314c67b243f3525/Script/Youtube/youtube.request.js",
+          "url": "https://raw.githubusercontent.com/Maasea/sgmodule/65075cdb388fc5e3094afd7e7314c67b243f3525/Script/Youtube/youtube.request.js",
+          "sha256": "3ecca15e06e76a31720092c581180f648ef2c45e494644941ba985c878efbb26",
+          "size": 44024
+        },
+        {
+          "path": "Maasea/sgmodule/65075cdb388fc5e3094afd7e7314c67b243f3525/Script/Youtube/youtube.response.js",
+          "url": "https://raw.githubusercontent.com/Maasea/sgmodule/65075cdb388fc5e3094afd7e7314c67b243f3525/Script/Youtube/youtube.response.js",
+          "sha256": "f98483d5f5017514f82502253c0db5ce2d4ffb7839887aa2cadc22666f5a7f12",
+          "size": 132973
+        }
+      ],
+      "capabilities": {
+        "captureHostCount": 2,
+        "actionCount": 3,
+        "settingCount": 4,
+        "network": true,
+        "persistentStorage": true,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 0,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 4,
+        "policyRules": 0,
+        "captureRules": 4,
+        "digest": "9db36c369e432ab529bcc06fffc3aa1679814a1071ee145e94eaf03636ad8653"
+      }
+    },
+    {
+      "id": "io.5gpn.zhihu-cleaner",
+      "name": "Zhihu Cleaner",
+      "version": "2.1.0",
+      "description": "Removes selected Zhihu transport overrides, advertisements, promotions, and navigation entries.",
+      "tags": [
+        "ads",
+        "media",
+        "zhihu"
+      ],
+      "license": {
+        "spdx": "CC-BY-NC-SA-4.0",
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/LICENSES/CC-BY-NC-SA-4.0.txt"
+      },
+      "documentationUrl": "https://github.com/moooyo/5gpn-extensions/blob/main/zhihu-cleaner/README.md",
+      "manifest": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/main/zhihu-cleaner/extension.yaml",
+        "sha256": "1db5654b8aaa08fd48625664ac595c517a3f9d547692d56ac890722c24137829",
+        "size": 10237
+      },
+      "resources": [],
+      "capabilities": {
+        "captureHostCount": 5,
+        "actionCount": 18,
+        "settingCount": 0,
+        "network": false,
+        "persistentStorage": false,
+        "upstreamMappingCount": 0,
+        "routingRuleCount": 5,
+        "egressGroupRequired": false
+      },
+      "policy": {
+        "clientRules": 15,
+        "policyRules": 5,
+        "captureRules": 10,
+        "digest": "e7d7baaa94c139160a879aad2cbbec2aabfdbc476972ba914cff84dc038030eb"
+      }
+    }
+  ]
+}

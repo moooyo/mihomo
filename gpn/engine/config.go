@@ -50,7 +50,11 @@ type Config struct {
 	TLSKey         string       `json:"tls_key"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
-	runtime        *compiledScriptConfig
+	// Catalogs are the extension sources the operator has configured. They are
+	// discovery only: nothing here grants authority, and an install from a
+	// catalog runs the same reviewed, digest-checked path a pasted URL runs.
+	Catalogs []CatalogSource `json:"catalogs,omitempty"`
+	runtime  *compiledScriptConfig
 	// generation is assigned by configStore and advances only when validated
 	// document content changes. Directly decoded test/check configs leave it zero.
 	generation uint64
@@ -554,6 +558,9 @@ func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 		return err
 	}
 	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
+		return err
+	}
+	if err := validateCatalogs(c.Catalogs); err != nil {
 		return err
 	}
 	if len(certificateHostPatterns(c)) > maxCertificateHosts {

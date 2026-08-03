@@ -20,6 +20,10 @@ type Engine struct {
 	logs        *engineLogHub
 	proxy       *interceptProxy
 	interceptor *Interceptor
+	// catalogs holds fetched extension indexes for a few minutes. Nothing in it
+	// is state: it exists so opening the extensions page does not put a request
+	// on a publisher's host per render.
+	catalogs catalogCache
 }
 
 // New assembles the engine from the interception document at configPath, using
