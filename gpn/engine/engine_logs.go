@@ -104,8 +104,18 @@ func newEngineLogHub(capacity int) *engineLogHub {
 	}
 }
 
+// Enabled reports whether events are worth building. It is not "is anyone
+// watching" any more: the hub retains a bounded ring so that a log exists
+// BEFORE an operator goes looking, which is the only time a debug log is
+// useful. Streaming and retention are separate concerns and this is the
+// retention one.
+//
+// The cost that buys is building and marshalling every event even with nobody
+// subscribed. The ring is 1000 entries of bounded, truncated fields, so the
+// ceiling is small and fixed; the alternative is a log that is always empty at
+// exactly the moment it is opened.
 func (h *engineLogHub) Enabled() bool {
-	return h.HasSubscribers()
+	return h != nil
 }
 
 func (h *engineLogHub) HasSubscribers() bool {
@@ -113,11 +123,11 @@ func (h *engineLogHub) HasSubscribers() bool {
 }
 
 func (h *engineLogHub) Publish(event EngineLog) {
-	if !h.HasSubscribers() {
+	if h == nil {
 		return
 	}
 	h.mu.Lock()
-	if h.closed || h.subscribers.Load() == 0 {
+	if h.closed {
 		h.mu.Unlock()
 		return
 	}
@@ -149,6 +159,72 @@ func (h *engineLogHub) Publish(event EngineLog) {
 		default:
 		}
 	}
+}
+
+// EngineLogFilter narrows a snapshot. A zero value matches everything.
+type EngineLogFilter struct {
+	// Extension matches EngineLog.Extension exactly. Empty matches any.
+	Extension string
+	// Level matches EngineLog.Level exactly. Empty matches any.
+	Level string
+	// Contains matches Message case-insensitively. Empty matches any.
+	Contains string
+	// Limit caps the returned events. Zero or negative means the whole ring.
+	Limit int
+}
+
+// Snapshot returns retained events oldest first, which is the order a log is
+// read in.
+//
+// It unmarshals from the same ring the websocket path writes, rather than
+// keeping a second copy of every event in struct form. A snapshot is taken when
+// a human presses refresh; paying the decode there is cheaper than paying the
+// memory always.
+func (h *engineLogHub) Snapshot(filter EngineLogFilter) []EngineLog {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	size := uint64(len(h.ring))
+	next := h.next
+	payloads := make([][]byte, 0, size)
+	if size > 0 {
+		first := uint64(0)
+		if next > size {
+			first = next - size
+		}
+		for sequence := first; sequence < next; sequence++ {
+			if payload := h.ring[sequence%size]; payload != nil {
+				payloads = append(payloads, payload)
+			}
+		}
+	}
+	h.mu.Unlock()
+
+	want := strings.ToLower(filter.Contains)
+	out := make([]EngineLog, 0, len(payloads))
+	for _, payload := range payloads {
+		var event EngineLog
+		if err := json.Unmarshal(payload, &event); err != nil {
+			continue
+		}
+		if filter.Extension != "" && event.Extension != filter.Extension {
+			continue
+		}
+		if filter.Level != "" && event.Level != filter.Level {
+			continue
+		}
+		if want != "" && !strings.Contains(strings.ToLower(event.Message), want) {
+			continue
+		}
+		out = append(out, event)
+	}
+	// Trim from the FRONT: a limit on a log means "the most recent N", and
+	// dropping the newest would answer a different question.
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[len(out)-filter.Limit:]
+	}
+	return out
 }
 
 func normalizeEngineLog(event EngineLog, now time.Time) (EngineLog, error) {

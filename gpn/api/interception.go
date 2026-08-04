@@ -8,6 +8,8 @@ import (
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
 	"github.com/metacubex/http"
+	"strconv"
+
 	"github.com/metacubex/mihomo/gpn/engine"
 	"github.com/metacubex/mihomo/gpn/state"
 )
@@ -50,6 +52,7 @@ func interceptionRouter() http.Handler {
 	r.Put("/order", putInterceptionOrder)
 	r.Post("/review", postReview)
 	r.Post("/extensions", postInstall)
+	r.Get("/logs", getEngineLogs)
 	r.Get("/catalog", getCatalog)
 	r.Put("/catalog/sources", putCatalogSources)
 	r.Post("/catalog/{source}/entries/{entry}/review", postCatalogReview)
@@ -65,6 +68,36 @@ func interceptionRouter() http.Handler {
 		r.Put("/settings/{key}", putExtensionSetting)
 	})
 	return r
+}
+
+// getEngineLogs serves the retained engine and extension log ring.
+//
+// A read rather than a stream. The engine already publishes to a websocket for
+// a live tail, but the question an operator actually has is "what did this
+// extension do before it broke", asked after it broke -- and a stream that
+// begins when they open it cannot answer that.
+//
+// limit defaults to a screenful and is capped at the ring, so a caller cannot
+// ask for more than exists or make the response unbounded.
+func getEngineLogs(w http.ResponseWriter, r *http.Request) {
+	e := currentEngine()
+	if e == nil {
+		unavailable(w, r, "the interception engine is not installed")
+		return
+	}
+	query := r.URL.Query()
+	filter := engine.EngineLogFilter{
+		Extension: query.Get("extension"),
+		Level:     query.Get("level"),
+		Contains:  query.Get("contains"),
+		Limit:     200,
+	}
+	if raw := query.Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			filter.Limit = n
+		}
+	}
+	render.JSON(w, r, render.M{"logs": e.Logs(filter)})
 }
 
 // postReview fetches a candidate and reports what it is, without installing it.

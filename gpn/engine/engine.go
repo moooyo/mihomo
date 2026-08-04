@@ -72,3 +72,15 @@ func (e *Engine) Reload() error {
 	}
 	return nil
 }
+
+// Logs returns retained engine and extension log events, oldest first.
+//
+// The console reads this rather than subscribing: an operator opens the log
+// after something went wrong, and a stream that starts at "now" has nothing to
+// show them. The hub retains a bounded ring for exactly that case.
+func (e *Engine) Logs(filter EngineLogFilter) []EngineLog {
+	if e == nil {
+		return nil
+	}
+	return e.logs.Snapshot(filter)
+}
