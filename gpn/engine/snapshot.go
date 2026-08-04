@@ -53,13 +53,21 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 		return Snapshot{}, err
 	}
 
+	// Every list here is built with make, never with append onto a nil slice.
+	// A nil slice marshals to JSON null, and null is not what this type says it
+	// serves: the console reads .length off all three, so a gateway with no
+	// extensions installed -- or with the MITM master off -- rendered the
+	// extensions page into a TypeError and a blank screen. An empty list and a
+	// missing list are different claims, and only one of them is true here.
 	out := Snapshot{
-		Enabled:        cfg.MITM.Enabled,
-		HTTP2:          cfg.MITM.HTTP2,
-		HTTP3:          cfg.MITM.HTTP3,
-		ExecutionOrder: append([]string(nil), cfg.ExecutionOrder...),
-		Modules:        make([]ModuleSummary, 0, len(cfg.Modules)),
+		Enabled:            cfg.MITM.Enabled,
+		HTTP2:              cfg.MITM.HTTP2,
+		HTTP3:              cfg.MITM.HTTP3,
+		ExecutionOrder:     make([]string, 0, len(cfg.ExecutionOrder)),
+		Modules:            make([]ModuleSummary, 0, len(cfg.Modules)),
+		ActiveCaptureHosts: make([]string, 0),
 	}
+	out.ExecutionOrder = append(out.ExecutionOrder, cfg.ExecutionOrder...)
 
 	for _, m := range cfg.Modules {
 		out.Modules = append(out.Modules, summariseModule(m))
@@ -70,7 +78,7 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 	// hosts that nothing captures. Reporting the declared set instead would tell
 	// an operator their traffic is being intercepted when it is not.
 	if cfg.MITM.Enabled {
-		out.ActiveCaptureHosts = activeHostPatterns(cfg)
+		out.ActiveCaptureHosts = append(out.ActiveCaptureHosts, activeHostPatterns(cfg)...)
 	}
 
 	out.Certificate = e.certificateState(cfg)
@@ -110,7 +118,7 @@ func summariseModule(m Module) ModuleSummary {
 		// document was taken under, and a caller ranging over it while a reload
 		// swaps the document underneath would see a slice whose backing array
 		// belongs to a config nobody is serving any more.
-		CaptureHosts: append([]string(nil), m.CaptureHosts...),
+		CaptureHosts: append(make([]string, 0, len(m.CaptureHosts)), m.CaptureHosts...),
 		CaptureDNS:   m.CaptureDNS,
 		EgressGroup:  m.EgressGroup,
 		// Reported separately from EgressGroup because the two answer different
