@@ -72,6 +72,48 @@ type Tuning struct {
 // present rather than empty because an empty group refuses every query, and a
 // resolver that will not answer is harder to diagnose from a phone than one
 // answering from an address the operator recognises as wrong.
+// The two lists a fresh gateway starts with, carried over from the seed the
+// pre-monolith installer wrote.
+//
+// One resolves China's domains DIRECT and one steers the GFW list to the
+// gateway. Together they are the difference between a resolver that decides
+// something and one that sends every name to the fallback -- which is a working
+// gateway that appears to do nothing.
+//
+// Exported because DefaultDocument only ever applies to an ABSENT document.
+// Every gateway that already has one would miss these, which is exactly how
+// extension discovery once shipped dark on every existing host. The console
+// offers them explicitly for that case, from this same definition, so the two
+// paths cannot describe different defaults.
+const (
+	defaultChinaListURL = "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_Domain.yaml"
+	defaultGFWListURL   = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
+	defaultListInterval = 86400
+)
+
+func DefaultSubscriptionRules() []Rule {
+	return []Rule{
+		{
+			ID:              "china-domains",
+			Kind:            KindSubscription,
+			Value:           defaultChinaListURL,
+			Intent:          IntentDirect,
+			Enabled:         true,
+			Format:          "clash",
+			IntervalSeconds: defaultListInterval,
+		},
+		{
+			ID:              "gfwlist",
+			Kind:            KindSubscription,
+			Value:           defaultGFWListURL,
+			Intent:          IntentProxy,
+			Enabled:         true,
+			Format:          "plain",
+			IntervalSeconds: defaultListInterval,
+		},
+	}
+}
+
 func DefaultDocument() Document {
 	return Document{
 		Listen: Listen{
@@ -88,7 +130,7 @@ func DefaultDocument() Document {
 		// `null`, and every consumer that iterates the policy -- the console,
 		// the acceptance suites, an operator's jq -- errors on it rather than
 		// seeing zero rules. `[]` says the same thing with nothing to trip on.
-		Policy: Policy{Rules: []Rule{}, Fallback: FallbackAuto},
+		Policy: Policy{Rules: DefaultSubscriptionRules(), Fallback: FallbackAuto},
 	}
 }
 
