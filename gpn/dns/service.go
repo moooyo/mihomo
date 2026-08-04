@@ -194,11 +194,17 @@ func Open(stateDir string) (*Service, error) {
 	// it on the way in so an upgraded gateway converges to `[]` the first time
 	// anything writes, rather than keeping the foot-gun until an operator
 	// happens to add a rule.
-	if current.Policy.Rules == nil {
+	//
+	// The same pass groups hand-written rules ahead of subscriptions. A gateway
+	// configured while the two were edited as one interleaved list converges on
+	// load, not on the next write -- otherwise it would keep resolving in the
+	// old precedence while the console showed the new one.
+	if current.Policy.Rules == nil || !current.Policy.rulesAreGrouped() {
 		if _, err := doc.Update("", func(d Document) (Document, error) {
 			if d.Policy.Rules == nil {
 				d.Policy.Rules = []Rule{}
 			}
+			d.Policy = d.Policy.ordered()
 			return d, nil
 		}); err != nil {
 			return nil, fmt.Errorf("gpn/dns: normalise the policy list: %w", err)
@@ -252,6 +258,9 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 		if err != nil {
 			return current, err
 		}
+		// Group before validating, so what is checked is what will be stored
+		// and what will run.
+		next.Policy = next.Policy.ordered()
 		if err := next.Validate(); err != nil {
 			return current, err
 		}

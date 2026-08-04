@@ -70,6 +70,9 @@ const (
 // order: the previous model carried an explicit Order field that validation
 // then required to equal the index, which made it a second name for the same
 // fact and one more thing a caller could set inconsistently.
+//
+// The slice is kept grouped -- every hand-written rule, then every
+// subscription -- by Policy.ordered on the way in. See it for why.
 type Rule struct {
 	ID      string      `json:"id"`
 	Kind    MatcherKind `json:"kind"`
@@ -92,6 +95,57 @@ type Policy struct {
 // ErrInvalidPolicy wraps every caller-caused validation failure so the API can
 // answer 400 rather than 500.
 var ErrInvalidPolicy = errors.New("gpn/dns: invalid policy")
+
+// ordered returns the policy with its rules grouped into evaluation order:
+// every hand-written rule, in the operator's order, then every subscription, in
+// theirs. Relative order inside each group is untouched.
+//
+// classify takes the first match, so "does my exception beat the imported
+// list?" used to be answered by whichever of the two happened to sit earlier in
+// one array. That was a fair question to ask of a single list an operator could
+// see and reorder. It stopped being fair once the console split the two kinds
+// into separate dialogs, where the shared index is not visible at all -- an
+// exception could be silently outranked by a subscription with nothing on
+// screen to say so.
+//
+// Pinning it here rather than in the console means every writer gets the same
+// precedence: the panel, the bot, and a direct PUT. And it stays true that a
+// rule's position in the slice is the whole statement of when it runs -- the
+// grouping is applied to the stored document, not layered on top of it at
+// match time.
+func (p Policy) ordered() Policy {
+	if p.rulesAreGrouped() {
+		return p
+	}
+	out := make([]Rule, 0, len(p.Rules))
+	for _, r := range p.Rules {
+		if r.Kind != KindSubscription {
+			out = append(out, r)
+		}
+	}
+	for _, r := range p.Rules {
+		if r.Kind == KindSubscription {
+			out = append(out, r)
+		}
+	}
+	p.Rules = out
+	return p
+}
+
+// rulesAreGrouped reports whether no subscription precedes a hand-written rule.
+func (p Policy) rulesAreGrouped() bool {
+	subscriptionSeen := false
+	for _, r := range p.Rules {
+		if r.Kind == KindSubscription {
+			subscriptionSeen = true
+			continue
+		}
+		if subscriptionSeen {
+			return false
+		}
+	}
+	return true
+}
 
 var (
 	validKinds = map[MatcherKind]bool{
