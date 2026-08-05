@@ -526,7 +526,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			prefix, routeProxy, routeRule, decided, prefixErr := prepareClientRouting(metadata)
 			if prefixErr != nil {
-				log.Debugln("[GPN] fixed client rule boundary unavailable: %s", prefixErr)
+				log.Debugln("[5GPN] fixed client rule boundary unavailable: %s", prefixErr)
 				metadata.SpecialProxy = "REJECT"
 				decided = true
 			}
@@ -627,7 +627,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	// the only point where fixed-prefix routing and capture can still run.
 	prefix, routeProxy, routeRule, decided, prefixErr := prepareClientRouting(metadata)
 	if prefixErr != nil {
-		log.Debugln("[GPN] fixed client rule boundary unavailable: %s", prefixErr)
+		log.Debugln("[5GPN] fixed client rule boundary unavailable: %s", prefixErr)
 		metadata.SpecialProxy = "REJECT"
 		decided = true
 	}

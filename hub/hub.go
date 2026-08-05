@@ -53,7 +53,7 @@ func WithSecret(secret string) Option {
 
 // ApplyConfig dispatch configure to all parts include ExternalController
 func ApplyConfig(cfg *config.Config) error {
-	if err := startGPN(); err != nil {
+	if err := startFiveGPN(); err != nil {
 		return err
 	}
 	applyRoute(cfg)
