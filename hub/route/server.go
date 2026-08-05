@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -150,6 +151,9 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 			fs := http.StripPrefix("/ui", http.FileServer(http.Dir(uiPath)))
 			redirect := http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP
 			serveUI := func(w http.ResponseWriter, r *http.Request) {
+				if strings.EqualFold(path.Ext(r.URL.Path), ".mobileconfig") {
+					w.Header().Set("Content-Type", "application/x-apple-aspen-config")
+				}
 				fs.ServeHTTP(w, r)
 			}
 			r.Get("/", redirect)

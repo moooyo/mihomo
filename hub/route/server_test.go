@@ -1,13 +1,69 @@
 package route
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
 )
+
+func TestUIProfileContentType(t *testing.T) {
+	previousUIPath := uiPath
+	previousEmbedMode := embedMode
+	t.Cleanup(func() {
+		uiPath = previousUIPath
+		embedMode = previousEmbedMode
+	})
+
+	dir := t.TempDir()
+	profile := []byte{0x30, 0x82, 0x00, 0x05, 0x06, 0x03, 0x2a, 0x03, 0x04}
+	if err := os.WriteFile(filepath.Join(dir, "ios-dot.MOBILECONFIG"), profile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte("ordinary static asset")
+	if err := os.WriteFile(filepath.Join(dir, "asset.txt"), plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uiPath = dir
+	embedMode = true
+	handler := router(false, "controller-secret", "", Cors{})
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method+" profile", func(t *testing.T) {
+			response := requestRoute(handler, method, "/ui/ios-dot.MOBILECONFIG", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("status %d, want %d", response.Code, http.StatusOK)
+			}
+			if contentType := response.Header().Get("Content-Type"); contentType != "application/x-apple-aspen-config" {
+				t.Fatalf("Content-Type %q, want application/x-apple-aspen-config", contentType)
+			}
+			if contentLength := response.Header().Get("Content-Length"); contentLength != strconv.Itoa(len(profile)) {
+				t.Fatalf("Content-Length %q, want %d", contentLength, len(profile))
+			}
+			if method == http.MethodGet && !bytes.Equal(response.Body.Bytes(), profile) {
+				t.Fatalf("GET body %v, want %v", response.Body.Bytes(), profile)
+			}
+			if method == http.MethodHead && response.Body.Len() != 0 {
+				t.Fatalf("HEAD body length %d, want 0", response.Body.Len())
+			}
+		})
+	}
+
+	response := requestRoute(handler, http.MethodGet, "/ui/asset.txt", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("ordinary asset status %d, want %d", response.Code, http.StatusOK)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "text/plain; charset=utf-8" {
+		t.Fatalf("ordinary asset Content-Type %q, want text/plain; charset=utf-8", contentType)
+	}
+	if !bytes.Equal(response.Body.Bytes(), plain) {
+		t.Fatalf("ordinary asset body %q, want %q", response.Body.Bytes(), plain)
+	}
+}
 
 func TestUIRootRedirectAndAuthenticationBoundary(t *testing.T) {
 	previousUIPath := uiPath
