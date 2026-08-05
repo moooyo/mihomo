@@ -33,17 +33,17 @@ const (
 // owns. Removal runs first, so declaring a name in both is a replacement rather
 // than an ordering puzzle.
 type HeaderEdits struct {
-	Set    map[string]string `json:"set,omitempty"`
-	Remove []string          `json:"remove,omitempty"`
+	Set    map[string]string `json:"set,omitempty" yaml:"set"`
+	Remove []string          `json:"remove,omitempty" yaml:"remove"`
 }
 
 // URLRewrite changes where a request goes. Status 0 rewrites in place, which is
 // Loon's `header` form: the client never learns. 302 and 307 answer the client
 // with a redirect instead, and 307 is the one that preserves method and body.
 type URLRewrite struct {
-	Pattern string `json:"pattern"`
-	To      string `json:"to"`
-	Status  int    `json:"status,omitempty"`
+	Pattern string `json:"pattern" yaml:"pattern"`
+	To      string `json:"to" yaml:"to"`
+	Status  int    `json:"status,omitempty" yaml:"status"`
 
 	compiled *regexp.Regexp
 }
@@ -53,9 +53,9 @@ type URLRewrite struct {
 // a region: it maps a setting's value to the substitution, and a value missing
 // from the map declines the action rather than substituting nothing.
 type BodyReplace struct {
-	Pattern  string                       `json:"pattern"`
-	To       string                       `json:"to"`
-	ValueMap map[string]map[string]string `json:"value_map,omitempty"`
+	Pattern  string                       `json:"pattern" yaml:"pattern"`
+	To       string                       `json:"to" yaml:"to"`
+	ValueMap map[string]map[string]string `json:"value_map,omitempty" yaml:"valueMap"`
 
 	compiled *regexp.Regexp
 }

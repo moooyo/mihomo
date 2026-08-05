@@ -842,13 +842,20 @@ func (b *moduleBodyBudget) release(want int64) {
 // A declared length is the honest figure, capped by what the matched rules are
 // allowed to read. An undeclared one, and a bodyless request whose actions may
 // still synthesise a response, reserve the largest limit any matched rule
-// carries -- which is what those actions are permitted to hand back.
+// carries -- which is what those actions are permitted to hand back. A mock is
+// different: its output is fixed by the manifest and may legally exceed the
+// neighbouring maxBodyBytes read limit, so its already-validated exact size is
+// also a floor. Using the size cached during validation avoids decoding and
+// allocating a large synthetic body before admission accepts it.
 func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) int64 {
 	limit := moduleBodyReadLimit(rules)
 	widest := int64(0)
 	for _, matched := range rules {
 		if matched.Rule.MaxBodyBytes > widest {
 			widest = matched.Rule.MaxBodyBytes
+		}
+		if mockBytes := matched.Rule.Mock.bodySize(); mockBytes > widest {
+			widest = mockBytes
 		}
 	}
 	if widest == 0 {
@@ -878,7 +885,9 @@ func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) in
 // magnitude, and the budget stopped bounding the thing it exists to bound.
 //
 // The widest declared limit stays as a floor because an action may synthesise a
-// body it never read, up to its own limit.
+// body it never read, up to its own limit. A mock's exact validated body is a
+// second floor because mock output is intentionally independent of that read
+// limit.
 func moduleResponseBodyReservation(response *http.Response, rules []matchedScriptRule) int64 {
 	reserve := moduleBodyReadLimit(rules)
 	if response != nil && response.ContentLength > 0 && response.ContentLength < reserve {
@@ -888,6 +897,9 @@ func moduleResponseBodyReservation(response *http.Response, rules []matchedScrip
 	for _, matched := range rules {
 		if matched.Rule.MaxBodyBytes > widest {
 			widest = matched.Rule.MaxBodyBytes
+		}
+		if mockBytes := matched.Rule.Mock.bodySize(); mockBytes > widest {
+			widest = mockBytes
 		}
 	}
 	if widest > reserve {

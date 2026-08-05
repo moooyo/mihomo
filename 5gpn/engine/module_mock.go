@@ -3,8 +3,9 @@ package engine
 import (
 	"encoding/base64"
 	"fmt"
-	"github.com/metacubex/http"
 	"strings"
+
+	"github.com/metacubex/http"
 )
 
 // Two directives every published module uses, which this manifest could not
@@ -26,20 +27,27 @@ const (
 // base64 form exists because the published modules mock binary gRPC frames,
 // which cannot survive a UTF-8 round trip through a manifest.
 type MockResponse struct {
-	Status     int               `json:"status,omitempty"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Body       string            `json:"body,omitempty"`
-	Base64Body string            `json:"base64_body,omitempty"`
+	Status     int               `json:"status,omitempty" yaml:"status"`
+	Headers    map[string]string `json:"headers,omitempty" yaml:"headers"`
+	Body       *string           `json:"body,omitempty" yaml:"body"`
+	Base64Body *string           `json:"base64_body,omitempty" yaml:"base64Body"`
+
+	// bodyBytes is populated by validation before a config snapshot can be
+	// published. Admission reads it without decoding the immutable base64 body
+	// again, so a large mock cannot allocate its response before the process
+	// body budget has accepted it.
+	bodyBytes int64
 }
 
 func (m *MockResponse) validate() error {
 	if m == nil {
 		return nil
 	}
+	m.bodyBytes = 0
 	if m.Status != 0 && (m.Status < 100 || m.Status > 599) {
 		return fmt.Errorf("mock status %d is not an HTTP status", m.Status)
 	}
-	if m.Body != "" && m.Base64Body != "" {
+	if m.Body != nil && m.Base64Body != nil {
 		return fmt.Errorf("mock declares both body and base64Body")
 	}
 	if len(m.Headers) > maxMockHeaderFields {
@@ -60,14 +68,28 @@ func (m *MockResponse) validate() error {
 	if len(body) > maxMockBodyBytes {
 		return fmt.Errorf("mock body exceeds %d bytes", maxMockBodyBytes)
 	}
+	m.bodyBytes = int64(len(body))
 	return nil
 }
 
-func (m *MockResponse) bytes() ([]byte, error) {
-	if m.Base64Body == "" {
-		return []byte(m.Body), nil
+// bodySize returns the exact validated wire body size without decoding or
+// allocating. Every manifest import and persisted config decode validates the
+// mock before it can enter a compiled runtime snapshot.
+func (m *MockResponse) bodySize() int64 {
+	if m == nil {
+		return 0
 	}
-	decoded, err := base64.StdEncoding.DecodeString(m.Base64Body)
+	return m.bodyBytes
+}
+
+func (m *MockResponse) bytes() ([]byte, error) {
+	if m.Base64Body == nil {
+		if m.Body == nil {
+			return nil, nil
+		}
+		return []byte(*m.Body), nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*m.Base64Body)
 	if err != nil {
 		return nil, fmt.Errorf("mock base64Body is not base64: %w", err)
 	}
