@@ -113,8 +113,9 @@ type Candidate struct {
 // Fetch retrieves and parses a candidate without touching installed state.
 //
 // This is the review step for both a fresh install and an update check. They
-// are the same operation: fetch, parse, and report. What differs is only
-// whether anything is installed under the id already, which the response says.
+// are the same operation: fetch, parse, dry-run the complete install validation,
+// and report. What differs is only whether anything is installed under the id
+// already, which the response says.
 func (e *Engine) Fetch(ctx context.Context, request ImportRequest) (Candidate, error) {
 	imp, err := currentImporter()
 	if err != nil {
@@ -124,15 +125,16 @@ func (e *Engine) Fetch(ctx context.Context, request ImportRequest) (Candidate, e
 	if err != nil {
 		return Candidate{}, err
 	}
+	current, err := e.validateInstall(module)
+	if err != nil {
+		return Candidate{}, err
+	}
 	candidate := Candidate{Detail: detailOf(module), Digest: SnapshotDigest(module)}
 
-	cfg, cfgErr := e.config.Current()
-	if cfgErr == nil {
-		for _, installed := range cfg.Modules {
-			if installed.ID == module.ID {
-				candidate.Installed = SnapshotDigest(installed)
-				candidate.InstalledVersion = installed.Version
-			}
+	for _, installed := range current.Modules {
+		if installed.ID == module.ID {
+			candidate.Installed = SnapshotDigest(installed)
+			candidate.InstalledVersion = installed.Version
 		}
 	}
 	return candidate, nil

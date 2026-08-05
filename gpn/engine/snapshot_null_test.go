@@ -60,7 +60,7 @@ func TestSnapshotListsAreNeverNull(t *testing.T) {
 			}
 			body := string(data)
 
-			for _, field := range []string{"modules", "execution_order", "active_capture_hosts"} {
+			for _, field := range []string{"modules", "execution_order", "available_egress_groups", "active_capture_hosts"} {
 				if strings.Contains(body, `"`+field+`":null`) {
 					t.Errorf("%s is null; the console reads .length off it\n%s", field, body)
 				}
@@ -73,6 +73,9 @@ func TestSnapshotListsAreNeverNull(t *testing.T) {
 			}
 			if snap.ActiveCaptureHosts == nil {
 				t.Error("ActiveCaptureHosts is a nil slice")
+			}
+			if snap.AvailableEgressGroups == nil {
+				t.Error("AvailableEgressGroups is a nil slice")
 			}
 			for _, m := range snap.Modules {
 				if m.CaptureHosts == nil {

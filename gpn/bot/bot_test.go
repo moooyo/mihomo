@@ -249,7 +249,7 @@ func TestStatusRendersWhatTheGatewayReports(t *testing.T) {
 		return Status{
 			ResolverUp: true, Queries: 1200, Blocked: 34, CacheHits: 900, CacheMisses: 300,
 			Gateway: "10.0.1.20", ChinaUpstreams: []string{"a"}, TrustUpstreams: []string{"b", "c"},
-			InterceptionInstalled: true, InterceptionEnabled: true, HTTP3: true,
+			InterceptionInstalled: true, InterceptionEnabled: true,
 			Extensions: 3, EnabledExtensions: 2,
 			CertificateLoaded: true, CertificateCovers: false, MissingHosts: []string{"shop.example.com"},
 			Subscriptions: []Subscription{{Name: "cn", OK: true}, {Name: "ads", OK: false, Error: "timeout"}},
@@ -262,7 +262,7 @@ func TestStatusRendersWhatTheGatewayReports(t *testing.T) {
 		t.Fatalf("sent %d messages", len(sent))
 	}
 	text := sent[0].Text
-	for _, want := range []string{"10.0.1.20", "1200", "34", "QUIC captured", "2 of 3", "DOES NOT COVER shop.example.com", "1 of 2 failing"} {
+	for _, want := range []string{"10.0.1.20", "1200", "34", "2 of 3", "DOES NOT COVER shop.example.com", "1 of 2 failing"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status omits %q:\n%s", want, text)
 		}

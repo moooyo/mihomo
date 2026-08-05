@@ -103,7 +103,6 @@ type Status struct {
 
 	InterceptionInstalled bool
 	InterceptionEnabled   bool
-	HTTP3                 bool
 	Extensions            int
 	EnabledExtensions     int
 

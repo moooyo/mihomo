@@ -8,13 +8,14 @@ package engine
 // them would make opening the extensions page expensive in proportion to what
 // is installed. Detail reads fetch those individually.
 type Snapshot struct {
-	Enabled            bool             `json:"enabled"`
-	HTTP2              bool             `json:"http2"`
-	HTTP3              bool             `json:"http3"`
-	Modules            []ModuleSummary  `json:"modules"`
-	ExecutionOrder     []string         `json:"execution_order"`
-	ActiveCaptureHosts []string         `json:"active_capture_hosts"`
-	Certificate        CertificateState `json:"certificate"`
+	Enabled               bool             `json:"enabled"`
+	HTTP2                 bool             `json:"http2"`
+	HTTP3                 bool             `json:"http3"`
+	Modules               []ModuleSummary  `json:"modules"`
+	ExecutionOrder        []string         `json:"execution_order"`
+	AvailableEgressGroups []string         `json:"available_egress_groups"`
+	ActiveCaptureHosts    []string         `json:"active_capture_hosts"`
+	Certificate           CertificateState `json:"certificate"`
 }
 
 // ModuleSummary is one installed extension, without its bodies.
@@ -40,6 +41,9 @@ type ModuleSummary struct {
 // it. The failure looks like a client-side trust error with nothing in the
 // gateway's logs, so it has to be visible here.
 type CertificateState struct {
+	// Loaded means a non-CA leaf and matching private key can be parsed from the
+	// current files. It deliberately remains true after expiry so NotAfter can
+	// explain why handshakes reject the leaf.
 	Loaded     bool     `json:"loaded"`
 	NotAfter   int64    `json:"not_after,omitempty"`
 	CoveredAll bool     `json:"covers_all_capture_hosts"`
@@ -60,12 +64,13 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 	// extensions page into a TypeError and a blank screen. An empty list and a
 	// missing list are different claims, and only one of them is true here.
 	out := Snapshot{
-		Enabled:            cfg.MITM.Enabled,
-		HTTP2:              cfg.MITM.HTTP2,
-		HTTP3:              cfg.MITM.HTTP3,
-		ExecutionOrder:     make([]string, 0, len(cfg.ExecutionOrder)),
-		Modules:            make([]ModuleSummary, 0, len(cfg.Modules)),
-		ActiveCaptureHosts: make([]string, 0),
+		Enabled:               cfg.MITM.Enabled,
+		HTTP2:                 cfg.MITM.HTTP2,
+		HTTP3:                 cfg.MITM.HTTP3,
+		ExecutionOrder:        make([]string, 0, len(cfg.ExecutionOrder)),
+		Modules:               make([]ModuleSummary, 0, len(cfg.Modules)),
+		AvailableEgressGroups: e.AvailableEgressGroups(),
+		ActiveCaptureHosts:    make([]string, 0),
 	}
 	out.ExecutionOrder = append(out.ExecutionOrder, cfg.ExecutionOrder...)
 
@@ -78,7 +83,7 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 	// hosts that nothing captures. Reporting the declared set instead would tell
 	// an operator their traffic is being intercepted when it is not.
 	if cfg.MITM.Enabled {
-		out.ActiveCaptureHosts = append(out.ActiveCaptureHosts, activeHostPatterns(cfg)...)
+		out.ActiveCaptureHosts = append(out.ActiveCaptureHosts, e.readyCaptureHostPatterns(cfg)...)
 	}
 
 	out.Certificate = e.certificateState(cfg)
@@ -87,16 +92,16 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 
 func (e *Engine) certificateState(cfg Config) CertificateState {
 	state := CertificateState{}
-	cert, err := e.certs.GetCertificate(nil)
-	if err != nil || cert == nil || cert.Leaf == nil {
+	status, loaded := e.certs.status(cfg)
+	if !loaded {
 		return state
 	}
 	state.Loaded = true
-	state.NotAfter = cert.Leaf.NotAfter.Unix()
+	state.NotAfter = status.notAfter.Unix()
 
 	want := certificateHostPatterns(cfg)
-	have := make(map[string]struct{}, len(cert.Leaf.DNSNames))
-	for _, name := range cert.Leaf.DNSNames {
+	have := make(map[string]struct{}, len(status.dnsNames))
+	for _, name := range status.dnsNames {
 		have[canonicalHost(name)] = struct{}{}
 	}
 	for _, pattern := range want {

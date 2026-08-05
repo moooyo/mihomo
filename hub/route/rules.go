@@ -83,15 +83,10 @@ func disableRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(payload) != 0 {
-		rules := tunnel.Rules()
-		for index, disabled := range payload {
-			if index < 0 || index >= len(rules) {
-				continue
-			}
-			rule := rules[index]
-			if ruleWrapper, ok := rule.(constant.RuleWrapper); ok {
-				ruleWrapper.SetDisabled(disabled)
-			}
+		if err := tunnel.UpdateRuleDisabled(payload); err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
 		}
 	}
 

@@ -779,13 +779,18 @@ func normalizeLower(raw []string) []string {
 }
 
 func normalizeUpper(raw []string) []string {
+	seen := make(map[string]struct{}, len(raw))
 	out := make([]string, 0, len(raw))
 	for _, value := range raw {
 		if value = strings.ToUpper(strings.TrimSpace(value)); value != "" {
-			out = append(out, value)
+			if _, exists := seen[value]; !exists {
+				seen[value] = struct{}{}
+				out = append(out, value)
+			}
 		}
 	}
-	return uniqueSorted(out)
+	sort.Strings(out)
+	return out
 }
 
 func uniqueSortedInts(raw []int) []int {

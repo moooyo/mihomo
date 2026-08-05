@@ -52,6 +52,9 @@ func (b *requestTrailerBody) Read(buffer []byte) (int, error) {
 // status instead of walking every rule again.
 type preparedModuleRequest struct {
 	outbound *http.Request
+	// egressOwner is set by the extension that moved the request to another
+	// origin. Its network grant and operator binding authorize that new target.
+	egressOwner string
 	// handled means the exchange was already answered from a synthetic result
 	// and the caller must not dial upstream.
 	handled bool
@@ -176,6 +179,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	message.Headers.Del("Content-Length")
 	urlChanged := false
 	bodyChanged := false
+	egressOwner := ""
 
 	for _, matched := range requestRules {
 		// Only once the URL has actually moved.
@@ -223,12 +227,17 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			return preparedModuleRequest{handled: true}, nil
 		}
 		if result.ChangedURL {
+			_, currentOrigin, _, currentOriginErr := parseModuleNetworkRequestURL(message.URL)
 			parsed, authorizeErr := authorizeModuleRequestURLRewriteConfig(cfg, matched.Module, message.URL, result.URL)
 			if authorizeErr != nil {
 				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
 			}
+			_, nextOrigin, _, nextOriginErr := parseModuleNetworkRequestURL(parsed.String())
 			message.URL = parsed.String()
 			urlChanged = true
+			if currentOriginErr == nil && nextOriginErr == nil && currentOrigin != nextOrigin {
+				egressOwner = matched.Module.ID
+			}
 		}
 		if result.ChangedHeaders {
 			message.Headers = result.Headers
@@ -263,7 +272,8 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 		return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, err
 	}
 	return preparedModuleRequest{
-		outbound: outbound, bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes,
+		outbound: outbound, egressOwner: egressOwner,
+		bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes,
 		responseCandidates: responseCandidates,
 	}, nil
 }

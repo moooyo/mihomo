@@ -15,11 +15,14 @@ import (
 // Only the middle third was ever the engine; the rest was being a process. The
 // core owns the lifecycle now, so what is left is a constructor and an accessor.
 type Engine struct {
-	config      *configStore
-	certs       *certificateStore
-	logs        *engineLogHub
-	proxy       *interceptProxy
-	interceptor *Interceptor
+	config              *configStore
+	certs               *certificateStore
+	logs                *engineLogHub
+	proxy               *interceptProxy
+	interceptor         *Interceptor
+	egressGroups        *egressGroupRegistry
+	trafficChanged      func()
+	clientBoundaryReady func() bool
 	// catalogs holds fetched extension indexes for a few minutes. Nothing in it
 	// is state: it exists so opening the extensions page does not put a request
 	// on a publisher's host per render.
@@ -51,8 +54,11 @@ func New(configPath, stateDir string) (*Engine, error) {
 	proxy := newInterceptProxy(config, certs, stateDir)
 	proxy.setEngineLogPublisher(logs)
 
-	e := &Engine{config: config, certs: certs, logs: logs, proxy: proxy}
+	e := &Engine{
+		config: config, certs: certs, logs: logs, proxy: proxy,
+	}
 	e.interceptor = NewInterceptor(proxy)
+	e.interceptor.engine = e
 	return e, nil
 }
 

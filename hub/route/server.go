@@ -120,7 +120,9 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		if secret != "" {
 			r.Use(authentication(secret))
 		}
-		r.Get("/", hello)
+		if uiPath == "" {
+			r.Get("/", hello)
+		}
 		r.Get("/logs", getLogs)
 		r.Get("/traffic", traffic)
 		r.Get("/memory", memory)
@@ -146,10 +148,16 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 	if uiPath != "" {
 		r.Group(func(r chi.Router) {
 			fs := http.StripPrefix("/ui", http.FileServer(http.Dir(uiPath)))
-			r.Get("/ui", http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP)
-			r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
+			redirect := http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP
+			serveUI := func(w http.ResponseWriter, r *http.Request) {
 				fs.ServeHTTP(w, r)
-			})
+			}
+			r.Get("/", redirect)
+			r.Head("/", redirect)
+			r.Get("/ui", redirect)
+			r.Head("/ui", redirect)
+			r.Get("/ui/*", serveUI)
+			r.Head("/ui/*", serveUI)
 		})
 	}
 	if len(dohServer) > 0 && dohServer[0] == '/' {

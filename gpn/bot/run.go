@@ -188,11 +188,7 @@ func (s *Service) renderStatus() string {
 	case !status.InterceptionEnabled:
 		fmt.Fprintf(&b, "interception: off (%d extensions installed)\n", status.Extensions)
 	default:
-		fmt.Fprintf(&b, "interception: on, %d of %d extensions enabled", status.EnabledExtensions, status.Extensions)
-		if status.HTTP3 {
-			b.WriteString(", QUIC captured")
-		}
-		b.WriteString("\n")
+		fmt.Fprintf(&b, "interception: on, %d of %d extensions enabled\n", status.EnabledExtensions, status.Extensions)
 	}
 
 	if status.InterceptionInstalled {

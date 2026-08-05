@@ -21,6 +21,29 @@ type certificateStore struct {
 	certModTime time.Time
 	keyModTime  time.Time
 	certificate *tls.Certificate
+
+	// Status loading is deliberately independent from the handshake cache.
+	// Parsing a private key for a Console poll must never hold up a handshake.
+	statusMu    sync.Mutex
+	statusCache certificateStatusCache
+}
+
+// certificateStatus is the immutable part of a leaf that the control plane
+// needs. Keeping tls.Certificate out of this projection matters: callers must
+// not be able to mutate the certificate concurrently with a handshake.
+type certificateStatus struct {
+	notAfter time.Time
+	dnsNames []string
+}
+
+type certificateStatusCache struct {
+	set         bool
+	certPath    string
+	keyPath     string
+	certModTime time.Time
+	keyModTime  time.Time
+	loaded      bool
+	status      certificateStatus
 }
 
 // newCertificateStore prepares the leaf source. It cannot fail, and that is the
@@ -52,6 +75,114 @@ func (s *certificateStore) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Cert
 		return nil, errors.New("unrecognized interception SNI")
 	}
 	return s.currentCertificate()
+}
+
+// status returns the leaf currently represented by the store without going
+// through GetCertificate. The handshake callback deliberately rejects a nil
+// ClientHelloInfo before it resolves anything; inventing one here would bypass
+// the SNI authorization boundary and make a status read look like a handshake.
+//
+// The projection has its own path-and-mtime cache and mutex. A Console poll can
+// therefore parse a cold or renewed pair without holding the handshake mutex,
+// while repeated polls of unchanged files pay only the stat calls and a slice
+// copy. Parse failures are cached too when both files could be statted. Unlike
+// currentCertificate, status does not retain the last-loaded leaf after a read
+// failure: this status is explicitly about the current files, and a broken
+// renewal must look the same whether or not a handshake happened before it.
+// Expiry and SAN coverage are intentionally not admission checks here: they are
+// the facts the caller needs in order to report an expired or under-covering
+// leaf.
+func (s *certificateStore) status(cfg Config) (certificateStatus, bool) {
+	if s == nil {
+		return certificateStatus{}, false
+	}
+
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+
+	certInfo, err := os.Stat(cfg.TLSCert)
+	if err != nil {
+		s.statusCache = certificateStatusCache{}
+		return certificateStatus{}, false
+	}
+	keyInfo, err := os.Stat(cfg.TLSKey)
+	if err != nil {
+		s.statusCache = certificateStatusCache{}
+		return certificateStatus{}, false
+	}
+	if s.statusCache.matches(cfg.TLSCert, cfg.TLSKey, certInfo.ModTime(), keyInfo.ModTime()) {
+		return s.statusCache.result()
+	}
+
+	certificate, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		return s.cacheStatusLocked(cfg.TLSCert, cfg.TLSKey, certInfo.ModTime(), keyInfo.ModTime(), certificateStatus{}, false)
+	}
+	status, loaded := statusFromCertificate(&certificate)
+	return s.cacheStatusLocked(cfg.TLSCert, cfg.TLSKey, certInfo.ModTime(), keyInfo.ModTime(), status, loaded)
+}
+
+func (c certificateStatusCache) matches(certPath, keyPath string, certModTime, keyModTime time.Time) bool {
+	return c.set && c.certPath == certPath && c.keyPath == keyPath &&
+		c.certModTime.Equal(certModTime) && c.keyModTime.Equal(keyModTime)
+}
+
+func (c certificateStatusCache) result() (certificateStatus, bool) {
+	if !c.loaded {
+		return certificateStatus{}, false
+	}
+	return c.status.clone(), true
+}
+
+func (s *certificateStore) cacheStatusLocked(
+	certPath string,
+	keyPath string,
+	certModTime time.Time,
+	keyModTime time.Time,
+	status certificateStatus,
+	loaded bool,
+) (certificateStatus, bool) {
+	s.statusCache = certificateStatusCache{
+		set:         true,
+		certPath:    certPath,
+		keyPath:     keyPath,
+		certModTime: certModTime,
+		keyModTime:  keyModTime,
+		loaded:      loaded,
+		status:      status.clone(),
+	}
+	return s.statusCache.result()
+}
+
+func (s certificateStatus) clone() certificateStatus {
+	return certificateStatus{
+		notAfter: s.notAfter,
+		dnsNames: append([]string(nil), s.dnsNames...),
+	}
+}
+
+func statusFromCertificate(certificate *tls.Certificate) (certificateStatus, bool) {
+	if certificate == nil {
+		return certificateStatus{}, false
+	}
+	leaf := certificate.Leaf
+	if leaf == nil {
+		if len(certificate.Certificate) == 0 {
+			return certificateStatus{}, false
+		}
+		var err error
+		leaf, err = x509.ParseCertificate(certificate.Certificate[0])
+		if err != nil {
+			return certificateStatus{}, false
+		}
+	}
+	if leaf.IsCA {
+		return certificateStatus{}, false
+	}
+	return certificateStatus{
+		notAfter: leaf.NotAfter,
+		dnsNames: append([]string(nil), leaf.DNSNames...),
+	}, true
 }
 
 func (s *certificateStore) currentCertificate() (*tls.Certificate, error) {

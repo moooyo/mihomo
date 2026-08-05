@@ -145,6 +145,9 @@ func (e *Engine) mutate(revision string, fn func(*Config) error) (Snapshot, stri
 	if err != nil {
 		return Snapshot{}, next, err
 	}
+	if e.trafficChanged != nil {
+		e.trafficChanged()
+	}
 	snapshot, err := e.Snapshot()
 	return snapshot, next, err
 }
@@ -224,6 +227,9 @@ func (e *Engine) SetEnabled(revision, id string, enabled bool) (Snapshot, string
 			// the operator did not pick.
 			return fmt.Errorf("%w: extension %q requires an egress group binding before it can be enabled", ErrInvalidRequest, id)
 		}
+		if enabled && m.EgressGroup != "" && !e.validEgressGroup(m.EgressGroup) {
+			return fmt.Errorf("%w: extension %q egress group %q is unavailable", ErrInvalidRequest, id, m.EgressGroup)
+		}
 		m.Enabled = enabled
 		return nil
 	})
@@ -265,12 +271,16 @@ func (e *Engine) Reorder(revision string, ids []string) (Snapshot, string, error
 // the manifest may declare that one is required and nothing more. This is the
 // operator's choice about where decrypted traffic leaves the box.
 func (e *Engine) SetEgressGroup(revision, id, group string) (Snapshot, string, error) {
+	group = strings.TrimSpace(group)
+	if group != "" && !e.validEgressGroup(group) {
+		return Snapshot{}, revision, fmt.Errorf("%w: egress group %q is unavailable", ErrInvalidRequest, group)
+	}
 	return e.mutate(revision, func(c *Config) error {
 		m, err := findModule(c, id)
 		if err != nil {
 			return err
 		}
-		m.EgressGroup = strings.TrimSpace(group)
+		m.EgressGroup = group
 		return nil
 	})
 }
@@ -324,8 +334,38 @@ func (e *Engine) SetSettingValue(revision, id, key string, value json.RawMessage
 // Unexported because there is exactly one way in: a reviewed, digest-checked
 // fetch. See updates.go.
 func (e *Engine) install(revision string, m Module) (Snapshot, string, error) {
-	return e.mutate(revision, func(c *Config) error {
+	return e.mutate(revision, installMutation(m))
+}
+
+// validateInstall applies the install mutation to a private copy and runs the
+// same JSON decode, document validation, and runtime compilation as the write
+// path. It deliberately stops before configStore.Update can persist or publish
+// anything. The returned config is the snapshot the dry run started from.
+func (e *Engine) validateInstall(m Module) (Config, error) {
+	current, err := e.config.Current()
+	if err != nil {
+		return Config{}, err
+	}
+	candidate := cloneConfig(current)
+	if err := installMutation(m)(&candidate); err != nil {
+		return Config{}, err
+	}
+	raw, err := json.MarshalIndent(candidate, "", "  ")
+	if err != nil {
+		return Config{}, fmt.Errorf("gpn/engine: marshal config: %w", err)
+	}
+	if _, err := decodeConfig(raw); err != nil {
+		return Config{}, err
+	}
+	return current, nil
+}
+
+// installMutation is shared by review and apply so both validate the exact
+// document that an install would produce, including retained operator state.
+func installMutation(m Module) func(*Config) error {
+	return func(c *Config) error {
 		m.Enabled = false
+		m.Settings = append([]ModuleSetting(nil), m.Settings...)
 		if strings.TrimSpace(m.CaptureDNS) == "" {
 			m.CaptureDNS = "trust"
 		}
@@ -347,7 +387,7 @@ func (e *Engine) install(revision string, m Module) (Snapshot, string, error) {
 		c.Modules = append(c.Modules, m)
 		c.ExecutionOrder = append(c.ExecutionOrder, m.ID)
 		return nil
-	})
+	}
 }
 
 // carryOverSettingValues copies previously entered values onto the incoming

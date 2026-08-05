@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dop251/goja"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 const (
@@ -33,6 +34,7 @@ const (
 type moduleNetworkRequester struct {
 	ctx   context.Context
 	roots *x509.CertPool
+	owner string
 	// A requester exists only for a module holding the network grant, and that
 	// grant no longer carries an origin list. Every other guard still applies:
 	// the URL is canonicalized, IP literals and unsafe or private hosts are
@@ -49,11 +51,13 @@ func newModuleNetworkRequester(
 	ctx context.Context,
 	roots *x509.CertPool,
 	slots chan struct{},
+	owner string,
 ) *moduleNetworkRequester {
 	return &moduleNetworkRequester{
 		ctx: ctx,
 
 		roots:      roots,
+		owner:      owner,
 		slots:      slots,
 		transports: make(map[string]*http.Transport),
 	}
@@ -191,7 +195,7 @@ func performModuleNetworkRequest(
 	slots chan struct{},
 	options map[string]any,
 ) (moduleNetworkResponse, error) {
-	requester := newModuleNetworkRequester(ctx, roots, slots)
+	requester := newModuleNetworkRequester(ctx, roots, slots, "")
 	defer requester.Close()
 	req, err := newModuleNetworkRequest(options)
 	if err != nil {
@@ -309,6 +313,8 @@ func (r *moduleNetworkRequester) requestWaiting(req moduleNetworkRequest) (modul
 
 func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitForSlot bool) (moduleNetworkResponse, error) {
 	parsed, origin, target := req.url, req.origin, req.target
+	target.Owner = r.owner
+	target.OwnerOnly = true
 	method, headers, body := req.method, req.headers, req.body
 
 	if waitForSlot {
@@ -339,7 +345,11 @@ func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitFo
 		request.ContentLength = 0
 	}
 
-	transport, err := r.transport(origin, target)
+	group, err := authorizeUpstream(C.TCP, target)
+	if err != nil {
+		return moduleNetworkResponse{}, err
+	}
+	transport, err := r.transport(origin, target, group)
 	if err != nil {
 		return moduleNetworkResponse{}, err
 	}
@@ -380,20 +390,26 @@ func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitFo
 	}, nil
 }
 
-func (r *moduleNetworkRequester) transport(origin string, target netTarget) (*http.Transport, error) {
+func (r *moduleNetworkRequester) transport(origin string, target netTarget, group string) (*http.Transport, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil, errors.New("network requester is closed")
 	}
-	if transport := r.transports[origin]; transport != nil {
+	key := origin + "\x00" + group
+	if transport := r.transports[key]; transport != nil {
 		return transport, nil
 	}
 
 	transport := &http.Transport{
-		Proxy:               nil,
-		ForceAttemptHTTP2:   true,
-		DisableCompression:  true,
+		Proxy:              nil,
+		ForceAttemptHTTP2:  true,
+		DisableCompression: true,
+		// A live mihomo reload can remove and later recreate the same group
+		// name. Action-local transports are not part of the main proxy pool
+		// invalidation callback, so never retain an authorized connection across
+		// script requests. TLS session resumption remains available below.
+		DisableKeepAlives:   true,
 		MaxIdleConns:        1,
 		MaxIdleConnsPerHost: 1,
 		// One connection per host was all a synchronous caller could ever use.
@@ -422,7 +438,7 @@ func (r *moduleNetworkRequester) transport(origin string, target netTarget) (*ht
 			return dialUpstream(dialCtx, target)
 		},
 	}
-	r.transports[origin] = transport
+	r.transports[key] = transport
 	return transport, nil
 }
 

@@ -16,7 +16,8 @@ import (
 // authenticated greeting, a CONNECT exchange and a reply is now a method call
 // with the connection as its argument.
 type Interceptor struct {
-	proxy *interceptProxy
+	proxy  *interceptProxy
+	engine *Engine
 }
 
 // NewInterceptor wraps a proxy for installation via tunnel.SetInterceptor.
@@ -45,6 +46,10 @@ func (i *Interceptor) MatchTCP(metadata *C.Metadata) bool {
 	cfg, err := i.proxy.config.Current()
 	if err != nil || !cfg.MITM.Enabled {
 		return false
+	}
+	if i.engine != nil {
+		binding, exists := i.engine.CaptureFor(metadata.Host)
+		return exists && binding.Ready
 	}
 	return activeInterceptHost(cfg, metadata.Host)
 }
@@ -77,31 +82,15 @@ func (i *Interceptor) HandleTCP(conn net.Conn, metadata *C.Metadata) {
 	}
 }
 
-// MatchUDP reports whether this association is QUIC for a captured host.
+// MatchUDP always leaves QUIC to the gateway's fixed UDP/443 reject rule.
 //
-// Port 443 only, and only with HTTP3 enabled. The narrower port set than
-// MatchTCP is not caution: :80 has no datagram form, so a UDP association to it
-// is not something the engine could terminate. Everything this refuses meets
-// the fixed UDP/443 reject instead and comes back as TCP, which is captured --
-// so a false answer here costs a round trip, never the capture.
-func (i *Interceptor) MatchUDP(metadata *C.Metadata) bool {
-	if metadata.Host == "" || metadata.DstPort != 443 {
-		return false
-	}
-	cfg, err := i.proxy.config.Current()
-	if err != nil || !cfg.MITM.Enabled || !cfg.MITM.HTTP3 {
-		return false
-	}
-	return activeInterceptHost(cfg, metadata.Host)
-}
+// Extension interception supports plain HTTP and TLS over TCP only. Keeping
+// this refusal independent of document state is the defensive boundary: even
+// an invalid in-memory value cannot turn datagram capture back on.
+func (*Interceptor) MatchUDP(*C.Metadata) bool { return false }
 
-// HandleUDP takes ownership of a captured association and returns the packet
-// conn the core will drive as the remote.
-//
-// Unlike HandleTCP this returns rather than serves: the core owns the pump in
-// both directions and the engine owns what sits behind the conn. A failure here
-// is not fatal to the client -- the core drops the association, and the client's
-// QUIC attempt times out into its own TCP fallback, where capture succeeds.
+// HandleUDP retains the interface method for the dormant bridge. The core calls
+// it only after MatchUDP accepts an association, and MatchUDP always refuses.
 func (i *Interceptor) HandleUDP(metadata *C.Metadata) (C.PacketConn, error) {
 	return i.proxy.captureQUIC(metadata)
 }

@@ -195,7 +195,9 @@ func NatTable() C.NatTable {
 
 // Rules return all rules
 func Rules() []C.Rule {
-	return rules
+	configMux.RLock()
+	defer configMux.RUnlock()
+	return append(make([]C.Rule, 0, len(rules)), rules...)
 }
 
 func Listeners() map[string]C.InboundListener {
@@ -208,7 +210,51 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 	rules = newRules
 	ruleProviders = rp
 	subRules = newSubRule
+	refreshFixedClientBoundaryLocked()
+	routingConfigEpoch.Add(1)
 	configMux.Unlock()
+	notifyClientBoundaryUpdate()
+}
+
+// UpdateRuleDisabled atomically applies a rule-wrapper disable patch.
+// The fixed UDP/443 guard is immutable through this product surface.
+func UpdateRuleDisabled(disabledByIndex map[int]bool) error {
+	configMux.Lock()
+	changed := false
+	defer func() {
+		configMux.Unlock()
+		if changed {
+			notifyClientBoundaryUpdate()
+		}
+	}()
+
+	type update struct {
+		wrapper  C.RuleWrapper
+		disabled bool
+	}
+	updates := make([]update, 0, len(disabledByIndex))
+	for index, disabled := range disabledByIndex {
+		if index < 0 || index >= len(rules) {
+			return fmt.Errorf("rule index %d is out of range", index)
+		}
+		wrapper, ok := rules[index].(C.RuleWrapper)
+		if !ok {
+			return fmt.Errorf("rule index %d cannot be disabled", index)
+		}
+		if disabled && isFixedUDP443GuardShape(wrapper) {
+			return errors.New("the fixed UDP/443 guard cannot be disabled")
+		}
+		updates = append(updates, update{wrapper: wrapper, disabled: disabled})
+	}
+	for _, update := range updates {
+		update.wrapper.SetDisabled(update.disabled)
+	}
+	if len(updates) > 0 {
+		refreshFixedClientBoundaryLocked()
+		routingConfigEpoch.Add(1)
+		changed = true
+	}
+	return nil
 }
 
 // Proxies return all proxies
@@ -231,7 +277,10 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
+	routingConfigEpoch.Add(1)
 	configMux.Unlock()
+	publishEgressProxyNames(newProxies)
+	notifyClientBoundaryUpdate()
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {
@@ -249,12 +298,18 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 
 // Mode return current mode
 func Mode() TunnelMode {
+	configMux.RLock()
+	defer configMux.RUnlock()
 	return mode
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
+	configMux.Lock()
 	mode = m
+	routingConfigEpoch.Add(1)
+	configMux.Unlock()
+	notifyClientBoundaryUpdate()
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -317,12 +372,34 @@ func preHandleMetadata(metadata *C.Metadata) error {
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
+		configMux.RLock()
 		proxy, exist = proxies[metadata.SpecialProxy]
+		configMux.RUnlock()
 		if !exist {
 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 		}
 		return
 	}
+	helper := newRuleMatchHelper(metadata)
+
+	currentMode := Mode()
+	switch currentMode {
+	case Direct:
+		configMux.RLock()
+		proxy = proxies["DIRECT"]
+		configMux.RUnlock()
+	case Global:
+		configMux.RLock()
+		proxy = proxies["GLOBAL"]
+		configMux.RUnlock()
+	// Rule
+	default:
+		proxy, rule, err = match(metadata, helper)
+	}
+	return
+}
+
+func newRuleMatchHelper(metadata *C.Metadata) C.RuleMatchHelper {
 	var (
 		resolved             bool
 		attemptProcessLookup = metadata.Type != C.INNER
@@ -397,17 +474,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	case process.FindProcessOff:
 		helper.FindProcess = nil
 	}
-
-	switch mode {
-	case Direct:
-		proxy = proxies["DIRECT"]
-	case Global:
-		proxy = proxies["GLOBAL"]
-	// Rule
-	default:
-		proxy, rule, err = match(metadata, helper)
-	}
-	return
+	return helper
 }
 
 // processUDP starts a loop to handle udp packet
@@ -457,11 +524,23 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
 
-			if ic := captureUDPFor(metadata); ic != nil {
-				return dialCapturedUDP(ic, packet, sender, originMetadata, metadata, key)
+			prefix, routeProxy, routeRule, decided, prefixErr := prepareClientRouting(metadata)
+			if prefixErr != nil {
+				log.Debugln("[GPN] fixed client rule boundary unavailable: %s", prefixErr)
+				metadata.SpecialProxy = "REJECT"
+				decided = true
+			}
+			if !decided {
+				if prefix == nil {
+					// No fixed-prefix proof: ordinary routing only.
+				} else if !clientPrefixAllowsCapture(prefix) {
+					metadata.SpecialProxy = "REJECT"
+				} else if ic := captureUDPFor(metadata); ic != nil {
+					return dialCapturedUDP(ic, packet, sender, originMetadata, metadata, key)
+				}
 			}
 
-			proxy, rule, err := resolveMetadata(metadata)
+			proxy, rule, err := resolvePreparedClientRouting(metadata, prefix, routeProxy, routeRule)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
 				return nil, nil, err
@@ -545,10 +624,22 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 
 	// The destination is known and nothing has been read off conn yet, which is
-	// the only point where a transformation stage can still see the handshake.
-	if ic := captureTCPFor(metadata); ic != nil {
-		ic.HandleTCP(conn, metadata)
-		return
+	// the only point where fixed-prefix routing and capture can still run.
+	prefix, routeProxy, routeRule, decided, prefixErr := prepareClientRouting(metadata)
+	if prefixErr != nil {
+		log.Debugln("[GPN] fixed client rule boundary unavailable: %s", prefixErr)
+		metadata.SpecialProxy = "REJECT"
+		decided = true
+	}
+	if !decided {
+		if prefix == nil {
+			// No fixed-prefix proof: ordinary routing only.
+		} else if !clientPrefixAllowsCapture(prefix) {
+			metadata.SpecialProxy = "REJECT"
+		} else if ic := captureTCPFor(metadata); ic != nil {
+			ic.HandleTCP(conn, metadata)
+			return
+		}
 	}
 
 	peekMutex := sync.Mutex{}
@@ -562,7 +653,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}()
 	}
 
-	proxy, rule, err := resolveMetadata(metadata)
+	proxy, rule, err := resolvePreparedClientRouting(metadata, prefix, routeProxy, routeRule)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
 		return
@@ -653,9 +744,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case Mode() == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case Mode() == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -665,60 +756,77 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
+	return matchLocked(metadata, helper, nil)
+}
 
+func matchLocked(metadata *C.Metadata, helper C.RuleMatchHelper, initialRules []C.Rule) (C.Proxy, C.Rule, error) {
 	var rematchChain []string
+	ruleList := initialRules
 	for {
-		var rematchProxy C.Proxy
-		var rematchRule C.Rule
-	GetRules:
-		for _, rule := range getRules(metadata) {
-			if matched, ada := rule.Match(metadata, helper); matched {
-				adapter, ok := proxies[ada]
-				if !ok {
-					continue
-				}
-
-				// parse multi-layer nesting
-				for adapter := adapter; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
-					if adapter.Type() == C.Pass {
-						log.Debugln("%s match Pass rule", adapter.Name())
-						continue GetRules
-					}
-					if adapter.Type() == C.Rematch {
-						log.Debugln("%s match Rematch rule", adapter.Name())
-						rematchProxy = adapter
-						rematchRule = rule
-						break GetRules
-					}
-				}
-
-				if metadata.NetWork == C.UDP && !adapter.SupportUDP() {
-					log.Debugln("%s UDP is not supported", adapter.Name())
-					continue
-				}
-
-				return adapter, rule, nil
-			}
+		if ruleList == nil {
+			ruleList = getRules(metadata)
 		}
-		if rematchProxy != nil {
-			if slices.Contains(rematchChain, rematchProxy.Name()) {
-				log.Warnln("[Rule] rematch cycle detected on %s", rematchProxy.Name())
-				return rematchProxy, rematchRule, nil
+		result := matchRuleList(metadata, helper, ruleList)
+		if result.matched {
+			return result.proxy, result.rule, nil
+		}
+		if result.rematch != nil {
+			if slices.Contains(rematchChain, result.rematch.Name()) {
+				log.Warnln("[Rule] rematch cycle detected on %s", result.rematch.Name())
+				return result.rematch, result.rule, nil
 			}
-			rematchChain = append(rematchChain, rematchProxy.Name())
-			conn, err := rematchProxy.DialContext(context.Background(), metadata) // not a real connection, just for metadata update
+			rematchChain = append(rematchChain, result.rematch.Name())
+			conn, err := result.rematch.DialContext(context.Background(), metadata) // not a real connection, just for metadata update
 			if conn != nil {
 				_ = conn.Close()
 			}
 			if err != nil {
-				log.Warnln("[Rule] rematch proxy %s failed to update metadata: %s", rematchProxy.Name(), err)
-				return rematchProxy, rematchRule, nil
+				log.Warnln("[Rule] rematch proxy %s failed to update metadata: %s", result.rematch.Name(), err)
+				return result.rematch, result.rule, nil
 			}
-			log.Debugln("[Rule] rematch proxy %s update metadata to rematch-name=%q sub-rule=%q", rematchProxy.Name(), metadata.InName, metadata.SpecialRules)
+			log.Debugln("[Rule] rematch proxy %s update metadata to rematch-name=%q sub-rule=%q", result.rematch.Name(), metadata.InName, metadata.SpecialRules)
+			ruleList = nil
 			continue
 		}
 		return proxies["DIRECT"], nil, nil
 	}
+}
+
+type ruleListMatch struct {
+	proxy   C.Proxy
+	rule    C.Rule
+	rematch C.Proxy
+	matched bool
+}
+
+func matchRuleList(metadata *C.Metadata, helper C.RuleMatchHelper, ruleList []C.Rule) ruleListMatch {
+NextRule:
+	for _, rule := range ruleList {
+		matched, adapterName := rule.Match(metadata, helper)
+		if !matched {
+			continue
+		}
+		adapter, ok := proxies[adapterName]
+		if !ok {
+			continue
+		}
+		for nested := adapter; nested != nil; nested = nested.Unwrap(metadata, false) {
+			switch nested.Type() {
+			case C.Pass:
+				log.Debugln("%s match Pass rule", nested.Name())
+				continue NextRule
+			case C.Rematch:
+				log.Debugln("%s match Rematch rule", nested.Name())
+				return ruleListMatch{rule: rule, rematch: nested}
+			}
+		}
+		if metadata.NetWork == C.UDP && !adapter.SupportUDP() {
+			log.Debugln("%s UDP is not supported", adapter.Name())
+			continue
+		}
+		return ruleListMatch{proxy: adapter, rule: rule, matched: true}
+	}
+	return ruleListMatch{}
 }
 
 func getRules(metadata *C.Metadata) []C.Rule {

@@ -63,19 +63,23 @@ type Config struct {
 	generation uint64
 }
 
-// MITMSettings is the master switch and the two protocol decisions.
+// MITMSettings is the master switch and the protocol settings.
 //
-// HTTP3 is capture over QUIC. It is off by default and separate from HTTP2
-// because it decides something HTTP2 does not: whether gateway QUIC is
-// terminated here or refused so the client retries over TCP. The seed
-// template's fixed AND,((NETWORK,UDP),(DST-PORT,443)),REJECT is what performs
-// the refusal, and it stays in place either way — capture is consulted before
-// rule resolution, so with HTTP3 on the reject only ever sees the datagrams
-// capture did not want.
+// HTTP3 remains in the document and API schema so an explicit false value in
+// an existing document continues to load and round-trip. Interception does not
+// terminate QUIC: validation rejects true, and the gateway's fixed UDP/443
+// rule blocks HTTP/3 so clients that support fallback retry over TCP.
 type MITMSettings struct {
 	Enabled bool `json:"enabled"`
 	HTTP2   bool `json:"http2"`
 	HTTP3   bool `json:"http3"`
+}
+
+func (s MITMSettings) validate() error {
+	if s.HTTP3 {
+		return errors.New("mitm.http3: HTTP/3 interception is unsupported; UDP/443 must remain blocked by the gateway")
+	}
+	return nil
 }
 
 type ModuleSource struct {
@@ -632,6 +636,9 @@ func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 	if c.Version != configVersion {
 		return fmt.Errorf("config version must be %d", configVersion)
 	}
+	if err := c.MITM.validate(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.TLSCert) == "" || strings.TrimSpace(c.TLSKey) == "" {
 		return errors.New("tls_cert and tls_key are required")
 	}
@@ -653,6 +660,9 @@ func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 func (c Config) ValidateCertificateRequest() error {
 	if c.Version != configVersion {
 		return fmt.Errorf("config version must be %d", configVersion)
+	}
+	if err := c.MITM.validate(); err != nil {
+		return err
 	}
 	if c.TLSCert != "/etc/5gpn/intercept/tls/fullchain.pem" || c.TLSKey != "/etc/5gpn/intercept/tls/privkey.pem" {
 		return errors.New("TLS paths do not match the fixed interception runtime boundary")

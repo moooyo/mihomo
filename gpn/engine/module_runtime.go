@@ -265,7 +265,7 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		// instead), so contextObject["network"] was unreachable JavaScript.
 		// Two requesters means two transport maps and two deferred Closes, and
 		// a reader with no way to tell which one is live.
-		requester = newModuleNetworkRequester(actionCtx, roots, r.networkSlots)
+		requester = newModuleNetworkRequester(actionCtx, roots, r.networkSlots, module.ID)
 		defer requester.Close()
 		if rule.Entry != scriptEntryProxyCompat {
 			contextObject["network"] = requester.newAPI(vm, loop)
@@ -1286,6 +1286,7 @@ type compiledScriptConfig struct {
 	moduleHosts    map[string]*compiledHostMatcher
 	activeHosts    *compiledHostMatcher
 	activePatterns []string
+	traffic        *compiledTrafficPolicy
 }
 
 func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
@@ -1297,9 +1298,14 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 	for _, module := range cfg.Modules {
 		byID[module.ID] = module
 	}
+	traffic, err := compileTrafficPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
 	compiled := &compiledScriptConfig{
 		modules:     make([]compiledScriptModule, 0, len(cfg.Modules)),
 		moduleHosts: make(map[string]*compiledHostMatcher, len(cfg.Modules)),
+		traffic:     traffic,
 	}
 	activePatterns := make([]string, 0, 16)
 	for _, module := range cfg.Modules {

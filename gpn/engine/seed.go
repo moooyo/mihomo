@@ -19,7 +19,8 @@ const (
 )
 
 // DefaultDocument is an interception engine that is installed and doing
-// nothing: the master off, no extensions, HTTP/2 on, HTTP/3 capture off.
+// nothing: the master off, no extensions, HTTP/2 on, and the retained HTTP/3
+// field false because extension interception does not support QUIC.
 //
 // "Installed and doing nothing" is a state the system needs to be able to
 // represent, and an absent file cannot represent it. The API answers 503 for an

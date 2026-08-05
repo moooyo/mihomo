@@ -48,6 +48,7 @@ func (e *Engine) CaptureFor(host string) (CaptureBinding, bool) {
 	for _, m := range cfg.Modules {
 		byID[m.ID] = m
 	}
+	traffic, trafficErr := trafficPolicyForConfig(cfg)
 
 	consider := func(m Module) (CaptureBinding, bool) {
 		if !m.Enabled {
@@ -75,7 +76,8 @@ func (e *Engine) CaptureFor(host string) (CaptureBinding, bool) {
 			ModuleName: m.Name,
 			Pattern:    matched,
 			CaptureDNS: m.CaptureDNS,
-			Ready:      cfg.MITM.Enabled,
+			Ready: cfg.MITM.Enabled && e.clientBoundaryIsReady() && e.moduleEgressReady(m) &&
+				trafficErr == nil && e.captureDestinationReady(traffic, host),
 		}, true
 	}
 

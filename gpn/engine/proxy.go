@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
 )
@@ -103,8 +104,8 @@ type upstreamTransportGeneration struct {
 	projection upstreamTransportProjection
 
 	mu              sync.Mutex
-	httpTransport   *http.Transport
-	http3Transports map[quic.Version]*http3.Transport
+	httpTransports  map[string]*http.Transport
+	http3Transports map[http3TransportKey]*http3.Transport
 	http3Versions   map[string]quic.Version
 	closed          bool
 	closeOnce       sync.Once
@@ -112,6 +113,11 @@ type upstreamTransportGeneration struct {
 	// refs and retired are protected by interceptProxy.transportMu.
 	refs    int
 	retired bool
+}
+
+type http3TransportKey struct {
+	owner   string
+	version quic.Version
 }
 
 type tlsHandshakeErrorReporter struct {
@@ -402,7 +408,7 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outbound := prepared.outbound
-	response, cleanup, err := p.roundTrip(outbound, cfg)
+	response, cleanup, err := p.roundTrip(outbound, cfg, prepared.egressOwner)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -584,13 +590,20 @@ func requestHasBodySection(request *http.Request) bool {
 	return requestHasPayload(request) || len(request.Trailer) > 0
 }
 
-func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Response, func(), error) {
+func (p *interceptProxy) roundTrip(request *http.Request, cfg Config, owner string) (*http.Response, func(), error) {
 	generation, cleanup := p.acquireUpstreamTransportGeneration(cfg)
+	network := C.TCP
 	if request.ProtoMajor == 3 {
-		response, err := p.roundTripHTTP3(request, generation)
+		network = C.UDP
+	}
+	if err := authorizeProjectedRequest(network, request, generation.projection, owner); err != nil {
+		return nil, cleanup, err
+	}
+	if request.ProtoMajor == 3 {
+		response, err := p.roundTripHTTP3(request, generation, owner)
 		return response, cleanup, err
 	}
-	transport, err := generation.getHTTPTransport(p)
+	transport, err := generation.getHTTPTransport(p, owner)
 	if err != nil {
 		return nil, cleanup, err
 	}
@@ -598,12 +611,33 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Res
 	return response, cleanup, err
 }
 
+func authorizeProjectedRequest(network C.NetWork, request *http.Request, projection upstreamTransportProjection, owner string) error {
+	if request == nil || request.URL == nil {
+		return errors.New("upstream request target is missing")
+	}
+	port := request.URL.Port()
+	if port == "" {
+		if request.URL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	target, permitted := projection.targets.upstreamTarget(request.URL.Hostname(), port, owner)
+	if !permitted {
+		return errors.New("upstream target is outside the active extension allowlist")
+	}
+	_, err := authorizeUpstream(network, target)
+	return err
+}
+
 func newUpstreamTransportGeneration(cfg Config) *upstreamTransportGeneration {
 	projection := newUpstreamTransportProjection(cfg)
 	return &upstreamTransportGeneration{
 		generation:      projection.generation,
 		projection:      projection,
-		http3Transports: make(map[quic.Version]*http3.Transport, 2),
+		httpTransports:  make(map[string]*http.Transport),
+		http3Transports: make(map[http3TransportKey]*http3.Transport, 2),
 		http3Versions:   make(map[string]quic.Version),
 	}
 }
@@ -695,29 +729,32 @@ func (p *interceptProxy) closeUpstreamTransports() {
 	}
 }
 
-func (generation *upstreamTransportGeneration) getHTTPTransport(p *interceptProxy) (*http.Transport, error) {
+func (generation *upstreamTransportGeneration) getHTTPTransport(p *interceptProxy, owner string) (*http.Transport, error) {
 	generation.mu.Lock()
 	defer generation.mu.Unlock()
 	if generation.closed {
 		return nil, errors.New("upstream transport generation is closed")
 	}
-	if generation.httpTransport == nil {
-		generation.httpTransport = p.newHTTPTransportForProjection(generation.projection)
-	}
-	return generation.httpTransport, nil
-}
-
-func (generation *upstreamTransportGeneration) getHTTP3Transport(p *interceptProxy, version quic.Version) (*http3.Transport, error) {
-	generation.mu.Lock()
-	defer generation.mu.Unlock()
-	if generation.closed {
-		return nil, errors.New("upstream transport generation is closed")
-	}
-	if transport := generation.http3Transports[version]; transport != nil {
+	if transport := generation.httpTransports[owner]; transport != nil {
 		return transport, nil
 	}
-	transport := p.newHTTP3Transport(generation, version)
-	generation.http3Transports[version] = transport
+	transport := p.newHTTPTransportForProjectionOwner(generation.projection, owner)
+	generation.httpTransports[owner] = transport
+	return transport, nil
+}
+
+func (generation *upstreamTransportGeneration) getHTTP3Transport(p *interceptProxy, version quic.Version, owner string) (*http3.Transport, error) {
+	generation.mu.Lock()
+	defer generation.mu.Unlock()
+	if generation.closed {
+		return nil, errors.New("upstream transport generation is closed")
+	}
+	key := http3TransportKey{owner: owner, version: version}
+	if transport := generation.http3Transports[key]; transport != nil {
+		return transport, nil
+	}
+	transport := p.newHTTP3Transport(generation, version, owner)
+	generation.http3Transports[key] = transport
 	return transport, nil
 }
 
@@ -742,11 +779,14 @@ func (generation *upstreamTransportGeneration) closeIdleConnections() {
 		generation.mu.Unlock()
 		return
 	}
-	httpTransport := generation.httpTransport
+	httpTransports := make([]*http.Transport, 0, len(generation.httpTransports))
+	for _, transport := range generation.httpTransports {
+		httpTransports = append(httpTransports, transport)
+	}
 	generation.mu.Unlock()
 
-	if httpTransport != nil {
-		httpTransport.CloseIdleConnections()
+	for _, transport := range httpTransports {
+		transport.CloseIdleConnections()
 	}
 }
 
@@ -813,17 +853,20 @@ func (generation *upstreamTransportGeneration) close() {
 	generation.closeOnce.Do(func() {
 		generation.mu.Lock()
 		generation.closed = true
-		httpTransport := generation.httpTransport
+		httpTransports := make([]*http.Transport, 0, len(generation.httpTransports))
+		for _, transport := range generation.httpTransports {
+			httpTransports = append(httpTransports, transport)
+		}
 		http3Transports := make([]*http3.Transport, 0, len(generation.http3Transports))
 		for _, transport := range generation.http3Transports {
 			http3Transports = append(http3Transports, transport)
 		}
-		generation.httpTransport = nil
+		generation.httpTransports = nil
 		generation.http3Transports = nil
 		generation.mu.Unlock()
 
-		if httpTransport != nil {
-			httpTransport.CloseIdleConnections()
+		for _, transport := range httpTransports {
+			transport.CloseIdleConnections()
 		}
 		for _, transport := range http3Transports {
 			_ = transport.Close()
@@ -836,6 +879,10 @@ func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
 }
 
 func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransportProjection) *http.Transport {
+	return p.newHTTPTransportForProjectionOwner(projection, "")
+}
+
+func (p *interceptProxy) newHTTPTransportForProjectionOwner(projection upstreamTransportProjection, owner string) *http.Transport {
 	return &http.Transport{
 		Proxy:                  nil,
 		ForceAttemptHTTP2:      projection.http2,
@@ -859,7 +906,7 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 			if err != nil {
 				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
-			target, permitted := projection.targets.upstreamTarget(host, portText)
+			target, permitted := projection.targets.upstreamTarget(host, portText, owner)
 			if !permitted {
 				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
@@ -873,7 +920,7 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 	}
 }
 
-func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGeneration, version quic.Version) *http3.Transport {
+func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGeneration, version quic.Version, owner string) *http3.Transport {
 	return &http3.Transport{
 		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
 		TLSClientConfig: &tls.Config{
@@ -902,7 +949,7 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 			if err != nil {
 				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
 			}
-			target, permitted := generation.projection.targets.upstreamTarget(host, portText)
+			target, permitted := generation.projection.targets.upstreamTarget(host, portText, owner)
 			if !permitted {
 				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
 			}
@@ -937,13 +984,13 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 	}
 }
 
-func (p *interceptProxy) roundTripHTTP3(request *http.Request, generation *upstreamTransportGeneration) (*http.Response, error) {
+func (p *interceptProxy) roundTripHTTP3(request *http.Request, generation *upstreamTransportGeneration, owner string) (*http.Response, error) {
 	authority, err := canonicalHTTP3Authority(request)
 	if err != nil {
 		return nil, err
 	}
 	version := generation.preferredHTTP3Version(authority)
-	transport, err := generation.getHTTP3Transport(p, version)
+	transport, err := generation.getHTTP3Transport(p, version, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -958,7 +1005,7 @@ func (p *interceptProxy) roundTripHTTP3(request *http.Request, generation *upstr
 	if bodyErr := resetHTTP3RequestBodyForReplay(request); bodyErr != nil {
 		return nil, bodyErr
 	}
-	transport, transportErr := generation.getHTTP3Transport(p, quic.Version2)
+	transport, transportErr := generation.getHTTP3Transport(p, quic.Version2, owner)
 	if transportErr != nil {
 		return nil, transportErr
 	}

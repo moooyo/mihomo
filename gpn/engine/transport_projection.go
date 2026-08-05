@@ -40,8 +40,10 @@ type upstreamTargetProjection struct {
 }
 
 type upstreamModuleProjection struct {
+	id       string
 	hosts    *compiledHostMatcher
 	mappings []HostMapping
+	network  bool
 }
 
 // inboundUDPAuthorization is captured when a SOCKS UDP association starts.
@@ -63,17 +65,31 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 	digest := sha256.New()
 	writeFingerprintBool(digest, cfg.MITM.HTTP2)
 	writeFingerprintBool(digest, cfg.MITM.Enabled)
+	byID := make(map[string]Module, len(cfg.Modules))
 	for _, module := range cfg.Modules {
+		byID[module.ID] = module
+	}
+	for _, moduleID := range cfg.ExecutionOrder {
+		writeFingerprintField(digest, moduleID)
+		module, exists := byID[moduleID]
+		writeFingerprintBool(digest, exists && module.Enabled)
+		if !exists {
+			continue
+		}
 		if !module.Enabled {
 			continue
 		}
 		projectedModule := upstreamModuleProjection{
+			id:       module.ID,
 			hosts:    projectedModuleHostMatcher(cfg, module),
 			mappings: make([]HostMapping, 0, len(module.HostMappings)),
+			network:  module.Network,
 		}
 		// The module boundary is in the digest so that moving a host from one
 		// module to another cannot collide with leaving it where it was.
 		writeFingerprintField(digest, module.ID)
+		writeFingerprintBool(digest, module.EgressGroupRequired)
+		writeFingerprintField(digest, module.EgressGroup)
 		for _, host := range module.CaptureHosts {
 			writeFingerprintField(digest, host)
 		}
@@ -152,7 +168,7 @@ func projectedModuleHostMatcher(cfg Config, module Module) *compiledHostMatcher 
 	return newCompiledHostMatcher(module.CaptureHosts)
 }
 
-func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (netTarget, bool) {
+func (p upstreamTargetProjection) upstreamTarget(rawHost, portText, owner string) (netTarget, bool) {
 	if !p.enabled {
 		return netTarget{}, false
 	}
@@ -161,7 +177,20 @@ func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (netT
 	if err != nil || port < 1 || port > 65535 {
 		return netTarget{}, false
 	}
-	if (port == 80 || port == 443) && p.activeHosts.Match(host) {
+	var ownerModule *upstreamModuleProjection
+	if owner != "" {
+		for index := range p.modules {
+			if p.modules[index].id == owner {
+				ownerModule = &p.modules[index]
+				break
+			}
+		}
+		if ownerModule == nil {
+			return netTarget{}, false
+		}
+	}
+	if (port == 80 || port == 443) && p.activeHosts.Match(host) &&
+		(ownerModule == nil || ownerModule.network || ownerModule.hosts.Match(host)) {
 		bestPattern := ""
 		target := host
 		for _, module := range p.modules {
@@ -178,12 +207,15 @@ func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (netT
 				}
 			}
 		}
-		return netTarget{Host: target, Port: port}, true
+		return netTarget{Host: target, Port: port, Owner: owner}, true
 	}
-	if !p.networkGrant {
+	// An unowned main upstream may only address captured hosts and mapping
+	// targets. The broad network grant belongs to the action that invoked it;
+	// that action's owner is carried explicitly by its requester.
+	if ownerModule == nil || !ownerModule.network {
 		return netTarget{}, false
 	}
-	return netTarget{Host: host, Port: port}, true
+	return netTarget{Host: host, Port: port, Owner: owner}, true
 }
 
 func (a inboundUDPAuthorization) allows(target netTarget) bool {

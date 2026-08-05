@@ -52,11 +52,14 @@ func Start(home string) error {
 	// mihomo's own inner dialer so an intercepted upstream obeys exactly the
 	// rules an ordinary connection would, and shows up in the same connection
 	// table.
-	engine.SetUpstreamDialer(func(ctx context.Context, host string, port int) (net.Conn, error) {
-		return dial.TCP(ctx, host, port)
+	engine.SetUpstreamAuthorizer(func(network C.NetWork, host string, port int, owner string, ownerOnly bool) (string, error) {
+		return dial.Authorize(network, host, port, owner, ownerOnly)
 	})
-	engine.SetUpstreamPacketDialer(func(ctx context.Context, host string, port int) (net.PacketConn, error) {
-		return dial.UDP(ctx, host, port)
+	engine.SetUpstreamDialer(func(ctx context.Context, host string, port int, owner string, ownerOnly bool) (net.Conn, error) {
+		return dial.TCP(ctx, host, port, owner, ownerOnly)
+	})
+	engine.SetUpstreamPacketDialer(func(ctx context.Context, host string, port int, owner string, ownerOnly bool) (net.PacketConn, error) {
+		return dial.UDP(ctx, host, port, owner, ownerOnly)
 	})
 
 	api.Advertise("gpn-core", api.Feature{Version: 1})
@@ -73,6 +76,13 @@ func Start(home string) error {
 		return err
 	}
 	dnsRef.Store(svc)
+	tunnel.SetEgressProxyUpdateCallback(func() {
+		svc.Resolver().FlushCache()
+		if e := engineRef.Load(); e != nil {
+			e.InvalidateEgressTransports()
+		}
+	})
+	tunnel.SetClientBoundaryUpdateCallback(svc.Resolver().FlushCache)
 	api.SetDNSService(svc)
 	api.Advertise("gpn-dns", api.Feature{Version: 1})
 
@@ -134,7 +144,7 @@ func startBot(configPath string) error {
 		// api.telegram.org is unreachable from a good number of the networks
 		// this gateway runs on, and the operator has already configured how to
 		// reach such places.
-		return dial.TCP(ctx, host, port)
+		return dial.SystemTCP(ctx, host, port)
 	})
 	if err != nil {
 		return err
@@ -179,7 +189,6 @@ func gatewayStatus() bot.Status {
 		if snapshot, err := e.Snapshot(); err == nil {
 			status.InterceptionInstalled = true
 			status.InterceptionEnabled = snapshot.Enabled
-			status.HTTP3 = snapshot.HTTP3
 			status.Extensions = len(snapshot.Modules)
 			for _, m := range snapshot.Modules {
 				if m.Enabled {
@@ -212,7 +221,7 @@ func explainName(name string) (bot.Explanation, error) {
 	if decision.Capture != nil {
 		explanation.Extension = decision.Capture.ExtensionName
 		if !decision.Capture.Ready {
-			explanation.Reason = "the extension declares this host, but the interception master switch is off"
+			explanation.Reason = "the extension declares this host, but its interception runtime is not ready"
 		}
 	}
 	return explanation, nil
@@ -247,6 +256,9 @@ func StartInterception(configPath string) error {
 	api.Advertise("gpn-interception", api.Feature{})
 	api.SetInterceptionEngine(nil)
 	engineRef.Store(nil)
+	tunnel.SetTrafficPolicy(nil)
+	tunnel.SetInterceptor(nil)
+	dial.SetTrafficPolicy(nil, nil)
 	// The resolver must forget the capture table in the same breath. A stale
 	// lookup would keep steering hosts the current document no longer names,
 	// at a gateway with nothing left to terminate them.
@@ -255,7 +267,6 @@ func StartInterception(configPath string) error {
 	}
 
 	if configPath == "" {
-		tunnel.SetInterceptor(nil)
 		return nil
 	}
 	e, err := engine.New(configPath, StateDir())
@@ -263,9 +274,16 @@ func StartInterception(configPath string) error {
 		// Explicitly clear rather than leave whatever was installed before. A
 		// failed reload that silently kept the previous capture set would have
 		// the gateway intercepting hosts the current document no longer names.
-		tunnel.SetInterceptor(nil)
 		return err
 	}
+	e.SetEgressGroupSource(tunnel.IsEgressProxy, tunnel.EgressProxies)
+	e.SetClientBoundarySource(tunnel.ClientPolicyBoundaryReady)
+	if svc := dnsRef.Load(); svc != nil {
+		e.SetTrafficPolicyChangeCallback(svc.Resolver().FlushCache)
+	}
+	policy := e.TrafficPolicy()
+	dial.SetTrafficPolicy(policy, tunnel.IsEgressProxy)
+	tunnel.SetTrafficPolicy(policy)
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
 	api.SetInterceptionEngine(e)

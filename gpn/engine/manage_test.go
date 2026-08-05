@@ -150,6 +150,57 @@ func TestCaptureReportsDeclarationWithTheMasterOff(t *testing.T) {
 	}
 }
 
+func TestPersistedDocumentKeepsHTTP3FalseAndRejectsTrueAtStartup(t *testing.T) {
+	cfg, err := decodeConfig([]byte(twoExtensionDocument))
+	if err != nil {
+		t.Fatalf("document with http3 false did not load: %v", err)
+	}
+	if cfg.MITM.HTTP3 {
+		t.Fatal("document with http3 false loaded as true")
+	}
+
+	document := strings.Replace(twoExtensionDocument, `"http3": false`, `"http3": true`, 1)
+	path := filepath.Join(t.TempDir(), "intercept.json")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = newConfigStore(path)
+	if err == nil {
+		t.Fatal("startup accepted a persisted document enabling HTTP/3 interception")
+	}
+	if !strings.Contains(err.Error(), "HTTP/3") || !strings.Contains(err.Error(), "unsupported") || !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("HTTP/3 rejection %q does not explain the unsupported blocked protocol", err)
+	}
+}
+
+func TestSetSettingsRejectsHTTP3WithoutPublishing(t *testing.T) {
+	e := newTestEngine(t, twoExtensionDocument)
+	before, revision := e.ReadDocument()
+
+	_, returnedRevision, err := e.SetSettings(revision, MITMSettings{
+		Enabled: true,
+		HTTP2:   true,
+		HTTP3:   true,
+	})
+	if err == nil {
+		t.Fatal("SetSettings accepted HTTP/3 interception")
+	}
+	if !strings.Contains(err.Error(), "HTTP/3") || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("SetSettings returned an unclear error: %v", err)
+	}
+	if returnedRevision != revision {
+		t.Errorf("rejected write returned revision %s, want unchanged %s", returnedRevision, revision)
+	}
+
+	after, stillRevision := e.ReadDocument()
+	if stillRevision != revision {
+		t.Errorf("revision moved from %s to %s after a rejected HTTP/3 write", revision, stillRevision)
+	}
+	if before.MITM != after.MITM || after.MITM.HTTP3 {
+		t.Errorf("rejected HTTP/3 write changed settings from %+v to %+v", before.MITM, after.MITM)
+	}
+}
+
 func TestWritesRequireTheCurrentRevision(t *testing.T) {
 	e := newTestEngine(t, twoExtensionDocument)
 	stale := e.Revision()

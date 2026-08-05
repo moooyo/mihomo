@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -115,6 +116,25 @@ func TestManifestParsesAndNormalizes(t *testing.T) {
 
 	if m.Source.Digest != digestText(validManifest) {
 		t.Error("the source digest does not cover the manifest bytes")
+	}
+}
+
+func TestManifestNormalizesMethodsAsCanonicalUppercase(t *testing.T) {
+	body := strings.Replace(validManifest,
+		`      pathRegex: "^/v1/"`,
+		"      methods: [post, GET, ' POST ']\n      pathRegex: \"^/v1/\"", 1)
+	module := parseFixture(t, body)
+
+	want := []string{"GET", "POST"}
+	if got := module.Scripts[0].Match.Methods; !reflect.DeepEqual(got, want) {
+		t.Fatalf("methods = %v, want %v", got, want)
+	}
+	if err := validateModules([]Module{module}); err != nil {
+		t.Fatalf("the normalized module did not validate: %v", err)
+	}
+	module.Scripts[0].Match.Methods = []string{"get"}
+	if err := validateModules([]Module{module}); err == nil || !strings.Contains(err.Error(), "method") {
+		t.Fatalf("non-canonical methods returned %v, want a method validation error", err)
 	}
 }
 

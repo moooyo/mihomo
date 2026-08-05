@@ -81,9 +81,14 @@ func activeModuleUpstreamTarget(cfg Config, rawHost, portText string) (netTarget
 	}
 	// Any module holding the network grant may reach any host, so an active
 	// grant makes every target servable. There is no list left to enumerate.
+	byID := make(map[string]Module, len(cfg.Modules))
 	for _, module := range cfg.Modules {
+		byID[module.ID] = module
+	}
+	for _, id := range cfg.ExecutionOrder {
+		module := byID[id]
 		if module.Enabled && module.Network {
-			return netTarget{Host: host, Port: port}, true
+			return netTarget{Host: host, Port: port, Owner: module.ID}, true
 		}
 	}
 	return netTarget{}, false
