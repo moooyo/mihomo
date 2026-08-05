@@ -350,7 +350,7 @@ func compatHTTPMethod(
 // native requester accepts. The bundles also pass transport hints such as
 // binary-mode, auto-redirect, policy, and timeout; those are runtime-owned here
 // and are dropped rather than rejected, so a bundle is not broken by a hint the
-// sidecar simply does not delegate.
+// runtime simply does not delegate.
 func compatRequestOptions(raw goja.Value, method string) (map[string]any, bool, error) {
 	options := map[string]any{"method": methodToken(method)}
 	if raw == nil || goja.IsUndefined(raw) || goja.IsNull(raw) {

@@ -70,12 +70,11 @@ func interceptionRouter() http.Handler {
 	return r
 }
 
-// getEngineLogs serves the retained engine and extension log ring.
+// getEngineLogs serves a bounded snapshot of retained engine and extension logs.
 //
-// A read rather than a stream. The engine already publishes to a websocket for
-// a live tail, but the question an operator actually has is "what did this
-// extension do before it broke", asked after it broke -- and a stream that
-// begins when they open it cannot answer that.
+// The ring records events before anyone opens the page. This authenticated
+// controller read is the only log transport; the engine does not bind a second
+// socket or expose a separate stream.
 //
 // limit defaults to a screenful and is capped at the ring, so a caller cannot
 // ask for more than exists or make the response unbounded.

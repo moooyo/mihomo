@@ -105,7 +105,7 @@ func requestNeedsModuleBodyReservation(incoming *http.Request, rules []matchedSc
 //
 // An undeclared length is not a reason to buffer. A chunked HTTP/1.1 upload and
 // an HTTP/2 one both arrive with ContentLength -1, and refusing to stream them
-// meant a request with zero matched rules -- one this sidecar forwards
+// meant a request with zero matched rules -- one the interceptor forwards
 // byte-for-byte -- was fully resident and held one of the two body slots for as
 // long as the client took to send it.
 //
@@ -520,7 +520,7 @@ func (p *interceptProxy) transformModuleResponse(
 	}
 	decoded, err := decodeContentBody(body, encoding, maxModuleHTTPBody)
 	if err != nil {
-		// An upstream body this sidecar cannot decode cannot be projected into a
+		// An upstream body the runtime cannot decode cannot be projected into a
 		// script message, and refusing to serve it turns an origin's choice of
 		// coding into a 502 for a request that already succeeded. readBounded
 		// only returns once the upstream reader reached EOF, so everything the
@@ -584,7 +584,7 @@ func (p *interceptProxy) transformModuleResponse(
 }
 
 // reportSkippedResponseActions records that a response streamed through with its
-// matched actions unrun, because the sidecar could not decode the coding the
+// matched actions unrun, because the runtime could not decode the coding the
 // origin chose. Reported per action on its own log stream, the way the runtime
 // reports an action that timed out or was canceled, so the extension an operator
 // is debugging names itself rather than leaving a silent passthrough.

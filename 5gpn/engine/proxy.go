@@ -186,10 +186,10 @@ func (r *tlsHandshakeErrorReporter) report(target, message string) {
 // directory as the bundle store.
 //
 // It is a sibling of meta.json and pointer.json rather than a path of its own so
-// that --bundle-store moves all of this sidecar's durable state at once. Naming
-// the directory twice is how an operator ends up with extension state orphaned in
-// the directory they thought they had moved away from, and with two instances
-// silently overwriting each other's store.json.
+// that moving the engine state directory moves all durable extension state at
+// once. Naming the directory twice is how an operator ends up with extension
+// state orphaned in the directory they thought they had moved away from, and
+// with two instances silently overwriting each other's store.json.
 const interceptStoreFile = "store.json"
 
 func newInterceptProxy(config *configStore, certificates *certificateStore, stateDir string) *interceptProxy {

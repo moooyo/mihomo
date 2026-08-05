@@ -211,9 +211,9 @@ func performModuleNetworkRequest(
 // `$httpClient.get({headers: $request.headers}, cb)` and then annotating
 // `$request.headers` has the VM goroutine writing the very map a worker
 // goroutine would be reading -- `fatal error: concurrent map read and map
-// write`, which no recover() can catch and which takes the whole sidecar down
-// with every in-flight connection, the SOCKS listeners, the control API, and
-// the engine-log socket.
+// write`, which no recover() can catch and which terminates the entire
+// 5gpn-mihomo process, including DNS, forwarding, interception, the controller,
+// and every in-flight request.
 //
 // Building this value is therefore part of the call, not part of the round
 // trip: newModuleNetworkRequest runs on the goroutine that owns the VM and

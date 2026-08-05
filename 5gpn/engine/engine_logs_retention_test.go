@@ -3,28 +3,21 @@ package engine
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 // The log has to exist before anyone looks at it.
 //
-// Publish used to return immediately unless a websocket was already attached,
-// and Enabled() -- which gates whether the runtime builds an event at all --
-// was "is anyone watching". That is a correct design for a live tail and the
-// wrong one for a debug log: an operator opens the log because something broke,
-// which is necessarily after it broke, and a stream that begins at "now" has
-// nothing to show them. The console reads a snapshot for that reason.
-func TestEngineLogsRetainWithoutSubscribers(t *testing.T) {
+// Enabled gates whether the runtime builds an event at all. The bounded ring
+// stays enabled before any read because an operator opens the log only after
+// something breaks. The console then reads the retained snapshot.
+func TestEngineLogsRetainBeforeRead(t *testing.T) {
 	t.Parallel()
 
 	hub := newEngineLogHub(8)
 	defer hub.Close()
 
 	if !hub.Enabled() {
-		t.Fatal("the hub reports disabled with no subscribers; scripts would emit nothing")
-	}
-	if hub.HasSubscribers() {
-		t.Fatal("no subscriber was attached")
+		t.Fatal("the hub reports disabled before a read; scripts would emit nothing")
 	}
 
 	// A script event carries its extension and its action; the engine validates
@@ -121,5 +114,4 @@ func TestEngineLogsAfterClose(t *testing.T) {
 			t.Error("an event published after Close was retained")
 		}
 	}
-	_ = time.Now
 }
