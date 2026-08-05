@@ -202,13 +202,9 @@ func (s *certificateStore) currentCertificate() (*tls.Certificate, error) {
 	}
 	if s.certificate != nil && s.certPath == cfg.TLSCert && s.keyPath == cfg.TLSKey &&
 		certInfo.ModTime().Equal(s.certModTime) && keyInfo.ModTime().Equal(s.keyModTime) {
-		// The cache key is the file's mtime, and one of the checks below is not a
-		// property of the file: leaf validity is a property of the clock. Serving
-		// the cached leaf without re-checking it meant that once renewal had
-		// failed for long enough -- 397-day leaves, RENEW_BEFORE of 30 days and a
-		// daily timer, so 30 consecutive failures -- this process would present an
-		// expired certificate to every client indefinitely, and the SOCKS probe
-		// checkInterceptHealth performs cannot see it.
+		// The cache key covers file changes, not the passage of time. Revalidate
+		// the cached leaf against the wall clock even when both mtimes match, so an
+		// unchanged certificate cannot remain on the fast path after it expires.
 		if err := validateInterceptLeafValidity(s.certificate.Leaf, time.Now()); err == nil {
 			return s.certificate, nil
 		}

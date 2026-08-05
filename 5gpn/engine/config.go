@@ -1537,17 +1537,10 @@ func validateHostMappings(captureHosts []string, mappings []HostMapping) error {
 // validHostTarget accepts the three forms of a Loon [Host] target.
 //
 // Two of the three change where the interception engine dials. The address and
-// alias forms replace the SOCKS target for a captured host, which is what a
-// mapping is for.
-// The resolver form does not and cannot: it names nameservers for the 5gpn DNS
-// subsystem to query, not a destination, and the engine skips it everywhere a
-// mapping becomes a dial target (see HostMapping.resolverForm).
-//
-// This comment used to say the legacy sidecar acted on no mapping at all. It
-// did, and believing otherwise is what let the resolver form through to the dialler,
-// where "server:1.1.1.1" was written out as a SOCKS domain name and refused by
-// the egress terminator -- a mapping that was 100% broken while every surface
-// reported the extension healthy.
+// alias forms replace the engine dial target for a captured host, which is what
+// a mapping is for. The resolver form does not and cannot: it names nameservers
+// for the 5gpn DNS subsystem to query, not a destination, so the engine excludes
+// it wherever a mapping becomes a dial target (see HostMapping.resolverForm).
 //
 // The address form's scope refusal is duplicated rather than delegated, for the
 // same reason the gateway has it: a mapping is the one way an extension could
@@ -1571,12 +1564,11 @@ func validHostTarget(value string) bool {
 //
 // It is the one form the interception engine must not act on. The 5gpn DNS
 // subsystem dials those servers itself; the extension's egress never reaches
-// them, and substituting one as a dial target produces a SOCKS request for a
-// domain literally named
-// "server:1.1.1.1" -- which no egress binding names, so it is refused by the
-// interception listener's terminator before mihomo ever resolves anything. The
-// control plane already excludes the form for the same reason when it builds
-// egress selectors.
+// them. Substituting one as a dial target would pass a literal
+// "server:1.1.1.1" host to in-memory egress authorization, which has no
+// authorized target for it and refuses the request before any dial. The control
+// plane already excludes the form for the same reason when it builds egress
+// selectors.
 func (m HostMapping) resolverForm() bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(m.Target)), hostTargetServerPrefix)
 }

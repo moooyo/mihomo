@@ -46,7 +46,7 @@ type upstreamModuleProjection struct {
 	network  bool
 }
 
-// inboundUDPAuthorization is captured when a SOCKS UDP association starts.
+// inboundUDPAuthorization is captured when a datagram or QUIC association starts.
 // The snapshot preserves association authorization without retaining scripts.
 type inboundUDPAuthorization struct {
 	enabled     bool

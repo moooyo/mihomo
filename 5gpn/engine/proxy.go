@@ -70,9 +70,8 @@ const (
 	maxIdleUpstreamHTTPConnectionsPerHost = 8
 	maxUpstreamHTTP3Connections           = 64
 	upstreamHTTPIdleTimeout               = 90 * time.Second
-	// A handshake through the mihomo leg is the same order of work as the connect
-	// in front of it, which dialSOCKS5TCP already caps at 10s, and it is what
-	// net/http's own DefaultTransport allows.
+	// The in-process inner dial and the subsequent TLS handshake each use this
+	// ceiling, matching net/http's own DefaultTransport.
 	upstreamHandshakeTimeout = 10 * time.Second
 	// Time to first byte only: ResponseHeaderTimeout starts after the request
 	// body has been written, so a slow upload never starts this clock. 90s is the
@@ -182,14 +181,9 @@ func (r *tlsHandshakeErrorReporter) report(target, message string) {
 	}
 }
 
-// interceptStoreFile is the extensions' persistent store, kept in the same state
-// directory as the bundle store.
-//
-// It is a sibling of meta.json and pointer.json rather than a path of its own so
-// that moving the engine state directory moves all durable extension state at
-// once. Naming the directory twice is how an operator ends up with extension
-// state orphaned in the directory they thought they had moved away from, and
-// with two instances silently overwriting each other's store.json.
+// interceptStoreFile is the fixed name of the extensions' persistent store
+// inside the engine state directory. Keeping it relative to stateDir ensures
+// the selected state directory owns the complete storage path.
 const interceptStoreFile = "store.json"
 
 func newInterceptProxy(config *configStore, certificates *certificateStore, stateDir string) *interceptProxy {
@@ -516,17 +510,11 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleSOCKSConnection clears the SOCKS-phase deadline before the HTTP phase
-// begins, and MaxBytesReader bounds only bytes, so a downstream peer that stops
-// sending its request body or stops reading its response otherwise pins this
-// handler and its mihomo SOCKS connection for as long as it likes. Re-arming per
-// read and per write is what a flat ReadTimeout/WriteTimeout cannot do: a bound
-// large enough for a legitimate 64 MiB transfer over a slow link is no bound at
-// all, and a flat write deadline would truncate a long download.
-//
-// This is the shape the engine log socket already uses for its own frames, and
-// going through ResponseController covers all three servers: net/http applies it
-// to the connection, HTTP/2 and http3 to the one stream.
+// transferDeadlineBody and transferDeadlineWriter re-arm the stall deadline for
+// every I/O operation. MaxBytesReader bounds bytes, not time, while a flat
+// request deadline would truncate a large transfer that continues to make
+// progress. Per-operation deadlines stop a peer that stalls without penalizing
+// a slow but active transfer.
 type transferDeadlineBody struct {
 	io.ReadCloser
 	controller *http.ResponseController
@@ -940,9 +928,9 @@ func (p *interceptProxy) newHTTPTransportForProjectionOwner(projection upstreamT
 			if !permitted {
 				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
-			// dialSOCKS5TCP bounds only the connect. Without a deadline on the
-			// context its greeting, auth and CONNECT exchange with mihomo waits
-			// forever, and no transport timeout starts until it returns.
+			// dialUpstream enters mihomo through the in-process inner dialer. Bound
+			// its connect context so an unresponsive egress cannot hold transport
+			// setup indefinitely.
 			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
 			defer cancel()
 			return dialUpstream(dialCtx, target)

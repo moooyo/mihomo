@@ -731,12 +731,9 @@ func (r *scriptRuntime) savePersistent(snapshot *persistentSnapshot) error {
 	if err := os.Rename(tempPath, r.statePath); err != nil {
 		return err
 	}
-	// store.json is a sibling of meta.json and pointer.json, and bundleStore
-	// writes those with "atomic rename + fsync of file and directory". This one
-	// synced the file and skipped the directory, so the rename itself was not
-	// durable: a power cut could leave the directory entry naming the old inode,
-	// or a temp file that was then removed -- a storage.set that returned true to
-	// a script silently undone, or the whole store absent on the first write.
+	// store.json lives in the engine state directory. Syncing the temporary file
+	// makes its contents durable, but the parent directory must also be synced
+	// after rename so the new directory entry survives a power loss.
 	return syncDir(filepath.Dir(r.statePath))
 }
 
