@@ -54,12 +54,19 @@ type Config struct {
 	Origin string
 	// Certificate supplies the DoT leaf. Required when DoT is set.
 	Certificate CertificateSource
+	// Fatal receives an unexpected listener exit after a successful bind. The
+	// process owner decides how to terminate; keeping that decision out of this
+	// package makes the boundary deterministic to test without calling os.Exit.
+	Fatal func(error)
 }
 
 // Ingress holds the bound listeners.
 type Ingress struct {
-	mu      sync.Mutex
-	servers []*D.Server
+	mu       sync.Mutex
+	servers  []*D.Server
+	fatal    func(error)
+	stopping bool
+	serveWG  sync.WaitGroup
 }
 
 // Start binds every configured listener and begins serving.
@@ -67,9 +74,9 @@ type Ingress struct {
 // Binds are synchronous and a failure is returned, because the alternative has
 // exactly one outcome worth naming: a process that reports healthy -- systemd
 // active, watchdog fed -- while :853 is dead and every client on the network has
-// silently lost name resolution. Serve errors after a successful bind are logged
-// instead, since by then the socket is up and the caller has nothing useful to
-// decide.
+// silently lost name resolution. An unexpected Serve return after a successful
+// bind is reported through Fatal so the process owner can fail fast and let its
+// supervisor restore the complete gateway.
 func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 	if client == nil {
 		return errors.New("gpn/dns/ingress: no client handler")
@@ -80,6 +87,8 @@ func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 	if len(i.servers) > 0 {
 		return errors.New("gpn/dns/ingress: already started")
 	}
+	i.fatal = cfg.Fatal
+	i.stopping = false
 
 	if cfg.DoT != "" {
 		if cfg.Certificate == nil {
@@ -92,7 +101,10 @@ func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 		if err != nil {
 			return fmt.Errorf("gpn/dns/ingress: DoT listen %s: %w", cfg.DoT, err)
 		}
-		i.serve(&D.Server{Listener: ln, Handler: client}, "DoT "+cfg.DoT)
+		if err := i.serve(&D.Server{Listener: ln, Handler: client}, "DoT "+cfg.DoT, true); err != nil {
+			i.shutdownLocked()
+			return err
+		}
 	}
 
 	if cfg.Debug != "" {
@@ -102,10 +114,10 @@ func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 		}
 		pc, err := net.ListenPacket("udp", cfg.Debug)
 		if err != nil {
-			i.shutdownLocked()
-			return fmt.Errorf("gpn/dns/ingress: debug listen %s: %w", cfg.Debug, err)
+			log.Warnln("[GPN/DNS] optional debug UDP %s not bound: %v", cfg.Debug, err)
+		} else if err := i.serve(&D.Server{PacketConn: pc, Handler: client}, "debug UDP "+cfg.Debug, false); err != nil {
+			log.Warnln("[GPN/DNS] optional debug UDP %s not started: %v", cfg.Debug, err)
 		}
-		i.serve(&D.Server{PacketConn: pc, Handler: client}, "debug UDP "+cfg.Debug)
 	}
 
 	if cfg.Origin != "" {
@@ -122,7 +134,10 @@ func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 			i.shutdownLocked()
 			return fmt.Errorf("gpn/dns/ingress: origin listen %s: %w", cfg.Origin, err)
 		}
-		i.serve(&D.Server{PacketConn: pc, Handler: originHandler}, "origin UDP "+cfg.Origin)
+		if err := i.serve(&D.Server{PacketConn: pc, Handler: originHandler}, "origin UDP "+cfg.Origin, true); err != nil {
+			i.shutdownLocked()
+			return err
+		}
 		// TCP as well: mihomo retries over TCP when a reply comes back
 		// truncated, and a boundary that only speaks UDP turns a large answer
 		// into a resolution failure at the exact moment egress needs it.
@@ -131,27 +146,73 @@ func (i *Ingress) Start(cfg Config, client, originHandler D.Handler) error {
 			i.shutdownLocked()
 			return fmt.Errorf("gpn/dns/ingress: origin listen tcp %s: %w", cfg.Origin, err)
 		}
-		i.serve(&D.Server{Listener: ln, Handler: originHandler}, "origin TCP "+cfg.Origin)
+		if err := i.serve(&D.Server{Listener: ln, Handler: originHandler}, "origin TCP "+cfg.Origin, true); err != nil {
+			i.shutdownLocked()
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (i *Ingress) serve(srv *D.Server, what string) {
+func (i *Ingress) serve(srv *D.Server, what string, critical bool) error {
+	ready := make(chan struct{})
+	earlyExit := make(chan error, 1)
+	started := false
+	srv.NotifyStartedFunc = func() {
+		started = true
+		close(ready)
+	}
 	i.servers = append(i.servers, srv)
+	i.serveWG.Add(1)
 	go func() {
-		if err := srv.ActivateAndServe(); err != nil {
-			log.Errorln("[GPN/DNS] %s stopped: %v", what, err)
+		defer i.serveWG.Done()
+		err := srv.ActivateAndServe()
+		failure := ingressFailure(what, err)
+		if !started {
+			earlyExit <- failure
+			return
 		}
+
+		i.mu.Lock()
+		stopping, fatal := i.stopping, i.fatal
+		i.mu.Unlock()
+		if stopping {
+			return
+		}
+		if critical && fatal != nil {
+			fatal(failure)
+			return
+		}
+		log.Errorln("[GPN/DNS] %v", failure)
 	}()
+
+	select {
+	case <-ready:
+		return nil
+	case err := <-earlyExit:
+		return err
+	}
+}
+
+func ingressFailure(what string, err error) error {
+	if err == nil {
+		err = errors.New("Serve returned without an error")
+	}
+	return fmt.Errorf("gpn/dns/ingress: %s stopped: %w", what, err)
 }
 
 // Shutdown stops every listener, bounded by ctx.
 func (i *Ingress) Shutdown(ctx context.Context) {
+	i.PrepareShutdown()
+
 	i.mu.Lock()
-	defer i.mu.Unlock()
+	servers := append([]*D.Server(nil), i.servers...)
+	i.servers = nil
+	i.mu.Unlock()
+
 	var wg sync.WaitGroup
-	for _, srv := range i.servers {
+	for _, srv := range servers {
 		wg.Add(1)
 		go func(srv *D.Server) {
 			defer wg.Done()
@@ -159,13 +220,23 @@ func (i *Ingress) Shutdown(ctx context.Context) {
 		}(srv)
 	}
 	wg.Wait()
-	i.servers = nil
+}
+
+// PrepareShutdown withdraws the fatal-error boundary before an intentional
+// asynchronous drain begins. A relisten calls this synchronously after the new
+// listeners are ready, closing the scheduling window in which an old listener
+// could end normally and still be mistaken for a process-fatal failure.
+func (i *Ingress) PrepareShutdown() {
+	i.mu.Lock()
+	i.stopping = true
+	i.mu.Unlock()
 }
 
 // shutdownLocked closes what is already bound when a later bind fails. Callers
 // hold i.mu. Without it a partial Start leaves a listener serving behind an
 // error the caller is about to treat as "nothing came up".
 func (i *Ingress) shutdownLocked() {
+	i.stopping = true
 	for _, srv := range i.servers {
 		_ = srv.Shutdown()
 	}

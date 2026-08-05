@@ -9,6 +9,7 @@ package gpn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"sync/atomic"
@@ -41,7 +42,10 @@ var (
 // listeners, resolvers and the rule tree on every reload, and an engine that
 // came and went with it would drop every captured session whenever an operator
 // changed an unrelated proxy.
-func Start(home string) error {
+func Start(home string, onFatal func(error)) error {
+	if onFatal == nil {
+		return errors.New("gpn: a fatal error handler is required")
+	}
 	dir, err := state.Dir(home)
 	if err != nil {
 		return err
@@ -71,7 +75,7 @@ func Start(home string) error {
 	// document it cannot parse is fatal, since starting with an empty policy
 	// would resolve names the operator meant to block and steer nothing they
 	// meant to steer.
-	svc, err := dns.Open(dir)
+	svc, err := dns.Open(dir, dns.WithFatalHandler(onFatal), dns.WithRequiredListeners())
 	if err != nil {
 		return err
 	}
@@ -94,12 +98,15 @@ func Start(home string) error {
 		return svc.Resolver().OriginResolve(ctx, host)
 	}))
 
-	// Binding is a separate outcome. A gateway whose certificate has not been
-	// issued yet must still come up, serve its API and let an operator finish
-	// the bootstrap -- refusing to start would leave them with no surface on
-	// which to fix the thing that stopped it.
+	// Binding is part of the required DNS boundary. Continuing with any of these
+	// sockets absent would leave systemd reporting a healthy gateway while
+	// clients have no resolver, so fail startup and let the service supervisor
+	// retry the complete monolith.
 	if err := svc.Listen(); err != nil {
-		log.Warnln("[GPN/DNS] listeners not bound: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		svc.Shutdown(ctx)
+		cancel()
+		return fmt.Errorf("gpn: start DNS listeners: %w", err)
 	}
 
 	// The interception engine comes up from a document beside the resolver's.
@@ -112,7 +119,7 @@ func Start(home string) error {
 		log.Warnln("[GPN] interception document unavailable: %v", err)
 		return nil
 	}
-	if err := StartInterception(interceptPath); err != nil {
+	if err := StartInterception(interceptPath, onFatal); err != nil {
 		log.Warnln("[GPN] interception engine not installed: %v", err)
 	}
 
@@ -247,7 +254,7 @@ func StateDir() string {
 // SAN set no longer covers the enabled capture hosts, must leave a working
 // gateway rather than refusing to boot. The error is returned for the caller to
 // log; it is not fatal.
-func StartInterception(configPath string) error {
+func StartInterception(configPath string, onFatal func(error)) error {
 	// Withdrawing first means every early return below leaves the feature
 	// unadvertised. Advertising a subsystem that failed to come up would have
 	// the client render a panel over an engine that is not there, which is a
@@ -276,6 +283,7 @@ func StartInterception(configPath string) error {
 		// the gateway intercepting hosts the current document no longer names.
 		return err
 	}
+	e.SetFatalHandler(onFatal)
 	e.SetEgressGroupSource(tunnel.IsEgressProxy, tunnel.EgressProxies)
 	e.SetClientBoundarySource(tunnel.ClientPolicyBoundaryReady)
 	if svc := dnsRef.Load(); svc != nil {

@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,31 @@ import (
 
 	D "github.com/miekg/dns"
 )
+
+func waitForServeExit(t *testing.T, ing *Ingress) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		ing.serveWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DNS Serve did not return")
+	}
+}
+
+func freeUDPAddr(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve UDP port: %v", err)
+	}
+	addr := pc.LocalAddr().String()
+	_ = pc.Close()
+	return addr
+}
 
 func leaf(t *testing.T) *tls.Certificate {
 	t.Helper()
@@ -102,6 +128,83 @@ func TestDoTServesQueries(t *testing.T) {
 		}
 	default:
 		t.Error("handler never saw the query")
+	}
+}
+
+func TestUnexpectedServeExitReportsFatal(t *testing.T) {
+	failures := make(chan error, 1)
+	ing := &Ingress{}
+	cert := leaf(t)
+	if err := ing.Start(Config{
+		DoT:         "127.0.0.1:0",
+		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		Fatal: func(err error) {
+			failures <- err
+		},
+	}, &answering{seen: make(chan string, 1)}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Closing the bound socket behind Ingress simulates the kernel-facing
+	// listener disappearing without going through an intentional Shutdown.
+	if err := ing.servers[0].Listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	select {
+	case err := <-failures:
+		if !strings.Contains(err.Error(), "DoT") || !strings.Contains(err.Error(), "stopped") {
+			t.Fatalf("fatal error = %q", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unexpected listener exit was not reported")
+	}
+	waitForServeExit(t, ing)
+	ing.Shutdown(context.Background())
+}
+
+func TestDebugServeExitDoesNotReportFatal(t *testing.T) {
+	failures := make(chan error, 1)
+	ing := &Ingress{}
+	if err := ing.Start(Config{
+		Debug: freeUDPAddr(t),
+		Fatal: func(err error) {
+			failures <- err
+		},
+	}, &answering{seen: make(chan string, 1)}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := ing.servers[0].PacketConn.Close(); err != nil {
+		t.Fatalf("close debug listener: %v", err)
+	}
+	waitForServeExit(t, ing)
+	select {
+	case err := <-failures:
+		t.Fatalf("optional debug listener reported a fatal error: %v", err)
+	default:
+	}
+	ing.Shutdown(context.Background())
+}
+
+func TestIntentionalShutdownDoesNotReportFatal(t *testing.T) {
+	failures := make(chan error, 1)
+	ing := &Ingress{}
+	cert := leaf(t)
+	if err := ing.Start(Config{
+		DoT:         "127.0.0.1:0",
+		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		Fatal: func(err error) {
+			failures <- err
+		},
+	}, &answering{seen: make(chan string, 1)}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ing.Shutdown(context.Background())
+	waitForServeExit(t, ing)
+	select {
+	case err := <-failures:
+		t.Fatalf("intentional Shutdown reported a fatal error: %v", err)
+	default:
 	}
 }
 

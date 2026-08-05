@@ -212,9 +212,13 @@ func (r *Resolver) SetPolicy(p Policy, cacheDir string) error {
 	if err != nil {
 		return err
 	}
+	r.setCompiledPolicy(compiled)
+	return nil
+}
+
+func (r *Resolver) setCompiledPolicy(compiled *compiledPolicy) {
 	r.policy.Store(compiled)
 	r.cache.Flush()
-	return nil
 }
 
 // SetUpstreams rebuilds both groups and retires the previous pair.

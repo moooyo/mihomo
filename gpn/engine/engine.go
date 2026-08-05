@@ -65,6 +65,15 @@ func New(configPath, stateDir string) (*Engine, error) {
 // Interceptor returns the capture stage to install via tunnel.SetInterceptor.
 func (e *Engine) Interceptor() C.Interceptor { return e.interceptor }
 
+// SetFatalHandler installs the one process-owner boundary for unexpected Go
+// panics that escape the script exception and timeout containment. It is set
+// before the interceptor is published and is never changed afterward.
+func (e *Engine) SetFatalHandler(handler func(error)) {
+	if e != nil && e.proxy != nil {
+		e.proxy.fatal = handler
+	}
+}
+
 // Reload re-reads the interception document.
 //
 // The document is the operator's, written by the API, and the engine picks up

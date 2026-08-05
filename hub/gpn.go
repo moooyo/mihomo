@@ -15,7 +15,10 @@ import (
 // from the executor would close that loop. hub is imported only by main, so it
 // is the one place in the startup path with no cycle.
 
-var gpnOnce sync.Once
+var (
+	gpnOnce     sync.Once
+	gpnStartErr error
+)
 
 // startGPN installs the 5gpn subsystems exactly once, before listeners accept.
 //
@@ -23,14 +26,17 @@ var gpnOnce sync.Once
 // must not be rebuilt with the listeners and resolvers around it -- an operator
 // editing an unrelated proxy would otherwise drop every captured session.
 //
-// Failures are logged, not returned. Everything here is optional relative to
-// forwarding: a gateway that cannot read its interception document should still
-// resolve and forward, and refusing to boot over it turns a degraded subsystem
-// into an outage.
-func startGPN() {
+// DNS is not optional: starting the forwarding plane while the client or origin
+// DNS boundary is absent creates an active-looking gateway that cannot carry
+// traffic. Startup errors therefore return through hub.Parse. A listener that
+// dies later reports through the injected callback and terminates at this one
+// process-owner boundary; plugin, interception, and bot errors remain locally
+// isolated inside gpn.Start.
+func startGPN() error {
 	gpnOnce.Do(func() {
-		if err := gpn.Start(C.Path.HomeDir()); err != nil {
-			log.Errorln("[GPN] start failed, 5gpn features are unavailable: %v", err)
-		}
+		gpnStartErr = gpn.Start(C.Path.HomeDir(), func(err error) {
+			log.Fatalln("[GPN] fatal runtime failure: %v", err)
+		})
 	})
+	return gpnStartErr
 }

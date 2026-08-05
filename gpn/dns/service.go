@@ -160,22 +160,57 @@ func (d Document) Validate() error {
 // Service owns the DNS document, the resolver it configures, and the listeners
 // that serve it.
 type Service struct {
-	doc      *state.Doc[Document]
-	resolver *Resolver
-	ing      *ingress.Ingress
-	certs    *certSource
-	rulesDir string
+	doc                      *state.Doc[Document]
+	resolver                 *Resolver
+	ing                      *ingress.Ingress
+	rulesDir                 string
+	fatal                    func(error)
+	requireCriticalListeners bool
 
 	mu    sync.Mutex
 	bound Listen
+	// updateMu keeps the durable document and its runtime projection in one
+	// order. state.Doc serializes writes, but releases its lock after the rename;
+	// without this outer lock a later revision could publish before an earlier
+	// writer resumes and installs stale runtime state.
+	updateMu sync.Mutex
 
 	subs *subscriptions
+}
+
+type preparedDocument struct {
+	policy       *compiledPolicy
+	china, trust []MemberSpec
+	ecs          netip.Prefix
+	gateway      netip.Addr
+}
+
+// Option configures process-level integration without putting process control
+// inside the DNS packages.
+type Option func(*Service)
+
+// WithFatalHandler reports an unexpected listener exit after a successful
+// bind. The owner normally terminates the monolith so its supervisor can
+// restart the complete failure domain.
+func WithFatalHandler(handler func(error)) Option {
+	return func(s *Service) {
+		s.fatal = handler
+	}
+}
+
+// WithRequiredListeners applies the product boundary: the monolith must never
+// report healthy without both client DoT and the loopback origin resolver.
+// Lower-level resolver tests may omit them by leaving this option unset.
+func WithRequiredListeners() Option {
+	return func(s *Service) {
+		s.requireCriticalListeners = true
+	}
 }
 
 // Open loads the document and builds a configured resolver. It does not bind
 // anything; Listen does that, so a bind failure is a separate outcome from an
 // unusable document.
-func Open(stateDir string) (*Service, error) {
+func Open(stateDir string, options ...Option) (*Service, error) {
 	doc, err := state.New(filepath.Join(stateDir, "dns.json"), DefaultDocument())
 	if err != nil {
 		return nil, err
@@ -223,12 +258,19 @@ func Open(stateDir string) (*Service, error) {
 			MaxInflight: tuning.MaxInflight,
 		}),
 		ing:      &ingress.Ingress{},
-		certs:    &certSource{},
 		rulesDir: rulesDir,
 	}
-	if err := s.apply(current); err != nil {
+	for _, option := range options {
+		option(s)
+	}
+	if err := s.validateRequiredListeners(current.Listen); err != nil {
 		return nil, err
 	}
+	prepared, err := prepareDocument(current, rulesDir)
+	if err != nil {
+		return nil, err
+	}
+	s.publish(current, prepared)
 	s.subs = newSubscriptions(s)
 	return s, nil
 }
@@ -253,6 +295,10 @@ func (s *Service) Document() (Document, string) {
 // is refused, which is what stops two console tabs from silently overwriting
 // each other.
 func (s *Service) Update(revision string, mutate func(Document) (Document, error)) (Document, string, error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	var prepared *preparedDocument
 	snap, err := s.doc.Update(revision, func(current Document) (Document, error) {
 		next, err := mutate(current)
 		if err != nil {
@@ -261,7 +307,16 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 		// Group before validating, so what is checked is what will be stored
 		// and what will run.
 		next.Policy = next.Policy.ordered()
-		if err := next.Validate(); err != nil {
+		// Listener and certificate paths are installation-owned. Binding a
+		// complete replacement while the unchanged critical sockets are live is
+		// impossible without socket activation, and persisting before a bind
+		// succeeds can turn one rejected API write into a permanent restart loop.
+		// Whole-document clients therefore round-trip this section unchanged.
+		if next.Listen != current.Listen && s.bound != (Listen{}) {
+			return current, fmt.Errorf("%w: listener settings are installation-owned", ErrInvalidPolicy)
+		}
+		prepared, err = prepareDocument(next, s.rulesDir)
+		if err != nil {
 			return current, err
 		}
 		return next, nil
@@ -269,47 +324,59 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 	if err != nil {
 		return snap.Value, snap.Revision, err
 	}
-	if err := s.apply(snap.Value); err != nil {
-		return snap.Value, snap.Revision, err
-	}
-	// A listener change needs a rebind; everything else is already live.
-	if err := s.relisten(snap.Value.Listen); err != nil {
-		return snap.Value, snap.Revision, err
-	}
+	s.publish(snap.Value, prepared)
 	s.subs.wakeUp()
 	return snap.Value, snap.Revision, nil
 }
 
-// apply pushes a validated document into the running resolver.
-func (s *Service) apply(d Document) error {
-	china, err := ParseMembers("china", d.Upstreams.China)
+func (s *Service) refreshCompiledPolicy() error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	document, _ := s.Document()
+	compiled, err := compile(document.Policy, s.rulesDir)
 	if err != nil {
 		return err
+	}
+	s.resolver.setCompiledPolicy(compiled)
+	return nil
+}
+
+func prepareDocument(d Document, rulesDir string) (*preparedDocument, error) {
+	if err := d.Validate(); err != nil {
+		return nil, err
+	}
+	china, err := ParseMembers("china", d.Upstreams.China)
+	if err != nil {
+		return nil, err
 	}
 	trust, err := ParseMembers("trust", d.Upstreams.Trust)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ecs, err := parseECS(d.Upstreams.ECS)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := s.resolver.SetPolicy(d.Policy, s.rulesDir); err != nil {
-		return err
+	policy, err := compile(d.Policy, rulesDir)
+	if err != nil {
+		return nil, err
 	}
-	s.resolver.SetUpstreams(china, trust, ecs)
-	s.resolver.SetLocalNames(d.LocalNames)
 
 	gateway := netip.Addr{}
 	if g := strings.TrimSpace(d.Gateway); g != "" {
-		if addr, err := netip.ParseAddr(g); err == nil {
-			gateway = addr
-		}
+		gateway, _ = netip.ParseAddr(g)
 	}
-	s.resolver.SetGateway(gateway)
+	return &preparedDocument{policy: policy, china: china, trust: trust, ecs: ecs, gateway: gateway}, nil
+}
 
-	s.certs.set(d.Listen.Certificate, d.Listen.PrivateKey)
-	return nil
+// publish applies only objects that were completely prepared before the state
+// document became durable. It cannot fail, so a successful revision can never
+// describe runtime state the resolver refused to install.
+func (s *Service) publish(d Document, prepared *preparedDocument) {
+	s.resolver.setCompiledPolicy(prepared.policy)
+	s.resolver.SetUpstreams(prepared.china, prepared.trust, prepared.ecs)
+	s.resolver.SetLocalNames(d.LocalNames)
+	s.resolver.SetGateway(prepared.gateway)
 }
 
 // Listen binds the configured listeners.
@@ -330,22 +397,52 @@ func (s *Service) relisten(want Listen) error {
 		return nil
 	}
 
-	next := &ingress.Ingress{}
-	cfg := ingress.Config{DoT: want.DoT, Debug: want.Debug, Origin: want.Origin}
-	if want.DoT != "" {
-		if want.Certificate == "" || want.PrivateKey == "" {
-			return errors.New("gpn/dns: the DoT listener needs a certificate and private key")
-		}
-		if _, err := s.certs.load(); err != nil {
-			return err
-		}
-		cfg.Certificate = s.certs.get
-	}
-	if err := next.Start(cfg, s.resolver, s.resolver.Origin()); err != nil {
+	next, err := s.startIngress(want)
+	if err != nil {
 		return err
 	}
+	s.publishIngressLocked(next, want)
+	return nil
+}
 
+func (s *Service) startIngress(want Listen) (*ingress.Ingress, error) {
+	if err := s.validateRequiredListeners(want); err != nil {
+		return nil, err
+	}
+	next := &ingress.Ingress{}
+	cfg := ingress.Config{DoT: want.DoT, Debug: want.Debug, Origin: want.Origin, Fatal: s.fatal}
+	if want.DoT != "" {
+		if want.Certificate == "" || want.PrivateKey == "" {
+			return nil, errors.New("gpn/dns: the DoT listener needs a certificate and private key")
+		}
+		certs := &certSource{}
+		certs.set(want.Certificate, want.PrivateKey)
+		if _, err := certs.load(); err != nil {
+			return nil, err
+		}
+		cfg.Certificate = certs.get
+	}
+	if err := next.Start(cfg, s.resolver, s.resolver.Origin()); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func (s *Service) validateRequiredListeners(want Listen) error {
+	if !s.requireCriticalListeners {
+		return nil
+	}
+	if strings.TrimSpace(want.DoT) == "" || strings.TrimSpace(want.Origin) == "" {
+		return errors.New("gpn/dns: both DoT and origin listeners are required")
+	}
+	return nil
+}
+
+func (s *Service) publishIngressLocked(next *ingress.Ingress, want Listen) {
 	previous := s.ing
+	if previous != nil {
+		previous.PrepareShutdown()
+	}
 	s.ing = next
 	s.bound = want
 	if previous != nil {
@@ -359,7 +456,6 @@ func (s *Service) relisten(want Listen) error {
 		}()
 	}
 	log.Infoln("[GPN/DNS] listening: DoT %q debug %q origin %q", want.DoT, want.Debug, want.Origin)
-	return nil
 }
 
 // Subscriptions reports every subscription rule's last fetch.

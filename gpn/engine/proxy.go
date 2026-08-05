@@ -33,6 +33,7 @@ type interceptProxy struct {
 	// too, or its capacity and transformation reports go nowhere.
 	logs       engineLogPublisher
 	bodyBudget *moduleBodyBudget
+	fatal      func(error)
 
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
@@ -208,7 +209,7 @@ func (p *interceptProxy) setEngineLogPublisher(logs engineLogPublisher) {
 func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
-		Handler:           p,
+		Handler:           p.failFastHandler(),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
@@ -231,7 +232,7 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 	}
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
-		Handler:           p,
+		Handler:           p.failFastHandler(),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
@@ -243,6 +244,35 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 		return nil
 	}
 	return err
+}
+
+type failFastInterceptHandler struct {
+	next  http.Handler
+	fatal func(error)
+}
+
+func (p *interceptProxy) failFastHandler() http.Handler {
+	return failFastInterceptHandler{next: p, fatal: p.fatal}
+}
+
+func (h failFastInterceptHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		if recovered == http.ErrAbortHandler {
+			panic(recovered)
+		}
+		failure := fmt.Errorf("gpn/engine: unexpected HTTP handler panic: %v", recovered)
+		if h.fatal != nil {
+			h.fatal(failure)
+		}
+		// The production fatal handler terminates the process. Re-panic if an
+		// injected test handler returns so net/http still aborts this request.
+		panic(recovered)
+	}()
+	h.next.ServeHTTP(w, r)
 }
 
 // mitmTLSConfig builds this connection's client-facing TLS config from keys the

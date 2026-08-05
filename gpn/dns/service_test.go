@@ -1,10 +1,12 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,13 +34,22 @@ import (
 // project is routine.
 func freePort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+	for attempt := 0; attempt < 20; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve TCP port: %v", err)
+		}
+		addr := ln.Addr().String()
+		pc, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			_ = pc.Close()
+			_ = ln.Close()
+			return addr
+		}
+		_ = ln.Close()
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatal("could not find a port free for both TCP and UDP")
+	return ""
 }
 
 // upstreamServer is a real DNS server standing in for a configured upstream.
@@ -241,6 +252,95 @@ func TestOnlyAListenerChangeRebinds(t *testing.T) {
 	// comparison is standing in for.
 	if reply := askOverWire(t, clientAddr, "www.corp.example", D.TypeA); reply.Rcode != D.RcodeSuccess {
 		t.Errorf("listener stopped answering after an unrelated edit: %s", D.RcodeToString[reply.Rcode])
+	}
+}
+
+func TestListenerChangeDoesNotPublishDocument(t *testing.T) {
+	upstream := upstreamServer(t, "192.0.2.95")
+	svc, clientAddr, _ := startService(t, upstream)
+
+	beforeDocument, beforeRevision := svc.Document()
+	documentPath := filepath.Join(filepath.Dir(svc.rulesDir), "dns.json")
+	beforeBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document before update: %v", err)
+	}
+
+	_, returnedRevision, err := svc.Update(beforeRevision, func(d Document) (Document, error) {
+		d.Listen.Debug = freePort(t)
+		d.Listen.Origin = ""
+		return d, nil
+	})
+	if err == nil {
+		t.Fatal("listener update changed installation-owned settings")
+	}
+	if !strings.Contains(err.Error(), "listener settings are installation-owned") {
+		t.Fatalf("listener update error = %q", err)
+	}
+	if returnedRevision != beforeRevision {
+		t.Fatalf("returned revision = %q, want %q", returnedRevision, beforeRevision)
+	}
+	afterDocument, afterRevision := svc.Document()
+	if afterRevision != beforeRevision {
+		t.Fatalf("live revision moved from %q to %q", beforeRevision, afterRevision)
+	}
+	if afterDocument.Listen != beforeDocument.Listen {
+		t.Fatalf("live listeners changed from %+v to %+v", beforeDocument.Listen, afterDocument.Listen)
+	}
+	afterBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document after update: %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatal("failed listener update changed the persisted document")
+	}
+	if reply := askOverWire(t, clientAddr, "www.corp.example", D.TypeA); reply.Rcode != D.RcodeSuccess {
+		t.Fatalf("old listener stopped after rejected update: %s", D.RcodeToString[reply.Rcode])
+	}
+}
+
+func TestPolicyPreparationFailureDoesNotPublishDocument(t *testing.T) {
+	upstream := upstreamServer(t, "192.0.2.96")
+	svc, clientAddr, _ := startService(t, upstream)
+
+	cachePath := subscriptionCachePath(svc.rulesDir, "unreadable-cache")
+	if err := os.Mkdir(cachePath, 0o700); err != nil {
+		t.Fatalf("create unreadable cache stand-in: %v", err)
+	}
+	documentPath := filepath.Join(filepath.Dir(svc.rulesDir), "dns.json")
+	beforeBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document before update: %v", err)
+	}
+	_, beforeRevision := svc.Document()
+
+	_, returnedRevision, err := svc.Update(beforeRevision, func(d Document) (Document, error) {
+		d.Policy.Rules = append(d.Policy.Rules, Rule{
+			ID: "unreadable-cache", Kind: KindSubscription,
+			Value: "https://lists.example.test/rules.txt", Intent: IntentBlock, Enabled: true,
+			Format: "plain", IntervalSeconds: 3600,
+		})
+		return d, nil
+	})
+	if err == nil {
+		t.Fatal("policy update accepted an unreadable subscription cache")
+	}
+	if returnedRevision != beforeRevision {
+		t.Fatalf("returned revision = %q, want %q", returnedRevision, beforeRevision)
+	}
+	_, afterRevision := svc.Document()
+	if afterRevision != beforeRevision {
+		t.Fatalf("live revision moved from %q to %q", beforeRevision, afterRevision)
+	}
+	afterBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document after update: %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatal("failed policy preparation changed the persisted document")
+	}
+	if reply := askOverWire(t, clientAddr, "www.corp.example", D.TypeA); reply.Rcode != D.RcodeSuccess {
+		t.Fatalf("resolver stopped after rejected policy: %s", D.RcodeToString[reply.Rcode])
 	}
 }
 

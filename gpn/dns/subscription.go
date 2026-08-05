@@ -144,7 +144,7 @@ func (s *subscriptions) refreshDue() {
 	}
 	// One recompile for the whole round. Recompiling per rule would rebuild
 	// every other rule's matcher for each list that landed.
-	if err := s.svc.resolver.SetPolicy(doc.Policy, s.svc.rulesDir); err != nil {
+	if err := s.svc.refreshCompiledPolicy(); err != nil {
 		log.Errorln("[GPN/DNS] policy recompile after subscription refresh: %v", err)
 	}
 }
