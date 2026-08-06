@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 
+	fivegpn "github.com/metacubex/mihomo/5gpn"
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/generator"
@@ -97,6 +98,11 @@ func main() {
 	}
 
 	_, _ = maxprocs.Set(maxprocs.Logger(func(string, ...any) {}))
+
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-nodes" {
+		fivegpn.NodesMain(os.Args[2:])
+		return
+	}
 
 	if len(os.Args) > 1 && os.Args[1] == "convert-ruleset" {
 		provider.ConvertMain(os.Args[2:])
