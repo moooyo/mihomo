@@ -70,7 +70,7 @@ func catalogIndexJSON(t *testing.T, capabilities string, digest string) string {
       "tags": ["testing"],
       "license": {"spdx": "MIT"},
       "manifest": {"url": %q, "sha256": %q, "size": 1234},
-      "resources": [{"path": "a.js", "url": "https://catalog.example.com/a.js", "sha256": "00", "size": 1}],
+      "resources": [],
       "policy": {"clientRules": 4, "policyRules": 0, "captureRules": 4, "digest": "beef"},
       "capabilities": %s
     }
@@ -91,8 +91,7 @@ const honestCapabilities = `{
       }`
 
 // The published index carries fields this build does not use -- a `policy`
-// projection of the retired overlay compiler, and per-resource digests the
-// importer computes for itself. Rejecting unknown fields is what made the
+// projection of the retired overlay compiler. Rejecting unknown fields is what made the
 // previous implementation refuse whole catalogs whenever a publisher added
 // something for a newer core, so the decode ignores them.
 func TestACatalogWithFieldsThisBuildDoesNotUseStillDecodes(t *testing.T) {
@@ -121,10 +120,11 @@ func TestUnusableEntriesAreDroppedRatherThanFailingTheCatalog(t *testing.T) {
   "kind": "ExtensionMarketplace",
   "metadata": {"id": "io.5gpn.official"},
   "entries": [
-    {"id": "Bad Id", "manifest": {"url": "https://catalog.example.com/a.yaml", "sha256": "aa"}},
-    {"id": "insecure.plugin", "manifest": {"url": "http://catalog.example.com/b.yaml", "sha256": "bb"}},
-    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/c.yaml", "sha256": "cc"}},
-    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/d.yaml", "sha256": "dd"}}
+    {"id": "Bad Id", "manifest": {"url": "https://catalog.example.com/a.yaml", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"id": "insecure.plugin", "manifest": {"url": "http://catalog.example.com/b.yaml", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+    {"id": "short-digest.plugin", "manifest": {"url": "https://catalog.example.com/short.yaml", "sha256": "cc"}},
+    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/c.yaml", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
+    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/d.yaml", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
   ]
 }`
 	imp := stubImporter(t, stubFetch{catalogIndexURL: index})
@@ -190,6 +190,131 @@ func TestAnHonestCatalogEntryReviewsLikeAPastedURL(t *testing.T) {
 	}
 }
 
+func TestCatalogProjectsWhetherTheInstalledManifestIsCurrent(t *testing.T) {
+	const oldURL = "https://elsewhere.example.com/example.yaml"
+
+	for _, test := range []struct {
+		name             string
+		installedBody    string
+		wantCurrent      bool
+		wantInstalledVer string
+	}{
+		{
+			name:             "matching version and manifest",
+			installedBody:    validManifest,
+			wantCurrent:      true,
+			wantInstalledVer: "1.2.0",
+		},
+		{
+			name: "same version with different manifest bytes",
+			installedBody: strings.Replace(
+				validManifest,
+				"description: A test extension",
+				"description: An older test extension",
+				1,
+			),
+			wantCurrent:      false,
+			wantInstalledVer: "1.2.0",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stubImporter(t, stubFetch{
+				catalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+				oldURL:          test.installedBody,
+			})
+			e := catalogTestEngine(t)
+			installFromCatalog(t, e, oldURL)
+
+			view, _, err := e.CatalogWithRevision(context.Background(), false)
+			if err != nil {
+				t.Fatalf("CatalogWithRevision: %v", err)
+			}
+			if len(view.Sources) != 1 || len(view.Sources[0].Entries) != 1 {
+				t.Fatalf("catalog view = %+v", view)
+			}
+			entry := view.Sources[0].Entries[0]
+			if entry.InstalledVersion != test.wantInstalledVer || entry.InstalledCurrent != test.wantCurrent {
+				t.Fatalf("installed version %q current %v, want %q current %v",
+					entry.InstalledVersion, entry.InstalledCurrent, test.wantInstalledVer, test.wantCurrent)
+			}
+		})
+	}
+}
+
+func TestCatalogCurrentIncludesEveryExternalScriptDigest(t *testing.T) {
+	manifestDigest := strings.Repeat("a", 64)
+	scriptDigest := strings.Repeat("b", 64)
+	entry := CatalogEntry{
+		ID: "example.plugin", Version: "1.2.0",
+		Manifest:  CatalogResource{SHA256: manifestDigest},
+		Resources: []CatalogResource{{URL: "https://scripts.example.com/action.js", SHA256: scriptDigest}},
+	}
+	module := Module{
+		ID: "example.plugin", Version: "1.2.0", Source: ModuleSource{Digest: manifestDigest},
+		Scripts: []ScriptRule{{ScriptURL: "https://scripts.example.com/action.js", ScriptDigest: scriptDigest}},
+	}
+	if !catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
+		t.Fatal("matching manifest and external script digests were not current")
+	}
+
+	module.Scripts[0].ScriptDigest = strings.Repeat("c", 64)
+	if catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
+		t.Fatal("a changed external script was reported current")
+	}
+	module.Scripts = nil
+	if catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
+		t.Fatal("a missing external script was reported current")
+	}
+}
+
+func TestCatalogReviewRefusesAnExternalScriptDigestMismatch(t *testing.T) {
+	manifestDigest := strings.Repeat("a", 64)
+	entry := CatalogEntry{
+		ID: "example.plugin", Version: "1.2.0",
+		Manifest:  CatalogResource{URL: catalogManifestURL, SHA256: manifestDigest},
+		Resources: []CatalogResource{{URL: "https://scripts.example.com/action.js", SHA256: strings.Repeat("b", 64)}},
+	}
+	module := Module{
+		ID: "example.plugin", Version: "1.2.0", Source: ModuleSource{Digest: manifestDigest},
+		Scripts: []ScriptRule{{ScriptURL: "https://scripts.example.com/action.js", ScriptDigest: strings.Repeat("c", 64)}},
+	}
+	err := (&Engine{}).verifyAgainstEntry(entry, Candidate{Detail: detailOf(module), module: &module})
+	if err == nil {
+		t.Fatal("a catalog review accepted different external script bytes")
+	}
+	if !strings.Contains(err.Error(), "external script digests") {
+		t.Fatalf("the refusal does not name the resource drift: %v", err)
+	}
+}
+
+func TestCatalogReviewFetchesAndVerifiesExternalScriptResources(t *testing.T) {
+	const scriptURL = "https://scripts.example.com/action.js"
+	const scriptBody = "function transform(context) { return {}; }"
+	externalManifest := strings.Replace(
+		validManifest,
+		`inline: "function transform(context) { return {}; }"`,
+		"source: "+scriptURL,
+		1,
+	)
+	if externalManifest == validManifest {
+		t.Fatal("the fixture did not replace the inline script")
+	}
+	index := catalogIndexJSON(t, honestCapabilities, digestText(externalManifest))
+	index = strings.Replace(index, `"resources": []`, fmt.Sprintf(
+		`"resources": [{"path":"action.js","url":%q,"sha256":%q,"size":%d}]`,
+		scriptURL, digestText(scriptBody), len(scriptBody)), 1)
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    index,
+		catalogManifestURL: externalManifest,
+		scriptURL:          scriptBody,
+	})
+	e := catalogTestEngine(t)
+
+	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err != nil {
+		t.Fatalf("matching external script resource was refused: %v", err)
+	}
+}
+
 // A catalog that advertises something milder than the manifest declares is the
 // case this check exists for: the operator reads the listing, and the listing is
 // what they believe they are confirming.
@@ -225,6 +350,23 @@ func TestAnEntryWhoseDigestDoesNotMatchIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "digest") {
 		t.Errorf("the refusal does not name the digest: %v", err)
+	}
+}
+
+func TestAnEntryWhoseVersionDoesNotMatchIsRefused(t *testing.T) {
+	index := strings.Replace(catalogIndexJSON(t, honestCapabilities, ""), `"version": "1.2.0"`, `"version": "9.9.9"`, 1)
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    index,
+		catalogManifestURL: validManifest,
+	})
+	e := catalogTestEngine(t)
+
+	_, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	if err == nil {
+		t.Fatal("a catalog version that does not match the manifest was reviewed")
+	}
+	if !strings.Contains(err.Error(), "version") {
+		t.Errorf("the refusal does not name the version drift: %v", err)
 	}
 }
 

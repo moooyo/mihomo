@@ -91,6 +91,7 @@ type CatalogMetadata struct {
 
 // CatalogResource is a fetchable artefact with its digest.
 type CatalogResource struct {
+	Path   string `json:"path,omitempty"`
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size,omitempty"`
@@ -132,12 +133,18 @@ type CatalogEntry struct {
 	License          CatalogLicense      `json:"license,omitempty"`
 	DocumentationURL string              `json:"documentationUrl,omitempty"`
 	Manifest         CatalogResource     `json:"manifest"`
+	Resources        []CatalogResource   `json:"resources,omitempty"`
 	Capabilities     CatalogCapabilities `json:"capabilities"`
 
 	// InstalledVersion is filled in by this gateway, not by the index: it is
 	// what is installed under this id here, empty when nothing is. It lets the
 	// listing say "2.1.0 installed, 2.2.0 available" without a second read.
 	InstalledVersion string `json:"installed_version,omitempty"`
+	// InstalledCurrent is true only when the publisher version, manifest bytes,
+	// and every external script URL/digest installed on this gateway match this
+	// catalog entry. It is a listing status, not a substitute for the full
+	// SnapshotDigest review that still runs before every apply.
+	InstalledCurrent bool `json:"installed_current,omitempty"`
 }
 
 // catalogIndex is the wire shape. It is decoded leniently -- unknown fields are
@@ -196,9 +203,13 @@ func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (Catalog
 	if err != nil {
 		return CatalogView{}, "", err
 	}
-	installed := make(map[string]string, len(committed.Config.Modules))
+	type installedIdentity struct {
+		version        string
+		manifestDigest string
+	}
+	installed := make(map[string]installedIdentity, len(committed.Config.Modules))
 	for _, m := range committed.Config.Modules {
-		installed[m.ID] = m.Version
+		installed[m.ID] = installedIdentity{version: m.Version, manifestDigest: m.Source.Digest}
 	}
 
 	view := CatalogView{Sources: make([]CatalogSourceView, 0, len(committed.Config.Catalogs))}
@@ -220,12 +231,66 @@ func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (Catalog
 		rendered.Metadata = index.Metadata
 		rendered.FetchedAt = fetchedAt.UTC().Format(time.RFC3339)
 		for _, entry := range index.Entries {
-			entry.InstalledVersion = installed[entry.ID]
+			if identity, ok := installed[entry.ID]; ok {
+				entry.InstalledVersion = identity.version
+				entry.InstalledCurrent = catalogEntryMatchesInstalled(entry, identity.version, identity.manifestDigest, committed.Config.Modules)
+			}
 			rendered.Entries = append(rendered.Entries, entry)
 		}
 		view.Sources = append(view.Sources, rendered)
 	}
 	return view, committed.Revision, nil
+}
+
+func catalogEntryMatchesInstalled(entry CatalogEntry, version, manifestDigest string, modules []Module) bool {
+	if version != entry.Version || !validLowerHex(entry.Manifest.SHA256, 64) ||
+		!strings.EqualFold(manifestDigest, entry.Manifest.SHA256) {
+		return false
+	}
+
+	var installed *Module
+	for i := range modules {
+		if modules[i].ID == entry.ID {
+			installed = &modules[i]
+			break
+		}
+	}
+	return installed != nil && catalogResourcesMatchModule(entry, *installed)
+}
+
+func catalogResourcesMatchModule(entry CatalogEntry, module Module) bool {
+	resources := make(map[string]string, len(entry.Resources))
+	for _, resource := range entry.Resources {
+		url := strings.TrimSpace(resource.URL)
+		digest := strings.ToLower(strings.TrimSpace(resource.SHA256))
+		if url == "" || !validLowerHex(digest, 64) {
+			return false
+		}
+		if previous, exists := resources[url]; exists && previous != digest {
+			return false
+		}
+		resources[url] = digest
+	}
+
+	installedResources := make(map[string]string)
+	for _, action := range module.Scripts {
+		if action.ScriptURL == "" {
+			continue
+		}
+		if previous, exists := installedResources[action.ScriptURL]; exists && previous != action.ScriptDigest {
+			return false
+		}
+		installedResources[action.ScriptURL] = action.ScriptDigest
+	}
+	if len(installedResources) != len(resources) {
+		return false
+	}
+	for url, digest := range installedResources {
+		if resources[url] != digest {
+			return false
+		}
+	}
+	return true
 }
 
 // SetCatalogSources replaces the configured catalogs.
@@ -333,7 +398,7 @@ func (e *Engine) ApplyCatalogUpdateWithSettings(
 		log.Infoln("[5GPN] extension %s updates from %s, previously %s", entry.ID, entry.Manifest.URL, previous)
 	}
 	return e.applyUpdateFrom(ctx, revision, entry.ID, entry.Manifest.URL, digest, values, func(module Module) error {
-		return e.verifyAgainstEntry(entry, Candidate{Detail: detailOf(module)})
+		return e.verifyAgainstEntry(entry, Candidate{Detail: detailOf(module), module: &module})
 	})
 }
 
@@ -378,9 +443,17 @@ func (e *Engine) verifyAgainstEntry(entry CatalogEntry, candidate Candidate) err
 		return fmt.Errorf("%w: %s serves extension %q, which the catalog lists as %q",
 			ErrInvalidRequest, entry.Manifest.URL, detail.ID, entry.ID)
 	}
-	if want := strings.ToLower(strings.TrimSpace(entry.Manifest.SHA256)); want != "" && want != detail.SourceDigest {
+	if detail.Version != entry.Version {
+		return fmt.Errorf("%w: %s serves version %q, which the catalog lists as %q",
+			ErrInvalidRequest, entry.Manifest.URL, detail.Version, entry.Version)
+	}
+	if want := strings.ToLower(strings.TrimSpace(entry.Manifest.SHA256)); !validLowerHex(want, 64) || want != detail.SourceDigest {
 		return fmt.Errorf("%w: the manifest at %s does not match the digest the catalog published (%s, not %s)",
 			ErrInvalidRequest, entry.Manifest.URL, detail.SourceDigest, want)
+	}
+	if candidate.module == nil || !catalogResourcesMatchModule(entry, *candidate.module) {
+		return fmt.Errorf("%w: %s does not match the external script digests the catalog published",
+			ErrInvalidRequest, entry.Manifest.URL)
 	}
 
 	declared := entry.Capabilities
@@ -461,6 +534,10 @@ func (imp *Importer) catalog(ctx context.Context, rawURL string) (catalogIndex, 
 			continue
 		}
 		if err := checkResourceURL(entry.Manifest.URL); err != nil {
+			continue
+		}
+		entry.Manifest.SHA256 = strings.ToLower(strings.TrimSpace(entry.Manifest.SHA256))
+		if !validLowerHex(entry.Manifest.SHA256, 64) {
 			continue
 		}
 		seen[entry.ID] = struct{}{}
