@@ -113,3 +113,42 @@ func TestStartReturnsDNSListenerFailure(t *testing.T) {
 		t.Fatalf("Start error = %q", err)
 	}
 }
+
+func TestStartBuildsInterceptionPlanBeforeOpeningDNS(t *testing.T) {
+	home := t.TempDir()
+	dir, err := state.Dir(home)
+	if err != nil {
+		t.Fatalf("state directory: %v", err)
+	}
+	document := dns.DefaultDocument()
+	document.Listen.DoT = "127.0.0.1:18540"
+	document.Listen.Origin = "127.0.0.1:18541"
+	// These paths are deliberately unusable. If DNS Listen moves ahead of the
+	// interception plan again, this error wins and the test names the ordering
+	// regression rather than merely observing a callback sequence.
+	document.Listen.Certificate = filepath.Join(dir, "missing-cert.pem")
+	document.Listen.PrivateKey = filepath.Join(dir, "missing-key.pem")
+	document.Listen.Debug = ""
+	document.Policy.Rules = []dns.Rule{}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("marshal DNS document: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dns.json"), raw, 0o600); err != nil {
+		t.Fatalf("write DNS document: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "intercept.json"), []byte(`{"version":`), 0o600); err != nil {
+		t.Fatalf("write corrupt interception document: %v", err)
+	}
+
+	err = Start(home, func(error) {})
+	if err == nil {
+		t.Fatal("Start opened DNS without a valid interception plan")
+	}
+	if !strings.Contains(err.Error(), "install interception plan") {
+		t.Fatalf("Start error = %q, want interception-plan failure before DNS Listen", err)
+	}
+	if strings.Contains(err.Error(), "start DNS listeners") || strings.Contains(err.Error(), "missing-cert.pem") {
+		t.Fatalf("DNS Listen ran before interception plan construction: %q", err)
+	}
+}

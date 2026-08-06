@@ -39,6 +39,8 @@ const (
 	capabilityDNSKey          = "5gpn-dns"
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
+
+	capabilityInterceptionVersion = 2
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.
@@ -105,29 +107,22 @@ func Start(home string, onFatal func(error)) error {
 		return svc.Resolver().OriginResolve(ctx, host)
 	}))
 
-	// Binding is part of the required DNS boundary. Continuing with any of these
-	// sockets absent would leave systemd reporting a healthy gateway while
-	// clients have no resolver, so fail startup and let the service supervisor
-	// retry the complete monolith.
-	if err := svc.Listen(); err != nil {
+	// Build and publish the interception plan before the public resolver accepts
+	// a query. A valid document with no ready certificate still installs a
+	// pending lookup, so DNS keeps a claimed host on the gateway while the client
+	// boundary rejects it. A missing plan is different: opening DoT with a nil
+	// lookup creates a startup window in which a capture host can be answered as
+	// ordinary direct traffic.
+	interceptPath := filepath.Join(dir, "intercept.json")
+	if err := startInterceptionBeforeDNS(
+		func() error { return engine.EnsureDocument(interceptPath) },
+		func() error { return StartInterception(interceptPath, onFatal) },
+		svc.Listen,
+	); err != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		svc.Shutdown(ctx)
 		cancel()
-		return fmt.Errorf("5gpn: start DNS listeners: %w", err)
-	}
-
-	// The interception engine comes up from a document beside the resolver's.
-	// Both failures below are warnings for the same reason: interception is
-	// optional relative to resolving and forwarding, and a gateway that cannot
-	// read its extension document should still carry traffic rather than refuse
-	// to boot.
-	interceptPath := filepath.Join(dir, "intercept.json")
-	if err := engine.EnsureDocument(interceptPath); err != nil {
-		log.Warnln("[5GPN] interception document unavailable: %v", err)
-		return nil
-	}
-	if err := StartInterception(interceptPath, onFatal); err != nil {
-		log.Warnln("[5GPN] interception engine not installed: %v", err)
+		return err
 	}
 
 	// The bot comes up last because it reports on everything above it. Its
@@ -135,6 +130,24 @@ func Start(home string, onFatal func(error)) error {
 	// that cannot read its bot document should still resolve and forward.
 	if err := startBot(filepath.Join(dir, "bot.json")); err != nil {
 		log.Warnln("[5GPN] Telegram bot not installed: %v", err)
+	}
+	return nil
+}
+
+// startInterceptionBeforeDNS makes the startup ordering executable rather than
+// a comment. ensure and install must both complete before listen can expose
+// DoT; any failure prevents the public resolver from opening.
+func startInterceptionBeforeDNS(ensure, install, listen func() error) error {
+	if err := ensure(); err != nil {
+		return fmt.Errorf("5gpn: prepare interception document: %w", err)
+	}
+	if err := install(); err != nil {
+		return fmt.Errorf("5gpn: install interception plan: %w", err)
+	}
+	// Binding is part of the required DNS boundary. Continuing with any socket
+	// absent would leave systemd reporting a healthy gateway with no resolver.
+	if err := listen(); err != nil {
+		return fmt.Errorf("5gpn: start DNS listeners: %w", err)
 	}
 	return nil
 }
@@ -256,11 +269,11 @@ func StateDir() string {
 // capture stage. Calling it with an empty path, or not calling it at all,
 // leaves the core routing every connection normally.
 //
-// Separate from Start because interception is optional and failible in a way
-// the rest is not: a malformed interception document, or a certificate whose
-// SAN set no longer covers the enabled capture hosts, must leave a working
-// gateway rather than refusing to boot. The error is returned for the caller to
-// log; it is not fatal.
+// Separate from Start so a management transaction can rebuild the plan without
+// rebuilding the resolver. Initial startup treats a document that cannot build
+// either an active or pending plan as fatal and never opens DoT; ordinary
+// certificate and egress unavailability are represented inside a valid pending
+// plan and do not prevent startup.
 func StartInterception(configPath string, onFatal func(error)) error {
 	// Withdrawing first means every early return below leaves the feature
 	// unadvertised. Advertising a subsystem that failed to come up would have
@@ -302,25 +315,30 @@ func StartInterception(configPath string, onFatal func(error)) error {
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
 	api.SetInterceptionEngine(e)
-	api.Advertise(capabilityInterceptionKey, api.Feature{Version: 1})
+	api.Advertise(capabilityInterceptionKey, api.Feature{Version: capabilityInterceptionVersion})
 	if svc := dnsRef.Load(); svc != nil {
 		svc.Resolver().SetCaptureLookup(func(name string) (dns.Capture, bool) {
 			binding, ok := e.CaptureFor(name)
 			if !ok {
 				return dns.Capture{}, false
 			}
-			return dns.Capture{
-				ExtensionID:   binding.ModuleID,
-				ExtensionName: binding.ModuleName,
-				Pattern:       binding.Pattern,
-				Resolver:      binding.CaptureDNS,
-				Ready:         binding.Ready,
-			}, true
+			return captureBindingForDNS(binding), true
 		})
 		svc.Resolver().FlushCache()
 	}
 	log.Infoln("[5GPN] interception engine installed from %s", configPath)
 	return nil
+}
+
+func captureBindingForDNS(binding engine.CaptureBinding) dns.Capture {
+	return dns.Capture{
+		ExtensionID:   binding.ModuleID,
+		ExtensionName: binding.ModuleName,
+		Pattern:       binding.Pattern,
+		Resolver:      binding.CaptureDNS,
+		Ready:         binding.Ready,
+		Claimed:       binding.Claimed,
+	}
 }
 
 // Engine returns the installed plugin engine, or nil.

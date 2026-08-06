@@ -15,12 +15,26 @@ type CaptureBinding struct {
 	Pattern string
 	// CaptureDNS is the operator's china/trust binding for this extension.
 	CaptureDNS string
+	// Claimed means the extension is authorized and the master is on. DNS keeps
+	// steering this name to the gateway even when Ready is false so the client
+	// traffic backstop can reject it; falling through to an origin answer would
+	// silently bypass the operator's authorization.
+	Claimed bool
 	// Ready reports that the interception master is on, so capture will
 	// actually happen. A declaration with the master off is still returned:
 	// the extensions page shows the extension as enabled, and an operator
 	// asking why the name is not captured needs the master switch named rather
 	// than an empty answer.
 	Ready bool
+}
+
+// ExtensionRuntimeState distinguishes an operator's persisted authorization
+// from the derived runtime plan. Only active means new traffic can enter the
+// extension; every other phase is fail-closed without rewriting Enabled.
+type ExtensionRuntimeState struct {
+	Ready  bool   `json:"ready"`
+	Phase  string `json:"phase"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // CaptureFor resolves host against every enabled extension's capture hosts.
@@ -49,6 +63,7 @@ func (e *Engine) CaptureFor(host string) (CaptureBinding, bool) {
 		byID[m.ID] = m
 	}
 	traffic, trafficErr := trafficPolicyForConfig(cfg)
+	certificateReady := e.certificateRuntimeReady(cfg)
 
 	consider := func(m Module) (CaptureBinding, bool) {
 		if !m.Enabled {
@@ -71,13 +86,15 @@ func (e *Engine) CaptureFor(host string) (CaptureBinding, bool) {
 		if matched == "" {
 			return CaptureBinding{}, false
 		}
+		ready := cfg.MITM.Enabled && certificateReady && e.clientBoundaryIsReady() && e.moduleEgressReady(m) &&
+			trafficErr == nil && e.captureDestinationReady(traffic, host)
 		return CaptureBinding{
 			ModuleID:   m.ID,
 			ModuleName: m.Name,
 			Pattern:    matched,
 			CaptureDNS: m.CaptureDNS,
-			Ready: cfg.MITM.Enabled && e.clientBoundaryIsReady() && e.moduleEgressReady(m) &&
-				trafficErr == nil && e.captureDestinationReady(traffic, host),
+			Ready:      ready,
+			Claimed:    cfg.MITM.Enabled,
 		}, true
 	}
 
@@ -100,6 +117,63 @@ func (e *Engine) CaptureFor(host string) (CaptureBinding, bool) {
 		}
 	}
 	return CaptureBinding{}, false
+}
+
+// ExtensionRuntimeState reports one module's derived lifecycle without
+// persisting a second active bit. Enabled remains the desired authorization.
+func (e *Engine) ExtensionRuntimeState(moduleID string) ExtensionRuntimeState {
+	if e == nil || e.config == nil {
+		return ExtensionRuntimeState{Phase: "disabled", Reason: "engine_unavailable"}
+	}
+	cfg, err := e.config.Current()
+	if err != nil {
+		return ExtensionRuntimeState{Phase: "disabled", Reason: "configuration_unavailable"}
+	}
+	return e.extensionRuntimeStateForConfig(cfg, moduleID)
+}
+
+func (e *Engine) extensionRuntimeStateForConfig(cfg Config, moduleID string) ExtensionRuntimeState {
+	var module *Module
+	for index := range cfg.Modules {
+		if cfg.Modules[index].ID == moduleID {
+			candidate := cfg.Modules[index]
+			module = &candidate
+			break
+		}
+	}
+	if module == nil || !module.Enabled {
+		return ExtensionRuntimeState{Phase: "disabled"}
+	}
+	if !cfg.MITM.Enabled {
+		return ExtensionRuntimeState{Phase: "armed", Reason: "master_disabled"}
+	}
+	certificate := e.certificateRuntimeStateForConfig(cfg)
+	if certificate.Status == "error" {
+		return ExtensionRuntimeState{Phase: "certificate_error", Reason: "certificate_error"}
+	}
+	if !certificate.Ready {
+		return ExtensionRuntimeState{Phase: "certificate_pending", Reason: "certificate_pending"}
+	}
+	if !e.clientBoundaryIsReady() {
+		return ExtensionRuntimeState{Phase: "boundary_unavailable", Reason: "fixed_boundary_unavailable"}
+	}
+	if !e.moduleEgressReady(*module) {
+		return ExtensionRuntimeState{Phase: "egress_unavailable", Reason: "egress_unavailable"}
+	}
+	policy, err := trafficPolicyForConfig(cfg)
+	if err != nil {
+		return ExtensionRuntimeState{Phase: "egress_unavailable", Reason: "traffic_policy_unavailable"}
+	}
+	for _, pattern := range module.CaptureHosts {
+		probe := pattern
+		if len(pattern) > 2 && pattern[:2] == "*." {
+			probe = "runtime-ready." + pattern[2:]
+		}
+		if !e.captureDestinationReady(policy, probe) {
+			return ExtensionRuntimeState{Phase: "egress_unavailable", Reason: "egress_unavailable"}
+		}
+	}
+	return ExtensionRuntimeState{Ready: true, Phase: "active"}
 }
 
 // EnabledCount is how many extensions are enabled, so a diagnostic can say

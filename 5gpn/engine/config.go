@@ -1738,12 +1738,22 @@ type configStore struct {
 	path string
 
 	mu         sync.Mutex
-	cur        atomic.Pointer[Config]
-	revision   string
+	committed  atomic.Pointer[CommittedConfigView]
 	generation uint64
 
 	logsMu sync.RWMutex
 	logs   engineLogPublisher
+}
+
+// CommittedConfigView is one atomically published interception document and
+// the revision naming the exact bytes it was compiled from.
+//
+// Keeping these values in one object is a control-plane correctness boundary:
+// a caller must never render one config and attach the revision of the config
+// that replaced it a moment later. The Config is immutable after publication.
+type CommittedConfigView struct {
+	Config   Config
+	Revision string
 }
 
 func newConfigStore(path string) (*configStore, error) {
@@ -1756,8 +1766,11 @@ func newConfigStore(path string) (*configStore, error) {
 		return nil, err
 	}
 	cfg.generation = 1
-	store := &configStore{path: path, revision: documentRevision(body), generation: 1}
-	store.cur.Store(&cfg)
+	store := &configStore{path: path, generation: 1}
+	store.committed.Store(&CommittedConfigView{
+		Config:   cfg,
+		Revision: documentRevision(body),
+	})
 	// Published at startup as well as on every write, so a gateway edited while
 	// the certificate oneshot was not running still converges.
 	if err := publishCertificateRequest(path, cfg); err != nil {
@@ -1769,17 +1782,43 @@ func newConfigStore(path string) (*configStore, error) {
 // Current returns the compiled snapshot. A pointer load: no syscall, no lock,
 // and nothing that can fail once the store exists.
 func (s *configStore) Current() (Config, error) {
-	if cfg := s.cur.Load(); cfg != nil {
-		return *cfg, nil
+	view, err := s.CommittedView()
+	if err != nil {
+		return Config{}, err
 	}
-	return Config{}, errors.New("5gpn/engine: no interception document")
+	return view.Config, nil
 }
 
 // Revision names the document by its bytes, which is what a write must quote.
 func (s *configStore) Revision() string {
+	if view := s.committed.Load(); view != nil {
+		return view.Revision
+	}
+	return ""
+}
+
+// CommittedView returns the config and revision from one pointer load.
+func (s *configStore) CommittedView() (CommittedConfigView, error) {
+	if view := s.committed.Load(); view != nil {
+		return *view, nil
+	}
+	return CommittedConfigView{}, errors.New("5gpn/engine: no interception document")
+}
+
+// WithCurrentLocked serializes a non-document operation with Update and
+// Reload while exposing the same committed config/revision pair readers see.
+// The callback must not call another configStore method that takes s.mu.
+func (s *configStore) WithCurrentLocked(fn func(Config, string) error) error {
+	if fn == nil {
+		return errors.New("5gpn/engine: current-config callback is required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.revision
+	view, err := s.CommittedView()
+	if err != nil {
+		return err
+	}
+	return fn(view.Config, view.Revision)
 }
 
 // Update mutates, validates, persists, then publishes.
@@ -1796,34 +1835,35 @@ func (s *configStore) Update(expected string, mutate func(Config) (Config, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current := Config{}
-	if cfg := s.cur.Load(); cfg != nil {
-		current = *cfg
+	view, err := s.CommittedView()
+	if err != nil {
+		return Config{}, "", err
 	}
-	if expected != "" && expected != s.revision {
-		return current, s.revision, state.ErrRevisionConflict
+	current := view.Config
+	if expected != "" && expected != view.Revision {
+		return current, view.Revision, state.ErrRevisionConflict
 	}
 
 	next, err := mutate(current)
 	if err != nil {
-		return current, s.revision, err
+		return current, view.Revision, err
 	}
 	raw, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
-		return current, s.revision, fmt.Errorf("5gpn/engine: marshal config: %w", err)
+		return current, view.Revision, fmt.Errorf("5gpn/engine: marshal config: %w", err)
 	}
 	compiled, err := decodeConfig(raw)
 	if err != nil {
-		return current, s.revision, err
+		return current, view.Revision, err
 	}
 	if err := state.WriteFile(s.path, raw); err != nil {
-		return current, s.revision, err
+		return current, view.Revision, err
 	}
 
 	s.generation++
 	compiled.generation = s.generation
-	s.cur.Store(&compiled)
-	s.revision = documentRevision(raw)
+	nextRevision := documentRevision(raw)
+	s.committed.Store(&CommittedConfigView{Config: compiled, Revision: nextRevision})
 	// After the document is durable, never before: the oneshot that reads this
 	// mints a leaf, and a leaf covering hosts a crash would un-declare is worse
 	// than a leaf that is briefly one edit behind.
@@ -1831,7 +1871,7 @@ func (s *configStore) Update(expected string, mutate func(Config) (Config, error
 		s.publishEngineLog("warn", err.Error())
 	}
 	s.publishEngineLog("info", "configuration updated")
-	return compiled, s.revision, nil
+	return compiled, nextRevision, nil
 }
 
 // Reload re-reads the document, for the operator who edited it by hand. Nothing
@@ -1845,7 +1885,11 @@ func (s *configStore) Reload() error {
 		return err
 	}
 	revision := documentRevision(body)
-	if revision == s.revision {
+	view, err := s.CommittedView()
+	if err != nil {
+		return err
+	}
+	if revision == view.Revision {
 		return nil
 	}
 	cfg, err := decodeConfig(body)
@@ -1857,13 +1901,22 @@ func (s *configStore) Reload() error {
 	}
 	s.generation++
 	cfg.generation = s.generation
-	s.cur.Store(&cfg)
-	s.revision = revision
+	s.committed.Store(&CommittedConfigView{Config: cfg, Revision: revision})
 	if err := publishCertificateRequest(s.path, cfg); err != nil {
 		s.publishEngineLog("warn", err.Error())
 	}
 	s.publishEngineLog("info", "configuration reloaded")
 	return nil
+}
+
+// CommittedView returns the interception document and revision from one
+// atomic publication. API callers should build their response from this view
+// instead of reading Snapshot and Revision independently.
+func (e *Engine) CommittedView() (CommittedConfigView, error) {
+	if e == nil || e.config == nil {
+		return CommittedConfigView{}, errors.New("5gpn/engine: interception engine is unavailable")
+	}
+	return e.config.CommittedView()
 }
 
 func documentRevision(raw []byte) string {

@@ -33,11 +33,13 @@ type Capture struct {
 	// when mihomo re-resolves the origin after the sniffer.
 	Resolver string `json:"resolver,omitempty"`
 	// Ready is false when an extension declared the name but the interception
-	// master is off. The declaration is still reported, because the extensions
-	// page shows the extension as enabled and an operator asking "why is this
-	// name not captured" needs the answer to be the master switch rather than
-	// silence.
+	// runtime cannot currently accept new traffic.
 	Ready bool `json:"ready"`
+	// Claimed keeps an enabled host on the gateway while the master is on but a
+	// certificate, boundary, or egress dependency is pending. The tunnel then
+	// rejects it at the reviewed client boundary instead of letting DNS leak it
+	// to an origin. With the master off, Claimed is false and policy applies.
+	Claimed bool `json:"claimed"`
 }
 
 // CaptureLookup resolves a name against the interception engine's capture
@@ -408,11 +410,12 @@ func (r *Resolver) Decide(name string) Decision {
 		}
 	}
 
-	// Only a READY capture steers. A declaration with the master off falls
-	// through to policy instead: steering it would send the client to a gateway
-	// with nothing able to terminate the connection, which black-holes the name
-	// rather than leaving it merely uncaptured.
-	if capture != nil && capture.Ready {
+	// A ready capture steers normally. A claimed-but-not-ready capture also
+	// stays on the gateway, where RouteClient rejects it before ordinary mihomo
+	// fallback. Letting it fall through here would expose traffic that the
+	// operator authorized for interception directly to its origin during a
+	// certificate or egress transition.
+	if capture != nil && (capture.Ready || capture.Claimed) {
 		return Decision{
 			Verdict: Verdict{Verdict: "proxy", Reason: "force-proxy"},
 			action:  actionGateway,

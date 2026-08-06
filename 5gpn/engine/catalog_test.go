@@ -534,9 +534,9 @@ func TestACatalogUpdateMovesTheExtensionsSource(t *testing.T) {
 	}
 }
 
-// Everything the ordinary update path refuses, this one refuses too. Disabled
-// is the one that matters: an update swaps every script the engine is running.
-func TestACatalogUpdateRefusesAnEnabledExtension(t *testing.T) {
+// Catalog updates use the same immutable-snapshot handoff as ordinary updates,
+// so an enabled extension remains enabled across the replacement.
+func TestACatalogUpdateKeepsAnEnabledExtensionEnabled(t *testing.T) {
 	stubImporter(t, stubFetch{
 		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
 		catalogManifestURL: validManifest,
@@ -555,11 +555,15 @@ func TestACatalogUpdateRefusesAnEnabledExtension(t *testing.T) {
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
 	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest)
-	if err == nil {
-		t.Fatal("an enabled extension was updated underneath its running scripts")
+	if err != nil {
+		t.Fatalf("enabled catalog update: %v", err)
 	}
-	if !strings.Contains(err.Error(), "disable") {
-		t.Errorf("the refusal does not say what to do: %v", err)
+	detail, err := e.Detail("example.plugin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !detail.Enabled || detail.EgressGroup != "Proxies" {
+		t.Fatalf("catalog update lost enabled operator state: %+v", detail.ModuleSummary)
 	}
 }
 

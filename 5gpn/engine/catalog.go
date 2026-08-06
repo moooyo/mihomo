@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/5gpn/state"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -183,17 +184,25 @@ type CatalogView struct {
 // A disabled source is reported without being fetched: it is still the
 // operator's configuration and still has to be visible to re-enable.
 func (e *Engine) Catalog(ctx context.Context, refresh bool) (CatalogView, error) {
-	cfg, err := e.config.Current()
+	catalog, _, err := e.CatalogWithRevision(ctx, refresh)
+	return catalog, err
+}
+
+// CatalogWithRevision pairs discovery with the committed config that supplied
+// its source list and installed-version projection. Network fetches may take
+// time, but a concurrent edit cannot relabel the resulting old view as new.
+func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (CatalogView, string, error) {
+	committed, err := e.CommittedView()
 	if err != nil {
-		return CatalogView{}, err
+		return CatalogView{}, "", err
 	}
-	installed := make(map[string]string, len(cfg.Modules))
-	for _, m := range cfg.Modules {
+	installed := make(map[string]string, len(committed.Config.Modules))
+	for _, m := range committed.Config.Modules {
 		installed[m.ID] = m.Version
 	}
 
-	view := CatalogView{Sources: make([]CatalogSourceView, 0, len(cfg.Catalogs))}
-	for _, source := range cfg.Catalogs {
+	view := CatalogView{Sources: make([]CatalogSourceView, 0, len(committed.Config.Catalogs))}
+	for _, source := range committed.Config.Catalogs {
 		rendered := CatalogSourceView{
 			ID: source.ID, Name: source.Name, URL: source.URL, Enabled: source.Enabled,
 			Entries: []CatalogEntry{},
@@ -216,7 +225,7 @@ func (e *Engine) Catalog(ctx context.Context, refresh bool) (CatalogView, error)
 		}
 		view.Sources = append(view.Sources, rendered)
 	}
-	return view, nil
+	return view, committed.Revision, nil
 }
 
 // SetCatalogSources replaces the configured catalogs.
@@ -246,18 +255,25 @@ func (e *Engine) SetCatalogSources(revision string, sources []CatalogSource) (Sn
 // disagreement refuses rather than being reported alongside a review the
 // operator would then confirm.
 func (e *Engine) ReviewCatalogEntry(ctx context.Context, sourceID, entryID string) (Candidate, error) {
+	candidate, _, _, err := e.ReviewCatalogEntryView(ctx, sourceID, entryID)
+	return candidate, err
+}
+
+// ReviewCatalogEntryView returns the exact manifest URL and committed revision
+// used by the review, so an API never reconstructs either through a second read.
+func (e *Engine) ReviewCatalogEntryView(ctx context.Context, sourceID, entryID string) (Candidate, string, string, error) {
 	entry, err := e.catalogEntry(ctx, sourceID, entryID)
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, "", "", err
 	}
-	candidate, err := e.Fetch(ctx, ImportRequest{URL: entry.Manifest.URL})
+	candidate, revision, err := e.FetchView(ctx, ImportRequest{URL: entry.Manifest.URL})
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, entry.Manifest.URL, revision, err
 	}
 	if err := e.verifyAgainstEntry(entry, candidate); err != nil {
-		return Candidate{}, err
+		return Candidate{}, entry.Manifest.URL, revision, err
 	}
-	return candidate, nil
+	return candidate, entry.Manifest.URL, revision, nil
 }
 
 // CatalogEntrySource resolves an entry to the manifest URL an install must
@@ -280,21 +296,34 @@ func (e *Engine) CatalogEntrySource(ctx context.Context, sourceID, entryID strin
 // this catalog, for this extension — so the redirection is the thing they
 // asked for rather than a side effect of configuration.
 //
-// Everything the ordinary update path checks still applies: the extension must
-// be disabled, the fetched manifest must still be the same extension id, and
-// its digest must match what was reviewed. On top of that the entry's own
-// claims are checked, so a catalog cannot advertise one shape and update to
-// another.
+// Everything the ordinary update path checks still applies: the fetched
+// manifest must still be the same extension id and its digest must match what
+// was reviewed. On top of that the entry's own claims are checked, so a catalog
+// cannot advertise one shape and update to another.
 func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, entryID, digest string) (Snapshot, string, error) {
+	return e.ApplyCatalogUpdateWithSettings(ctx, revision, sourceID, entryID, digest, nil)
+}
+
+// ApplyCatalogUpdateWithSettings is the catalog-source variant of
+// ApplyUpdateWithSettings. Values, when present, are the complete proposed
+// settings document for the freshly fetched candidate.
+func (e *Engine) ApplyCatalogUpdateWithSettings(
+	ctx context.Context,
+	revision, sourceID, entryID, digest string,
+	values SettingValues,
+) (Snapshot, string, error) {
+	view, err := e.CommittedView()
+	if err != nil {
+		return Snapshot{}, revision, err
+	}
+	if revision != "" && revision != view.Revision {
+		return Snapshot{}, view.Revision, state.ErrRevisionConflict
+	}
 	entry, err := e.catalogEntry(ctx, sourceID, entryID)
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
-	cfg, err := e.config.Current()
-	if err != nil {
-		return Snapshot{}, revision, err
-	}
-	installed, err := updatableModule(cfg, entry.ID)
+	installed, err := updatableModule(view.Config, entry.ID)
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
@@ -303,7 +332,7 @@ func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, ent
 	if previous := strings.TrimSpace(installed.Source.URL); previous != "" && previous != entry.Manifest.URL {
 		log.Infoln("[5GPN] extension %s updates from %s, previously %s", entry.ID, entry.Manifest.URL, previous)
 	}
-	return e.applyUpdateFrom(ctx, revision, entry.ID, entry.Manifest.URL, digest, func(module Module) error {
+	return e.applyUpdateFrom(ctx, revision, entry.ID, entry.Manifest.URL, digest, values, func(module Module) error {
 		return e.verifyAgainstEntry(entry, Candidate{Detail: detailOf(module)})
 	})
 }

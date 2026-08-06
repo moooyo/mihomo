@@ -228,7 +228,7 @@ func TestCertificateStateReadsAColdLeafWithoutPrimingTheHandshakeCache(t *testin
 	}
 }
 
-func TestCertificateStatusProjectionCacheTracksFileModTime(t *testing.T) {
+func TestCertificateStatusProjectionCacheTracksFileContent(t *testing.T) {
 	e, certPath, keyPath := newCertificateStateTestEngine(t)
 	now := time.Now()
 	initialNotAfter := now.Add(24 * time.Hour).Truncate(time.Second)
@@ -243,15 +243,6 @@ func TestCertificateStatusProjectionCacheTracksFileModTime(t *testing.T) {
 	)
 	initialModTime := now.Add(-10 * time.Minute).Truncate(time.Second)
 	setTestPairModTime(t, certPath, keyPath, initialModTime)
-	certInfo, err := os.Stat(certPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyInfo, err := os.Stat(keyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	snapshot, err := e.Snapshot()
 	if err != nil {
 		t.Fatalf("initial Snapshot: %v", err)
@@ -260,8 +251,13 @@ func TestCertificateStatusProjectionCacheTracksFileModTime(t *testing.T) {
 		t.Fatalf("initial certificate state = %+v", snapshot.Certificate)
 	}
 
-	// Change the bytes without changing the cache key. The second read must use
-	// the immutable projection rather than parse the private pair again.
+	// A replacement can preserve path, mtime and size. Content hashes, not file
+	// metadata, are therefore the cache identity; otherwise a warm process can
+	// keep reporting or serving a stale leaf indefinitely.
+	certInfo, err := os.Stat(certPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(certPath, []byte("broken certificate"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -272,26 +268,12 @@ func TestCertificateStatusProjectionCacheTracksFileModTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cached Snapshot: %v", err)
 	}
-	if !snapshot.Certificate.Loaded || snapshot.Certificate.NotAfter != initialNotAfter.Unix() {
-		t.Fatalf("unchanged cache key did not reuse the status projection: %+v", snapshot.Certificate)
-	}
-
-	// Advancing the certificate mtime invalidates the positive projection. The
-	// broken pair becomes a cached negative result.
-	brokenModTime := certInfo.ModTime().Add(time.Second)
-	if err := os.Chtimes(certPath, brokenModTime, brokenModTime); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err = e.Snapshot()
-	if err != nil {
-		t.Fatalf("invalidated Snapshot: %v", err)
-	}
 	if snapshot.Certificate.Loaded {
-		t.Fatalf("mtime change did not invalidate the positive projection: %+v", snapshot.Certificate)
+		t.Fatalf("same-mtime replacement retained the stale status projection: %+v", snapshot.Certificate)
 	}
 
-	// Publish a valid pair under the same path-and-mtime key. It stays unloaded
-	// until the key changes, proving load failures are cached as projections too.
+	// A valid pair published under the same mtime is detected as well, so a
+	// negative projection cannot hide recovery.
 	renewedNotAfter := now.Add(72 * time.Hour).Truncate(time.Second)
 	writeTestLeafFor(
 		t,
@@ -302,28 +284,13 @@ func TestCertificateStatusProjectionCacheTracksFileModTime(t *testing.T) {
 		now.Add(-time.Hour),
 		renewedNotAfter,
 	)
-	if err := os.Chtimes(certPath, brokenModTime, brokenModTime); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(keyPath, keyInfo.ModTime(), keyInfo.ModTime()); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err = e.Snapshot()
-	if err != nil {
-		t.Fatalf("negative cached Snapshot: %v", err)
-	}
-	if snapshot.Certificate.Loaded {
-		t.Fatalf("unchanged negative cache key reparsed the pair: %+v", snapshot.Certificate)
-	}
-
-	renewedModTime := brokenModTime.Add(time.Second)
-	setTestPairModTime(t, certPath, keyPath, renewedModTime)
+	setTestPairModTime(t, certPath, keyPath, certInfo.ModTime())
 	snapshot, err = e.Snapshot()
 	if err != nil {
 		t.Fatalf("renewed Snapshot: %v", err)
 	}
 	if !snapshot.Certificate.Loaded || snapshot.Certificate.NotAfter != renewedNotAfter.Unix() {
-		t.Fatalf("mtime change did not invalidate the negative projection: %+v", snapshot.Certificate)
+		t.Fatalf("same-mtime recovery did not replace the negative projection: %+v", snapshot.Certificate)
 	}
 
 	e.certs.mu.Lock()
@@ -505,6 +472,8 @@ func TestCertificateStateIsSafeAlongsideConcurrentHandshakes(t *testing.T) {
 		now.Add(-time.Hour),
 		now.Add(24*time.Hour),
 	)
+	e.certs.runtimeTTL = -1
+	publishTestCertificateResult(t, e, "ready", "", "")
 	hello := &tls.ClientHelloInfo{ServerName: "shared.example.com"}
 	if _, err := e.certs.GetCertificate(hello); err != nil {
 		t.Fatalf("warm certificate cache: %v", err)

@@ -644,32 +644,47 @@ func TestOriginHonoursTheCaptureResolverBinding(t *testing.T) {
 	}
 }
 
-// A ready capture steers; a declaration with the master off falls through to
-// policy, because steering it would send the client to a gateway with nothing
-// able to terminate the connection.
-func TestCaptureSteersOnlyWhenReady(t *testing.T) {
-	for _, ready := range []bool{true, false} {
-		r := testResolver(t, failing(), answering("192.0.2.90"))
-		policyWith(t, r, FallbackDirect)
-		r.SetCaptureLookup(func(string) (Capture, bool) {
-			return Capture{ExtensionID: "ext", Pattern: "captured.example", Ready: ready}, true
+// A pending runtime remains claimed by the gateway and is rejected at the
+// client boundary. Only a declaration whose master is off falls through to
+// ordinary DNS policy.
+func TestCaptureSteeringFollowsRuntimeClaim(t *testing.T) {
+	tests := []struct {
+		name    string
+		ready   bool
+		claimed bool
+		gateway bool
+	}{
+		{name: "active", ready: true, claimed: true, gateway: true},
+		{name: "pending", ready: false, claimed: true, gateway: true},
+		{name: "master off", ready: false, claimed: false, gateway: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := testResolver(t, failing(), answering("192.0.2.90"))
+			policyWith(t, r, FallbackDirect)
+			r.SetCaptureLookup(func(string) (Capture, bool) {
+				return Capture{
+					ExtensionID: "ext", Pattern: "captured.example",
+					Ready: test.ready, Claimed: test.claimed,
+				}, true
+			})
+
+			got := answerAddrs(ask(t, r, "captured.example", D.TypeA))
+			want := []string{"192.0.2.90"}
+			if test.gateway {
+				want = []string{"198.51.100.1"}
+			}
+			if !equalStrings(got, want) {
+				t.Errorf("ready=%v claimed=%v: answers %v, want %v", test.ready, test.claimed, got, want)
+			}
+
+			// Either way the diagnostic names the extension, so an operator asking
+			// why a name is not captured is told about the master switch rather
+			// than shown an empty answer.
+			if d := r.Decide("captured.example"); d.Capture == nil {
+				t.Error("the decision dropped the capture attribution")
+			}
 		})
-
-		got := answerAddrs(ask(t, r, "captured.example", D.TypeA))
-		want := []string{"192.0.2.90"}
-		if ready {
-			want = []string{"198.51.100.1"}
-		}
-		if !equalStrings(got, want) {
-			t.Errorf("ready=%v: answers %v, want %v", ready, got, want)
-		}
-
-		// Either way the diagnostic names the extension, so an operator asking
-		// why a name is not captured is told about the master switch rather
-		// than shown an empty answer.
-		if d := r.Decide("captured.example"); d.Capture == nil {
-			t.Errorf("ready=%v: the decision dropped the capture attribution", ready)
-		}
 	}
 }
 

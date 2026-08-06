@@ -1,5 +1,7 @@
 package engine
 
+import "errors"
+
 // Snapshot is the read-only view of the interception subsystem that the control
 // API serves and the console renders.
 //
@@ -20,13 +22,17 @@ type Snapshot struct {
 
 // ModuleSummary is one installed extension, without its bodies.
 type ModuleSummary struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name,omitempty"`
-	Version      string   `json:"version,omitempty"`
-	Enabled      bool     `json:"enabled"`
-	CaptureHosts []string `json:"capture_hosts"`
-	CaptureDNS   string   `json:"capture_dns"`
-	EgressGroup  string   `json:"egress_group,omitempty"`
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+	// Enabled is the operator's persisted desired authorization. Runtime.Ready
+	// reports whether new traffic can actually enter the extension now.
+	Enabled      bool                  `json:"enabled"`
+	Runtime      ExtensionRuntimeState `json:"runtime"`
+	SettingCount int                   `json:"setting_count"`
+	CaptureHosts []string              `json:"capture_hosts"`
+	CaptureDNS   string                `json:"capture_dns"`
+	EgressGroup  string                `json:"egress_group,omitempty"`
 	// EgressGroupRequired is what makes an empty EgressGroup meaningful.
 	EgressGroupRequired bool `json:"egress_group_required"`
 }
@@ -41,6 +47,12 @@ type ModuleSummary struct {
 // it. The failure looks like a client-side trust error with nothing in the
 // gateway's logs, so it has to be visible here.
 type CertificateState struct {
+	Ready        bool   `json:"ready"`
+	Status       string `json:"status"`
+	TargetDigest string `json:"target_digest,omitempty"`
+	Attempt      string `json:"attempt,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
 	// Loaded means a non-CA leaf and matching private key can be parsed from the
 	// current files. It deliberately remains true after expiry so NotAfter can
 	// explain why handshakes reject the leaf.
@@ -52,9 +64,20 @@ type CertificateState struct {
 
 // Snapshot renders the current interception state.
 func (e *Engine) Snapshot() (Snapshot, error) {
-	cfg, err := e.config.Current()
+	view, err := e.CommittedView()
 	if err != nil {
 		return Snapshot{}, err
+	}
+	return e.SnapshotFromConfig(view.Config)
+}
+
+// SnapshotFromConfig renders exactly the committed Config supplied by the
+// caller. It exists so an API response can pair this projection with the
+// revision from the same CommittedConfigView even if another write commits
+// while the response is being built.
+func (e *Engine) SnapshotFromConfig(cfg Config) (Snapshot, error) {
+	if e == nil {
+		return Snapshot{}, errors.New("5gpn/engine: interception engine is unavailable")
 	}
 
 	// Every list here is built with make, never with append onto a nil slice.
@@ -75,7 +98,9 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 	out.ExecutionOrder = append(out.ExecutionOrder, cfg.ExecutionOrder...)
 
 	for _, m := range cfg.Modules {
-		out.Modules = append(out.Modules, summariseModule(m))
+		summary := summariseModule(m)
+		summary.Runtime = e.extensionRuntimeStateForConfig(cfg, m.ID)
+		out.Modules = append(out.Modules, summary)
 	}
 
 	// The active set is what the matcher will actually accept, which is not the
@@ -91,7 +116,15 @@ func (e *Engine) Snapshot() (Snapshot, error) {
 }
 
 func (e *Engine) certificateState(cfg Config) CertificateState {
-	state := CertificateState{}
+	runtime := e.certificateRuntimeStateForConfig(cfg)
+	state := CertificateState{
+		Ready:        runtime.Ready,
+		Status:       runtime.Status,
+		TargetDigest: runtime.TargetDigest,
+		Attempt:      runtime.Attempt,
+		ErrorCode:    runtime.ErrorCode,
+		ErrorMessage: runtime.ErrorMessage,
+	}
 	status, loaded := e.certs.status(cfg)
 	if !loaded {
 		return state
@@ -114,11 +147,17 @@ func (e *Engine) certificateState(cfg Config) CertificateState {
 }
 
 func summariseModule(m Module) ModuleSummary {
+	runtime := ExtensionRuntimeState{Phase: "disabled"}
+	if m.Enabled {
+		runtime.Phase = "armed"
+	}
 	return ModuleSummary{
-		ID:      m.ID,
-		Name:    m.Name,
-		Version: m.Version,
-		Enabled: m.Enabled,
+		ID:           m.ID,
+		Name:         m.Name,
+		Version:      m.Version,
+		Enabled:      m.Enabled,
+		Runtime:      runtime,
+		SettingCount: len(m.Settings),
 		// Copied rather than aliased: the summary outlives the read lock the
 		// document was taken under, and a caller ranging over it while a reload
 		// swaps the document underneath would see a slice whose backing array

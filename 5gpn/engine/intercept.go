@@ -49,7 +49,12 @@ func (i *Interceptor) MatchTCP(metadata *C.Metadata) bool {
 	}
 	if i.engine != nil {
 		binding, exists := i.engine.CaptureFor(metadata.Host)
-		return exists && binding.Ready
+		// A claimed host remains inside the interception failure boundary while
+		// its runtime plan is pending. Declining it here would hand the same
+		// connection to ordinary rule fallback after RouteClient had evaluated an
+		// older ready generation. TLS then fails its plan gate and plain HTTP gets
+		// a 503; neither can bypass the extension by racing a certificate update.
+		return exists && binding.Claimed
 	}
 	return activeInterceptHost(cfg, metadata.Host)
 }

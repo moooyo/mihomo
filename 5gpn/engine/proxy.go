@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -34,6 +35,10 @@ type interceptProxy struct {
 	logs       engineLogPublisher
 	bodyBudget *moduleBodyBudget
 	fatal      func(error)
+	// runtimeReady is installed once during Engine assembly. It revalidates the
+	// current host against the complete certificate, fixed-boundary and winning
+	// egress plan before any request body or action is observed.
+	runtimeReady func(Config, string) bool
 
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
@@ -52,7 +57,29 @@ type interceptProxy struct {
 	tlsMu      sync.Mutex
 	tlsKeys    [][32]byte
 	tlsKeysSet time.Time
+	tlsPlan    string
 	tlsNow     func() time.Time
+}
+
+type tlsConnectionPlan struct {
+	generation atomic.Pointer[string]
+}
+
+type tlsConnectionPlanContextKey struct{}
+
+func (p *tlsConnectionPlan) set(generation string) {
+	value := generation
+	p.generation.Store(&value)
+}
+
+func (p *tlsConnectionPlan) current() string {
+	if p == nil {
+		return ""
+	}
+	if value := p.generation.Load(); value != nil {
+		return *value
+	}
+	return ""
 }
 
 const (
@@ -220,7 +247,8 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 	if err != nil {
 		return err
 	}
-	tlsConfig, err := p.mitmTLSConfig(cfg.MITM.HTTP2)
+	connectionPlan := &tlsConnectionPlan{}
+	tlsConfig, err := p.mitmTLSConfigForConnection(cfg.MITM.HTTP2, connectionPlan)
 	if err != nil {
 		return err
 	}
@@ -232,6 +260,9 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
 		TLSConfig:         tlsConfig,
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, tlsConnectionPlanContextKey{}, connectionPlan)
+		},
 	}
 	err = server.ServeTLS(listener, "", "")
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
@@ -290,16 +321,38 @@ func (h failFastInterceptHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 // NextProtos comes from the caller's snapshot rather than the template because
 // MITM.HTTP2 can change under a running process.
 func (p *interceptProxy) mitmTLSConfig(http2 bool) (*tls.Config, error) {
-	keys, err := p.sessionTicketKeys()
-	if err != nil {
-		return nil, err
+	return p.mitmTLSConfigForConnection(http2, nil)
+}
+
+func (p *interceptProxy) mitmTLSConfigForConnection(http2 bool, connectionPlan *tlsConnectionPlan) (*tls.Config, error) {
+	if p == nil || p.certificates == nil {
+		return nil, errors.New("interception certificate source is unavailable")
 	}
 	config := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
 		GetCertificate: p.certificates.GetCertificate,
 		NextProtos:     mitmTLSNextProtos(http2),
 	}
-	config.SetSessionTicketKeys(keys)
+	config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		certificate, generation, err := p.certificates.certificateForHello(hello)
+		if err != nil {
+			return nil, err
+		}
+		if connectionPlan != nil {
+			connectionPlan.set(generation)
+		}
+		keys, err := p.sessionTicketKeys(generation)
+		if err != nil {
+			return nil, err
+		}
+		selected := &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{*certificate},
+			NextProtos:   mitmTLSNextProtos(http2),
+		}
+		selected.SetSessionTicketKeys(keys)
+		return selected, nil
+	}
 	return config, nil
 }
 
@@ -308,13 +361,24 @@ func (p *interceptProxy) mitmTLSConfig(http2 bool) (*tls.Config, error) {
 // that manages its own. The previous key is kept so a ticket issued just before
 // a rotation still resumes rather than silently falling back to a full
 // handshake.
-func (p *interceptProxy) sessionTicketKeys() ([][32]byte, error) {
+func (p *interceptProxy) sessionTicketKeys(planGeneration string) ([][32]byte, error) {
+	if planGeneration == "" {
+		return nil, errors.New("session ticket key requires a certificate plan generation")
+	}
 	now := time.Now
 	if p.tlsNow != nil {
 		now = p.tlsNow
 	}
 	p.tlsMu.Lock()
 	defer p.tlsMu.Unlock()
+	if p.tlsPlan != planGeneration {
+		// Never retain a decryption key across certificate-plan generations. A
+		// resumed handshake does not select a certificate, so accepting an old
+		// ticket would otherwise bypass the new host-set and leaf boundary.
+		p.tlsPlan = planGeneration
+		p.tlsKeys = nil
+		p.tlsKeysSet = time.Time{}
+	}
 	if len(p.tlsKeys) > 0 && now().Sub(p.tlsKeysSet) < mitmTicketKeyLifetime {
 		return append([][32]byte(nil), p.tlsKeys...), nil
 	}
@@ -370,6 +434,37 @@ func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn ne
 
 func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := canonicalHost(r.Host)
+	cfg, err := p.config.Current()
+	if err != nil {
+		http.Error(w, "interception configuration unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !activeInterceptHost(cfg, host) {
+		http.Error(w, "unrecognized interception host", http.StatusMisdirectedRequest)
+		return
+	}
+	if p.certificates != nil {
+		plan := p.certificates.runtimePlan(cfg)
+		if !plan.state.Ready || plan.certificate == nil {
+			http.Error(w, "interception certificate plan unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if connectionPlan, ok := r.Context().Value(tlsConnectionPlanContextKey{}).(*tlsConnectionPlan); ok {
+			generation := connectionPlan.current()
+			if generation == "" || generation != plan.generation {
+				http.Error(w, "interception connection plan changed", http.StatusMisdirectedRequest)
+				return
+			}
+			if err := plan.certificate.Leaf.VerifyHostname(host); err != nil {
+				http.Error(w, "interception certificate does not cover the request host", http.StatusMisdirectedRequest)
+				return
+			}
+		}
+	}
+	if p.runtimeReady != nil && !p.runtimeReady(cfg, host) {
+		http.Error(w, "interception runtime plan unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if requestHasPayload(r) {
 		controller := http.NewResponseController(w)
 		// Armed before the first read as well: when this handler answers without
@@ -383,15 +478,6 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// rejected oversize upload when Request.Body is the concrete type it
 		// created, and that is what keeps those bytes off the wire.
 		defer func() { r.Body = serverBody }()
-	}
-	cfg, err := p.config.Current()
-	if err != nil {
-		http.Error(w, "interception configuration unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	if !activeInterceptHost(cfg, host) {
-		http.Error(w, "unrecognized interception host", http.StatusMisdirectedRequest)
-		return
 	}
 	requestProbe := moduleRequestProbe(r, host)
 	requestRules := matchingScriptRules(cfg, "request", requestProbe)

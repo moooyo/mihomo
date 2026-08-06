@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -22,15 +24,36 @@ var (
 	ErrModuleNotFound = errors.New("5gpn/engine: extension not found")
 	// ErrInvalidRequest wraps a caller-caused failure the API answers 400 for.
 	ErrInvalidRequest = errors.New("5gpn/engine: invalid request")
+	// ErrUnprocessable marks a syntactically valid management request whose
+	// complete proposed state cannot run. The API answers it with 422 while it
+	// remains an ErrInvalidRequest for callers that classify engine failures.
+	ErrUnprocessable = errors.New("5gpn/engine: unprocessable request")
 )
+
+type unprocessableRequestError struct{ message string }
+
+func (e unprocessableRequestError) Error() string {
+	return ErrInvalidRequest.Error() + ": " + e.message
+}
+
+func (e unprocessableRequestError) Unwrap() []error {
+	return []error{ErrInvalidRequest, ErrUnprocessable}
+}
+
+func unprocessableRequest(format string, args ...any) error {
+	return unprocessableRequestError{message: fmt.Sprintf(format, args...)}
+}
 
 // Revision names the current document.
 func (e *Engine) Revision() string { return e.config.Revision() }
 
 // ReadDocument returns the current document and its revision.
 func (e *Engine) ReadDocument() (Config, string) {
-	cfg, _ := e.config.Current()
-	return cfg, e.config.Revision()
+	view, err := e.CommittedView()
+	if err != nil {
+		return Config{}, ""
+	}
+	return view.Config, view.Revision
 }
 
 // Detail is one extension in full, minus the script bodies.
@@ -39,16 +62,26 @@ func (e *Engine) ReadDocument() (Config, string) {
 // review that needs this does not read them -- it reports their digests, which
 // is what "the code has not changed since you approved it" actually rests on.
 func (e *Engine) Detail(id string) (ModuleDetail, error) {
-	cfg, err := e.config.Current()
+	detail, _, err := e.DetailView(id)
+	return detail, err
+}
+
+// DetailView pairs detail with the revision of the exact committed Config it
+// came from. The runtime phase is derived from that same config rather than a
+// second read that a concurrent write could overtake.
+func (e *Engine) DetailView(id string) (ModuleDetail, string, error) {
+	view, err := e.CommittedView()
 	if err != nil {
-		return ModuleDetail{}, err
+		return ModuleDetail{}, "", err
 	}
-	for _, m := range cfg.Modules {
+	for _, m := range view.Config.Modules {
 		if m.ID == id {
-			return detailOf(m), nil
+			detail := detailOf(m)
+			detail.Runtime = e.extensionRuntimeStateForConfig(view.Config, id)
+			return detail, view.Revision, nil
 		}
 	}
-	return ModuleDetail{}, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
+	return ModuleDetail{}, view.Revision, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
 }
 
 // ModuleDetail is everything a review has to state before an operator confirms.
@@ -106,7 +139,7 @@ func detailOf(m Module) ModuleDetail {
 		SourceDigest:      m.Source.Digest,
 		Network:           m.Network,
 		PersistentStorage: m.PersistentStorage,
-		Settings:          append([]ModuleSetting(nil), m.Settings...),
+		Settings:          cloneModuleSettings(m.Settings),
 		RoutingRules:      append(RoutingRules(nil), m.RoutingRules...),
 	}
 	for _, s := range m.Scripts {
@@ -135,7 +168,7 @@ func detailOf(m Module) ModuleDetail {
 
 // mutate is the shared write: quote a revision, change one thing, publish.
 func (e *Engine) mutate(revision string, fn func(*Config) error) (Snapshot, string, error) {
-	_, next, err := e.config.Update(revision, func(current Config) (Config, error) {
+	compiled, next, err := e.config.Update(revision, func(current Config) (Config, error) {
 		candidate := cloneConfig(current)
 		if err := fn(&candidate); err != nil {
 			return current, err
@@ -148,7 +181,7 @@ func (e *Engine) mutate(revision string, fn func(*Config) error) (Snapshot, stri
 	if e.trafficChanged != nil {
 		e.trafficChanged()
 	}
-	snapshot, err := e.Snapshot()
+	snapshot, err := e.SnapshotFromConfig(compiled)
 	return snapshot, next, err
 }
 
@@ -171,11 +204,30 @@ func cloneConfig(c Config) Config {
 	out.Modules = make([]Module, len(c.Modules))
 	for i, m := range c.Modules {
 		m.CaptureHosts = copyStrings(m.CaptureHosts)
-		m.Settings = append([]ModuleSetting(nil), m.Settings...)
+		m.Settings = cloneModuleSettings(m.Settings)
 		m.Scripts = append([]ScriptRule(nil), m.Scripts...)
 		m.HostMappings = append([]HostMapping(nil), m.HostMappings...)
 		m.RoutingRules = append(RoutingRules(nil), m.RoutingRules...)
 		out.Modules[i] = m
+	}
+	return out
+}
+
+func cloneModuleSettings(settings []ModuleSetting) []ModuleSetting {
+	out := make([]ModuleSetting, len(settings))
+	for i, setting := range settings {
+		setting.Options = append([]string(nil), setting.Options...)
+		setting.Default = append(json.RawMessage(nil), setting.Default...)
+		setting.Value = append(json.RawMessage(nil), setting.Value...)
+		if setting.Min != nil {
+			value := *setting.Min
+			setting.Min = &value
+		}
+		if setting.Max != nil {
+			value := *setting.Max
+			setting.Max = &value
+		}
+		out[i] = setting
 	}
 	return out
 }
@@ -302,26 +354,67 @@ func (e *Engine) SetCaptureDNS(revision, id, resolver string) (Snapshot, string,
 	})
 }
 
-// SetSettingValue writes one typed setting.
+// SettingValues is one complete operator-owned settings document. Values stay
+// as JSON until they are checked against the publisher's typed declarations.
+type SettingValues map[string]json.RawMessage
+
+// SetSettingValues replaces every setting value for one extension atomically.
 //
-// The value is stored raw and validated by the document decode that follows, so
-// there is exactly one implementation of what a `select` accepts or what a
-// `number` may range over -- the one the engine itself uses.
-func (e *Engine) SetSettingValue(revision, id, key string, value json.RawMessage) (Snapshot, string, error) {
+// A partial per-key write can leave action gates observing a combination the
+// operator never submitted. Requiring the exact declared key set lets the
+// engine validate and compile one proposed snapshot, then publish it in one
+// pointer swap. Optional values may be null to clear them; required values must
+// be complete.
+func (e *Engine) SetSettingValues(revision, id string, values SettingValues) (Snapshot, string, error) {
 	return e.mutate(revision, func(c *Config) error {
 		m, err := findModule(c, id)
 		if err != nil {
 			return err
 		}
-		for i := range m.Settings {
-			if m.Settings[i].Key != key {
-				continue
-			}
-			m.Settings[i].Value = append(json.RawMessage(nil), value...)
-			return nil
+		if values == nil {
+			return unprocessableRequest("settings values must be an object containing every declared key")
 		}
-		return fmt.Errorf("%w: extension %q has no setting %q", ErrInvalidRequest, id, key)
+		next, err := settingsWithCompleteValues(m.Settings, values)
+		if err != nil {
+			return err
+		}
+		m.Settings = next
+		return nil
 	})
+}
+
+func settingsWithCompleteValues(settings []ModuleSetting, values SettingValues) ([]ModuleSetting, error) {
+	declared := make(map[string]struct{}, len(settings))
+	for _, setting := range settings {
+		declared[setting.Key] = struct{}{}
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := declared[key]; !ok {
+			return nil, unprocessableRequest("settings contain unknown key %q", key)
+		}
+	}
+
+	next := cloneModuleSettings(settings)
+	for i := range next {
+		raw, ok := values[next[i].Key]
+		if !ok {
+			return nil, unprocessableRequest("settings omit declared key %q", next[i].Key)
+		}
+		if err := validateSettingValue(next[i], raw, next[i].Required); err != nil {
+			return nil, unprocessableRequest("setting %q: %v", next[i].Key, err)
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			next[i].Value = nil
+			continue
+		}
+		next[i].Value = append(json.RawMessage(nil), raw...)
+	}
+	return next, nil
 }
 
 // install adds or replaces an extension, always disabled.
@@ -337,27 +430,31 @@ func (e *Engine) install(revision string, m Module) (Snapshot, string, error) {
 	return e.mutate(revision, installMutation(m))
 }
 
+func (e *Engine) update(revision string, m Module, values SettingValues) (Snapshot, string, error) {
+	return e.mutate(revision, updateMutation(m, values))
+}
+
 // validateInstall applies the install mutation to a private copy and runs the
 // same JSON decode, document validation, and runtime compilation as the write
 // path. It deliberately stops before configStore.Update can persist or publish
 // anything. The returned config is the snapshot the dry run started from.
-func (e *Engine) validateInstall(m Module) (Config, error) {
-	current, err := e.config.Current()
+func (e *Engine) validateInstall(m Module) (CommittedConfigView, error) {
+	view, err := e.CommittedView()
 	if err != nil {
-		return Config{}, err
+		return CommittedConfigView{}, err
 	}
-	candidate := cloneConfig(current)
+	candidate := cloneConfig(view.Config)
 	if err := installMutation(m)(&candidate); err != nil {
-		return Config{}, err
+		return CommittedConfigView{}, err
 	}
 	raw, err := json.MarshalIndent(candidate, "", "  ")
 	if err != nil {
-		return Config{}, fmt.Errorf("5gpn/engine: marshal config: %w", err)
+		return CommittedConfigView{}, fmt.Errorf("5gpn/engine: marshal config: %w", err)
 	}
 	if _, err := decodeConfig(raw); err != nil {
-		return Config{}, err
+		return CommittedConfigView{}, err
 	}
-	return current, nil
+	return view, nil
 }
 
 // installMutation is shared by review and apply so both validate the exact
@@ -365,7 +462,7 @@ func (e *Engine) validateInstall(m Module) (Config, error) {
 func installMutation(m Module) func(*Config) error {
 	return func(c *Config) error {
 		m.Enabled = false
-		m.Settings = append([]ModuleSetting(nil), m.Settings...)
+		m.Settings = cloneModuleSettings(m.Settings)
 		if strings.TrimSpace(m.CaptureDNS) == "" {
 			m.CaptureDNS = "trust"
 		}
@@ -390,19 +487,73 @@ func installMutation(m Module) func(*Config) error {
 	}
 }
 
+// updateMutation replaces an installed extension without changing whether the
+// operator authorized it. The immutable Config pointer is the handoff: requests
+// already holding the previous pointer finish on the old programs, while new
+// requests can only acquire the fully compiled replacement.
+func updateMutation(incoming Module, values SettingValues) func(*Config) error {
+	return func(c *Config) error {
+		for i := range c.Modules {
+			if c.Modules[i].ID != incoming.ID {
+				continue
+			}
+			prepared, err := prepareUpdatedModule(c.Modules[i], incoming, values, c.Modules[i].Enabled)
+			if err != nil {
+				return err
+			}
+			c.Modules[i] = prepared
+			return nil
+		}
+		return fmt.Errorf("%w: %q", ErrModuleNotFound, incoming.ID)
+	}
+}
+
+// prepareUpdatedModule carries only operator-owned state. Publisher-owned
+// defaults remain the fallback: an old value wins when its key and type still
+// match, otherwise the incoming default stays in place.
+func prepareUpdatedModule(previous, incoming Module, values SettingValues, requireReady bool) (Module, error) {
+	incoming.Enabled = previous.Enabled
+	incoming.EgressGroup = previous.EgressGroup
+	incoming.CaptureDNS = previous.CaptureDNS
+	if strings.TrimSpace(incoming.CaptureDNS) == "" {
+		incoming.CaptureDNS = "trust"
+	}
+	incoming.Settings = carryOverSettingValues(previous.Settings, cloneModuleSettings(incoming.Settings))
+	if values != nil {
+		var err error
+		incoming.Settings, err = settingsWithCompleteValues(incoming.Settings, values)
+		if err != nil {
+			return Module{}, err
+		}
+	}
+	if !requireReady {
+		return incoming, nil
+	}
+	if err := validateModuleSettings(incoming.Settings, true); err != nil {
+		return Module{}, unprocessableRequest("extension %q settings are not ready: %v", incoming.ID, err)
+	}
+	if incoming.EgressGroupRequired && strings.TrimSpace(incoming.EgressGroup) == "" {
+		return Module{}, unprocessableRequest("extension %q requires an egress group binding before it can be updated", incoming.ID)
+	}
+	return incoming, nil
+}
+
 // carryOverSettingValues copies previously entered values onto the incoming
-// declaration, by key and only when the type still matches.
+// declaration, by key and only when the type and new constraints still accept
+// them.
 //
 // A type change means the old value is no longer meaningful, and carrying it
 // over would store something the new declaration cannot validate.
 func carryOverSettingValues(previous, incoming []ModuleSetting) []ModuleSetting {
+	incoming = cloneModuleSettings(incoming)
 	byKey := make(map[string]ModuleSetting, len(previous))
 	for _, s := range previous {
 		byKey[s.Key] = s
 	}
 	for i := range incoming {
 		old, ok := byKey[incoming[i].Key]
-		if !ok || old.Type != incoming[i].Type || len(old.Value) == 0 {
+		if !ok || old.Type != incoming[i].Type || len(old.Value) == 0 ||
+			validateSettingValue(incoming[i], old.Value, false) != nil {
 			continue
 		}
 		incoming[i].Value = append(json.RawMessage(nil), old.Value...)

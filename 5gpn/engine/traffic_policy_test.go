@@ -17,8 +17,8 @@ func engineWithTrafficConfig(t *testing.T, cfg Config) *Engine {
 		t.Fatalf("compile traffic config: %v", err)
 	}
 	cfg.runtime = runtime
-	store := &configStore{revision: "unchanged"}
-	store.cur.Store(&cfg)
+	store := &configStore{}
+	store.committed.Store(&CommittedConfigView{Config: cfg, Revision: "unchanged"})
 	e := &Engine{config: store}
 	e.certs = newCertificateStore(store)
 	e.proxy = &interceptProxy{config: store}
@@ -254,9 +254,12 @@ func TestTrafficPolicyLiveGroupRemovalWithdrawsOnlyAffectedCapture(t *testing.T)
 		if !exists || binding.Ready != ready {
 			t.Fatalf("CaptureFor(%s) = %+v, %v; ready want %v", host, binding, exists, ready)
 		}
+		if !binding.Claimed {
+			t.Fatalf("CaptureFor(%s) withdrew the desired DNS/client claim while the master is on", host)
+		}
 		metadata := &C.Metadata{Type: C.HTTP, NetWork: C.TCP, Host: host, DstPort: 443}
-		if got := e.interceptor.MatchTCP(metadata); got != ready {
-			t.Fatalf("MatchTCP(%s) = %v, want %v", host, got, ready)
+		if got := e.interceptor.MatchTCP(metadata); !got {
+			t.Fatalf("MatchTCP(%s) declined a claimed host while ready=%v", host, ready)
 		}
 	}
 

@@ -1,63 +1,244 @@
 package engine
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/metacubex/mihomo/5gpn/state"
 )
 
-// The certificate request is the engine's statement of what the interception
-// leaf must cover: a digest on the first line, then one host pattern per line.
-//
-// It is published as a file rather than printed by a subcommand, and that is
-// the whole point. The consumer is a root oneshot that holds the CA signing
-// key, and the alternative had it execute the network-facing program's binary
-// to find out what to sign. A root process asking an unprivileged program a
-// question is fine; a root process holding the one key that can mint any
-// identity and *running* that program to decide what to mint is a different
-// shape entirely.
-//
-// It is also the only copy. Recomputing the digest in shell would put two
-// implementations of the same hash on either side of a boundary neither can
-// see across, and the failure when they drift is silent: the oneshot reissues
-// on every run, or never reissues at all.
-const certificateRequestName = "certificate-request"
+const (
+	certificateRequestName    = "certificate-request"
+	certificateRequestVersion = 1
+	certificateAttemptBytes   = 16
+	maxCertificateControlFile = 256 << 10
+)
 
-// certificateRequestPath is the file beside the document.
+var (
+	ErrCertificateRetryConflict = errors.New("certificate retry identity is stale")
+	ErrCertificateAlreadyReady  = errors.New("certificate request is already ready")
+)
+
+// certificateRequest is the complete unprivileged-to-root certificate
+// protocol. The random attempt token fences concurrent A -> B -> C updates and
+// explicit retries without turning runtime readiness into persisted config.
+type certificateRequest struct {
+	Version      int      `json:"version"`
+	TargetDigest string   `json:"target_digest"`
+	Attempt      string   `json:"attempt"`
+	Hosts        []string `json:"hosts"`
+}
+
 func certificateRequestPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), certificateRequestName)
 }
 
-// renderCertificateRequest is the exact bytes the oneshot parses.
-//
-// The digest covers the host list and nothing else. It deliberately does not
-// cover the rest of the document: an operator changing a script, a setting or
-// an egress binding has not changed what the certificate must name, and
-// reissuing on those would burn the CA for no reason and churn the leaf under
-// live sessions.
-func renderCertificateRequest(cfg Config) string {
+func desiredCertificateRequest(cfg Config, attempt string) certificateRequest {
 	hosts := certificateHostPatterns(cfg)
-	var b strings.Builder
-	b.WriteString(certificateDigest(cfg))
-	b.WriteByte('\n')
-	for _, host := range hosts {
-		b.WriteString(host)
-		b.WriteByte('\n')
+	return certificateRequest{
+		Version:      certificateRequestVersion,
+		TargetDigest: certificateDigest(cfg),
+		Attempt:      attempt,
+		Hosts:        append(make([]string, 0, len(hosts)), hosts...),
 	}
-	return b.String()
 }
 
-// publishCertificateRequest writes the request beside the document.
-//
-// Called after every successful publish and once at startup, so a gateway that
-// was edited while the oneshot was not running still converges: the path unit
-// fires on the write, and a run that missed one still reads the current file.
 func publishCertificateRequest(configPath string, cfg Config) error {
-	path := certificateRequestPath(configPath)
-	if err := state.WritePublicFile(path, []byte(renderCertificateRequest(cfg))); err != nil {
+	request, err := nextCertificateRequest(certificateRequestPath(configPath), cfg, false)
+	if err != nil {
+		return fmt.Errorf("5gpn/engine: prepare certificate request: %w", err)
+	}
+	if err := writeCertificateRequest(certificateRequestPath(configPath), request); err != nil {
 		return fmt.Errorf("5gpn/engine: publish certificate request: %w", err)
 	}
 	return nil
+}
+
+func writeCertificateRequest(path string, request certificateRequest) error {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	return state.WritePublicFile(path, raw)
+}
+
+func nextCertificateRequest(path string, cfg Config, forceNewAttempt bool) (certificateRequest, error) {
+	desired := desiredCertificateRequest(cfg, "")
+	if !forceNewAttempt && path != "" {
+		if current, err := readCertificateRequest(path); err == nil &&
+			current.TargetDigest == desired.TargetDigest && equalStrings(current.Hosts, desired.Hosts) {
+			desired.Attempt = current.Attempt
+			return desired, nil
+		}
+	}
+	attempt, err := newCertificateAttempt()
+	if err != nil {
+		return certificateRequest{}, err
+	}
+	desired.Attempt = attempt
+	return desired, nil
+}
+
+func newCertificateAttempt() (string, error) {
+	var attempt [certificateAttemptBytes]byte
+	if _, err := io.ReadFull(rand.Reader, attempt[:]); err != nil {
+		return "", fmt.Errorf("generate certificate attempt: %w", err)
+	}
+	return hex.EncodeToString(attempt[:]), nil
+}
+
+func readCertificateRequest(path string) (certificateRequest, error) {
+	raw, err := readBoundedControlFile(path)
+	if err != nil {
+		return certificateRequest{}, err
+	}
+	var request certificateRequest
+	if err := decodeStrictCertificateJSON(raw, &request); err != nil {
+		return certificateRequest{}, err
+	}
+	if request.Version != certificateRequestVersion {
+		return certificateRequest{}, errors.New("unsupported certificate request version")
+	}
+	if !validLowerHex(request.TargetDigest, 64) {
+		return certificateRequest{}, errors.New("invalid certificate request target digest")
+	}
+	if !validLowerHex(request.Attempt, certificateAttemptBytes*2) {
+		return certificateRequest{}, errors.New("invalid certificate request attempt")
+	}
+	if request.Hosts == nil || len(request.Hosts) > maxCertificateHosts ||
+		!equalStrings(request.Hosts, uniqueSorted(request.Hosts)) {
+		return certificateRequest{}, errors.New("invalid certificate request hosts")
+	}
+	for _, host := range request.Hosts {
+		if !validHostPattern(host) {
+			return certificateRequest{}, errors.New("invalid certificate request host")
+		}
+	}
+	return request, nil
+}
+
+func readBoundedControlFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxCertificateControlFile+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxCertificateControlFile {
+		return nil, errors.New("certificate control file is too large")
+	}
+	return raw, nil
+}
+
+func decodeStrictCertificateJSON(raw []byte, destination any) error {
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func validLowerHex(value string, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			if char < 'a' || char > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// RetryCertificateRequest republishes a publisher-reported error under a fresh
+// attempt token. The caller must quote both current identities. A pending
+// request is idempotent, a ready request is refused, and the config-store lock
+// makes the identity check and publication one CAS with document updates.
+func (e *Engine) RetryCertificateRequest(expectedRevision, expectedTargetDigest, expectedAttempt string) (Snapshot, string, error) {
+	if e == nil || e.config == nil {
+		return Snapshot{}, "", errors.New("5gpn/engine: interception is unavailable")
+	}
+	var snapshot Snapshot
+	var currentRevision string
+	err := e.config.WithCurrentLocked(func(cfg Config, revision string) error {
+		currentRevision = revision
+		var snapshotErr error
+		snapshot, snapshotErr = e.SnapshotFromConfig(cfg)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+		if expectedRevision == "" || expectedRevision != revision {
+			return state.ErrRevisionConflict
+		}
+		current, err := readCertificateRequest(certificateRequestPath(e.config.path))
+		if err != nil || current.TargetDigest != certificateDigest(cfg) ||
+			!equalStrings(current.Hosts, certificateHostPatterns(cfg)) ||
+			expectedTargetDigest != current.TargetDigest || expectedAttempt != current.Attempt {
+			return ErrCertificateRetryConflict
+		}
+		result, err := readCertificateResult(certificateStatePath(cfg), len(current.Hosts) == 0)
+		if err != nil || result.TargetDigest != current.TargetDigest || result.Attempt != current.Attempt {
+			// Missing, malformed and stale results are all still pending. Preserve
+			// the identity but atomically rewrite the request so a path-unit event
+			// lost to lock contention is retriggered. systemd serializes the
+			// oneshot; no second signing attempt can overlap the first.
+			if err := writeCertificateRequest(certificateRequestPath(e.config.path), current); err != nil {
+				return fmt.Errorf("5gpn/engine: retry pending certificate request: %w", err)
+			}
+			return nil
+		}
+		if result.Status == "ready" {
+			return ErrCertificateAlreadyReady
+		}
+		if result.Status != "error" {
+			return nil
+		}
+		published, err := nextCertificateRequest(certificateRequestPath(e.config.path), cfg, true)
+		if err != nil {
+			return err
+		}
+		if err := writeCertificateRequest(certificateRequestPath(e.config.path), published); err != nil {
+			return fmt.Errorf("5gpn/engine: retry certificate request: %w", err)
+		}
+		if e.certs != nil {
+			e.certs.invalidateRuntimePlan()
+		}
+		snapshot, err = e.SnapshotFromConfig(cfg)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return snapshot, currentRevision, err
+	}
+	return snapshot, currentRevision, nil
 }

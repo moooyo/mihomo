@@ -221,6 +221,46 @@ func TestWritesRequireTheCurrentRevision(t *testing.T) {
 	}
 }
 
+func TestMutationResponseUsesTheConfigCommittedAtItsReturnedRevision(t *testing.T) {
+	e := newTestEngine(t, twoExtensionDocument)
+	initial := e.Revision()
+	var callbackRevision string
+	var callbackErr error
+	e.trafficChanged = func() {
+		_, callbackRevision, callbackErr = e.config.Update(e.Revision(), func(current Config) (Config, error) {
+			candidate := cloneConfig(current)
+			module, err := findModule(&candidate, "first")
+			if err != nil {
+				return current, err
+			}
+			module.CaptureDNS = "trust"
+			return candidate, nil
+		})
+	}
+
+	snapshot, revision, err := e.SetCaptureDNS(initial, "first", "china")
+	if err != nil {
+		t.Fatalf("first mutation: %v", err)
+	}
+	if callbackErr != nil {
+		t.Fatalf("interleaved mutation: %v", callbackErr)
+	}
+	if revision == initial || callbackRevision == revision || e.Revision() != callbackRevision {
+		t.Fatalf("revisions initial=%q response=%q callback=%q current=%q", initial, revision, callbackRevision, e.Revision())
+	}
+	for _, module := range snapshot.Modules {
+		if module.ID == "first" && module.CaptureDNS != "china" {
+			t.Fatalf("response snapshot came from later revision: %+v", module)
+		}
+	}
+	current, _ := e.ReadDocument()
+	for _, module := range current.Modules {
+		if module.ID == "first" && module.CaptureDNS != "trust" {
+			t.Fatalf("interleaved current config = %+v", module)
+		}
+	}
+}
+
 func TestRejectedWriteLeavesTheDocumentRunning(t *testing.T) {
 	e := newTestEngine(t, twoExtensionDocument)
 	before, revision := e.ReadDocument()
@@ -343,6 +383,95 @@ func TestReinstallDropsAValueWhoseTypeChanged(t *testing.T) {
 	got := carryOverSettingValues(previous, incoming)
 	if len(got[0].Value) != 0 {
 		t.Errorf("value %s survived a type change", got[0].Value)
+	}
+}
+
+func TestCarryOverFallsBackToTheNewDefaultWhenConstraintsChanged(t *testing.T) {
+	previous := []ModuleSetting{{
+		Key: "region", Type: "select", Options: []string{"cn", "hk"}, Value: json.RawMessage(`"hk"`),
+	}}
+	incoming := []ModuleSetting{{
+		Key: "region", Type: "select", Required: true, Options: []string{"cn"},
+		Default: json.RawMessage(`"cn"`), Value: json.RawMessage(`"cn"`),
+	}}
+	got := carryOverSettingValues(previous, incoming)
+	if value := string(got[0].Value); value != `"cn"` {
+		t.Fatalf("carried invalid old option %s instead of new default", value)
+	}
+}
+
+func TestSetSettingValuesIsACompleteAtomicTransaction(t *testing.T) {
+	e := newTestEngine(t, twoExtensionDocument)
+	revision := e.Revision()
+
+	rejected := []SettingValues{
+		nil,
+		{},
+		{"region": json.RawMessage(`"cn"`), "unknown": json.RawMessage(`true`)},
+		{"region": json.RawMessage(`"outside-the-declared-options"`)},
+	}
+	for _, values := range rejected {
+		_, returned, err := e.SetSettingValues(revision, "second", values)
+		if !errors.Is(err, ErrInvalidRequest) || !errors.Is(err, ErrUnprocessable) {
+			t.Fatalf("SetSettingValues(%v) returned %v, want an unprocessable invalid request", values, err)
+		}
+		if returned != revision || e.Revision() != revision {
+			t.Fatalf("rejected settings write moved revision %q to returned=%q current=%q", revision, returned, e.Revision())
+		}
+		detail, detailErr := e.Detail("second")
+		if detailErr != nil {
+			t.Fatal(detailErr)
+		}
+		if got := string(detail.Settings[0].Value); got != `"cn"` {
+			t.Fatalf("rejected settings write changed region to %s", got)
+		}
+	}
+
+	_, next, err := e.SetSettingValues(revision, "second", SettingValues{
+		"region": json.RawMessage(`"hk"`),
+	})
+	if err != nil {
+		t.Fatalf("SetSettingValues(valid): %v", err)
+	}
+	if next == revision {
+		t.Fatal("valid complete settings write did not move the revision")
+	}
+	detail, err := e.Detail("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(detail.Settings[0].Value); got != `"hk"` {
+		t.Fatalf("stored region = %s, want hk", got)
+	}
+}
+
+func TestSetSettingValuesCanClearAnOptionalValue(t *testing.T) {
+	e := newTestEngine(t, twoExtensionDocument)
+	if _, _, err := e.install(e.Revision(), Module{
+		ID:           "optional-setting",
+		Version:      "1.0.0",
+		Name:         "Optional setting",
+		ImportedAt:   "2026-08-06T00:00:00Z",
+		Source:       ModuleSource{Digest: digestText("{}"), Body: "{}"},
+		CaptureHosts: []string{"optional.example.com"},
+		HostMappings: []HostMapping{{Pattern: "optional.example.com", Target: "origin.optional.example.net"}},
+		Settings: []ModuleSetting{{
+			Key: "note", Type: "text", Value: json.RawMessage(`"present"`),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.SetSettingValues(e.Revision(), "optional-setting", SettingValues{
+		"note": json.RawMessage(`null`),
+	}); err != nil {
+		t.Fatalf("clear optional value: %v", err)
+	}
+	detail, err := e.Detail("optional-setting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Settings) != 1 || len(detail.Settings[0].Value) != 0 {
+		t.Fatalf("optional value was not cleared: %+v", detail.Settings)
 	}
 }
 
@@ -509,25 +638,24 @@ func TestCertificateRequestIsPublishedAndFollowsTheDocument(t *testing.T) {
 	e := &Engine{config: store}
 
 	requestPath := filepath.Join(dir, "certificate-request")
-	read := func() (string, []string) {
+	read := func() certificateRequest {
 		t.Helper()
-		raw, err := os.ReadFile(requestPath)
+		request, err := readCertificateRequest(requestPath)
 		if err != nil {
 			t.Fatalf("the certificate request is not published: %v", err)
 		}
-		lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-		return lines[0], lines[1:]
+		return request
 	}
 
-	digest, hosts := read()
-	if len(digest) != 64 {
-		t.Errorf("digest %q is not a sha256 hex string", digest)
+	initial := read()
+	if initial.Version != certificateRequestVersion || len(initial.TargetDigest) != 64 || len(initial.Attempt) != certificateAttemptBytes*2 {
+		t.Errorf("invalid certificate request identity: %+v", initial)
 	}
 	// Only "first" is enabled, so only its hosts are covered. A leaf naming a
 	// disabled extension's hosts would let capture begin the moment it was
 	// enabled, with no reissue and therefore no record of the widening.
-	if !equalUnordered(hosts, []string{"*.first.example", "shared.example.com"}) {
-		t.Errorf("hosts %v, want only the enabled extension's", hosts)
+	if !equalUnordered(initial.Hosts, []string{"*.first.example", "shared.example.com"}) {
+		t.Errorf("hosts %v, want only the enabled extension's", initial.Hosts)
 	}
 
 	// Enabling the second widens the set, and the digest has to move with it --
@@ -538,12 +666,12 @@ func TestCertificateRequestIsPublishedAndFollowsTheDocument(t *testing.T) {
 	if _, _, err := e.SetEnabled(e.Revision(), "second", true); err != nil {
 		t.Fatal(err)
 	}
-	widened, hosts := read()
-	if widened == digest {
+	widened := read()
+	if widened.TargetDigest == initial.TargetDigest || widened.Attempt == initial.Attempt {
 		t.Error("the digest did not move when an extension was enabled")
 	}
-	if !equalUnordered(hosts, []string{"*.first.example", "*.second.example", "shared.example.com"}) {
-		t.Errorf("hosts %v after enabling the second extension", hosts)
+	if !equalUnordered(widened.Hosts, []string{"*.first.example", "*.second.example", "shared.example.com"}) {
+		t.Errorf("hosts %v after enabling the second extension", widened.Hosts)
 	}
 
 	// An edit that does not change what must be covered must NOT move the
@@ -552,8 +680,9 @@ func TestCertificateRequestIsPublishedAndFollowsTheDocument(t *testing.T) {
 	if _, _, err := e.SetCaptureDNS(e.Revision(), "first", "china"); err != nil {
 		t.Fatal(err)
 	}
-	if again, _ := read(); again != widened {
-		t.Error("an unrelated edit moved the certificate digest")
+	again := read()
+	if again.TargetDigest != widened.TargetDigest || again.Attempt != widened.Attempt || !equalStrings(again.Hosts, widened.Hosts) {
+		t.Error("an unrelated edit moved the certificate request identity")
 	}
 }
 

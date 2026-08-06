@@ -50,6 +50,7 @@ func interceptionRouter() http.Handler {
 	r.Get("/", getInterception)
 	r.Put("/settings", putInterceptionSettings)
 	r.Put("/order", putInterceptionOrder)
+	r.Post("/certificate/retry", postCertificateRetry)
 	r.Post("/review", postReview)
 	r.Post("/extensions", postInstall)
 	r.Get("/logs", getEngineLogs)
@@ -65,7 +66,7 @@ func interceptionRouter() http.Handler {
 		r.Put("/enabled", putExtensionEnabled)
 		r.Put("/egress", putExtensionEgress)
 		r.Put("/capture-dns", putExtensionCaptureDNS)
-		r.Put("/settings/{key}", putExtensionSetting)
+		r.Put("/settings", putExtensionSettings)
 	})
 	return r
 }
@@ -119,12 +120,12 @@ func postReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	candidate, err := e.Fetch(ctx, body)
+	candidate, revision, err := e.FetchView(ctx, body)
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
 	}
-	render.JSON(w, r, render.M{"candidate": candidate, "revision": e.Revision()})
+	render.JSON(w, r, render.M{"candidate": candidate, "revision": revision})
 }
 
 type installRequest struct {
@@ -156,17 +157,18 @@ func getUpdate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	candidate, err := e.CheckUpdate(ctx, chi.URLParam(r, "id"))
+	candidate, revision, err := e.CheckUpdateView(ctx, chi.URLParam(r, "id"))
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
 	}
-	render.JSON(w, r, render.M{"candidate": candidate, "revision": e.Revision()})
+	render.JSON(w, r, render.M{"candidate": candidate, "revision": revision})
 }
 
 type updateRequest struct {
-	Revision string `json:"revision"`
-	Digest   string `json:"digest"`
+	Revision string               `json:"revision"`
+	Digest   string               `json:"digest"`
+	Values   engine.SettingValues `json:"values"`
 }
 
 func (b *updateRequest) revision() string { return b.Revision }
@@ -180,7 +182,7 @@ func postUpdate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	snapshot, revision, err := e.ApplyUpdate(ctx, body.Revision, chi.URLParam(r, "id"), body.Digest)
+	snapshot, revision, err := e.ApplyUpdateWithSettings(ctx, body.Revision, chi.URLParam(r, "id"), body.Digest, body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
@@ -197,13 +199,19 @@ func getInterception(w http.ResponseWriter, r *http.Request) {
 		unavailable(w, r, "the interception engine is not installed")
 		return
 	}
-	snapshot, err := e.Snapshot()
+	view, err := e.CommittedView()
 	if err != nil {
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, render.M{"message": err.Error()})
 		return
 	}
-	render.JSON(w, r, interceptionResponse{Snapshot: snapshot, Revision: e.Revision()})
+	snapshot, err := e.SnapshotFromConfig(view.Config)
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, render.M{"message": err.Error()})
+		return
+	}
+	render.JSON(w, r, interceptionResponse{Snapshot: snapshot, Revision: view.Revision})
 }
 
 func getExtension(w http.ResponseWriter, r *http.Request) {
@@ -212,12 +220,12 @@ func getExtension(w http.ResponseWriter, r *http.Request) {
 		unavailable(w, r, "the interception engine is not installed")
 		return
 	}
-	detail, err := e.Detail(chi.URLParam(r, "id"))
+	detail, revision, err := e.DetailView(chi.URLParam(r, "id"))
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
 	}
-	render.JSON(w, r, render.M{"extension": detail, "revision": e.Revision()})
+	render.JSON(w, r, render.M{"extension": detail, "revision": revision})
 }
 
 type settingsRequest struct {
@@ -225,6 +233,29 @@ type settingsRequest struct {
 	Enabled  bool   `json:"enabled"`
 	HTTP2    bool   `json:"http2"`
 	HTTP3    bool   `json:"http3"`
+}
+
+type certificateRetryRequest struct {
+	Revision     string `json:"revision"`
+	TargetDigest string `json:"target_digest"`
+	Attempt      string `json:"attempt"`
+}
+
+func (b *certificateRetryRequest) revision() string { return b.Revision }
+
+func postCertificateRetry(w http.ResponseWriter, r *http.Request) {
+	var body certificateRetryRequest
+	e, ok := decodeWrite(w, r, &body)
+	if !ok {
+		return
+	}
+	snapshot, revision, err := e.RetryCertificateRequest(body.Revision, body.TargetDigest, body.Attempt)
+	if err != nil {
+		writeEngineError(w, r, err, e)
+		return
+	}
+	render.Status(r, http.StatusAccepted)
+	render.JSON(w, r, interceptionResponse{Snapshot: snapshot, Revision: revision})
 }
 
 func putInterceptionSettings(w http.ResponseWriter, r *http.Request) {
@@ -256,12 +287,12 @@ func getCatalog(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	view, err := e.Catalog(ctx, r.URL.Query().Get("refresh") == "1")
+	view, revision, err := e.CatalogWithRevision(ctx, r.URL.Query().Get("refresh") == "1")
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
 	}
-	render.JSON(w, r, render.M{"catalog": view, "revision": e.Revision()})
+	render.JSON(w, r, render.M{"catalog": view, "revision": revision})
 }
 
 type catalogSourcesRequest struct {
@@ -299,24 +330,20 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	source, entry := chi.URLParam(r, "source"), chi.URLParam(r, "entry")
-	candidate, err := e.ReviewCatalogEntry(ctx, source, entry)
-	if err != nil {
-		writeEngineError(w, r, err, e)
-		return
-	}
-	url, err := e.CatalogEntrySource(ctx, source, entry)
+	candidate, url, revision, err := e.ReviewCatalogEntryView(ctx, source, entry)
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
 	}
 	// The URL is returned so the install quotes the same source this review
 	// read, rather than the client reconstructing it from the listing.
-	render.JSON(w, r, render.M{"candidate": candidate, "url": url, "revision": e.Revision()})
+	render.JSON(w, r, render.M{"candidate": candidate, "url": url, "revision": revision})
 }
 
 type catalogUpdateRequest struct {
-	Revision string `json:"revision"`
-	Digest   string `json:"digest"`
+	Revision string               `json:"revision"`
+	Digest   string               `json:"digest"`
+	Values   engine.SettingValues `json:"values"`
 }
 
 func (b *catalogUpdateRequest) revision() string { return b.Revision }
@@ -337,8 +364,8 @@ func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	snapshot, revision, err := e.ApplyCatalogUpdate(
-		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.Digest)
+	snapshot, revision, err := e.ApplyCatalogUpdateWithSettings(
+		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.Digest, body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
@@ -402,18 +429,18 @@ func putExtensionCaptureDNS(w http.ResponseWriter, r *http.Request) {
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
-type settingValueRequest struct {
-	Revision string          `json:"revision"`
-	Value    json.RawMessage `json:"value"`
+type extensionSettingsRequest struct {
+	Revision string               `json:"revision"`
+	Values   engine.SettingValues `json:"values"`
 }
 
-func putExtensionSetting(w http.ResponseWriter, r *http.Request) {
-	var body settingValueRequest
+func putExtensionSettings(w http.ResponseWriter, r *http.Request) {
+	var body extensionSettingsRequest
 	e, ok := decodeWrite(w, r, &body)
 	if !ok {
 		return
 	}
-	snapshot, revision, err := e.SetSettingValue(body.Revision, chi.URLParam(r, "id"), chi.URLParam(r, "key"), body.Value)
+	snapshot, revision, err := e.SetSettingValues(body.Revision, chi.URLParam(r, "id"), body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
@@ -460,13 +487,13 @@ func decodeWrite(w http.ResponseWriter, r *http.Request, into revisioned) (*engi
 // write on this surface.
 type revisioned interface{ revision() string }
 
-func (b *settingsRequest) revision() string     { return b.Revision }
-func (b *orderRequest) revision() string        { return b.Revision }
-func (b *enabledRequest) revision() string      { return b.Revision }
-func (b *egressRequest) revision() string       { return b.Revision }
-func (b *captureDNSRequest) revision() string   { return b.Revision }
-func (b *settingValueRequest) revision() string { return b.Revision }
-func (b *deleteRequest) revision() string       { return b.Revision }
+func (b *settingsRequest) revision() string          { return b.Revision }
+func (b *orderRequest) revision() string             { return b.Revision }
+func (b *enabledRequest) revision() string           { return b.Revision }
+func (b *egressRequest) revision() string            { return b.Revision }
+func (b *captureDNSRequest) revision() string        { return b.Revision }
+func (b *extensionSettingsRequest) revision() string { return b.Revision }
+func (b *deleteRequest) revision() string            { return b.Revision }
 
 func respondEngine(w http.ResponseWriter, r *http.Request, snapshot engine.Snapshot, revision string, err error, e *engine.Engine) {
 	if err != nil {
@@ -489,8 +516,20 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error, e *engi
 			"message":  "the interception document changed since you read it",
 			"revision": e.Revision(),
 		})
+	case errors.Is(err, engine.ErrCertificateRetryConflict):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, render.M{
+			"message":  err.Error(),
+			"revision": e.Revision(),
+		})
+	case errors.Is(err, engine.ErrCertificateAlreadyReady):
+		render.Status(r, http.StatusUnprocessableEntity)
+		render.JSON(w, r, render.M{"message": err.Error()})
 	case errors.Is(err, engine.ErrModuleNotFound):
 		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, render.M{"message": err.Error()})
+	case errors.Is(err, engine.ErrUnprocessable):
+		render.Status(r, http.StatusUnprocessableEntity)
 		render.JSON(w, r, render.M{"message": err.Error()})
 	case errors.Is(err, engine.ErrInvalidRequest):
 		badRequest(w, r, err.Error())

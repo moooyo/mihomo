@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+
+	"github.com/metacubex/mihomo/5gpn/state"
 )
 
 // Import, update check, and update apply.
@@ -117,27 +119,50 @@ type Candidate struct {
 // and report. What differs is only whether anything is installed under the id
 // already, which the response says.
 func (e *Engine) Fetch(ctx context.Context, request ImportRequest) (Candidate, error) {
+	candidate, _, err := e.FetchView(ctx, request)
+	return candidate, err
+}
+
+// FetchView returns the candidate together with the revision of the committed
+// config whose operator values were projected into its detail.
+func (e *Engine) FetchView(ctx context.Context, request ImportRequest) (Candidate, string, error) {
+	candidate, view, err := e.fetchCandidateView(ctx, request)
+	return candidate, view.Revision, err
+}
+
+func (e *Engine) fetchCandidateView(ctx context.Context, request ImportRequest) (Candidate, CommittedConfigView, error) {
 	imp, err := currentImporter()
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, CommittedConfigView{}, err
 	}
 	module, err := imp.Import(ctx, request)
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, CommittedConfigView{}, err
 	}
-	current, err := e.validateInstall(module)
+	view, err := e.validateInstall(module)
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, CommittedConfigView{}, err
 	}
-	candidate := Candidate{Detail: detailOf(module), Digest: SnapshotDigest(module)}
+	proposed := module
+	candidate := Candidate{Digest: SnapshotDigest(module)}
 
-	for _, installed := range current.Modules {
+	for _, installed := range view.Config.Modules {
 		if installed.ID == module.ID {
 			candidate.Installed = SnapshotDigest(installed)
 			candidate.InstalledVersion = installed.Version
+			// Review the state that would actually land: operator values whose key
+			// and type still match win, then the new publisher default. Readiness
+			// is intentionally deferred to apply so a newly required value can be
+			// collected by the confirmation rather than making review impossible.
+			proposed, err = prepareUpdatedModule(installed, module, nil, false)
+			if err != nil {
+				return Candidate{}, CommittedConfigView{}, err
+			}
+			break
 		}
 	}
-	return candidate, nil
+	candidate.Detail = detailOf(proposed)
+	return candidate, view, nil
 }
 
 // CheckUpdate re-fetches an installed extension from the URL it came from.
@@ -150,30 +175,43 @@ func (e *Engine) Fetch(ctx context.Context, request ImportRequest) (Candidate, e
 // see ApplyCatalogUpdate. The distinction that matters is not "may the source
 // ever change" but "may it change without being asked".
 func (e *Engine) CheckUpdate(ctx context.Context, id string) (Candidate, error) {
-	cfg, err := e.config.Current()
+	candidate, _, err := e.CheckUpdateView(ctx, id)
+	return candidate, err
+}
+
+// CheckUpdateView pairs the review with the committed revision that supplied
+// its carried operator values.
+func (e *Engine) CheckUpdateView(ctx context.Context, id string) (Candidate, string, error) {
+	view, err := e.CommittedView()
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, "", err
 	}
-	for _, m := range cfg.Modules {
+	for _, m := range view.Config.Modules {
 		if m.ID != id {
 			continue
 		}
 		if strings.TrimSpace(m.Source.URL) == "" {
-			return Candidate{}, fmt.Errorf("%w: extension %q was imported from a pasted manifest and has no source to check", ErrInvalidRequest, id)
+			return Candidate{}, view.Revision, fmt.Errorf("%w: extension %q was imported from a pasted manifest and has no source to check", ErrInvalidRequest, id)
 		}
-		candidate, err := e.Fetch(ctx, ImportRequest{URL: m.Source.URL})
+		sourceURL := m.Source.URL
+		candidate, current, err := e.fetchCandidateView(ctx, ImportRequest{URL: sourceURL})
 		if err != nil {
-			return Candidate{}, err
+			return Candidate{}, current.Revision, err
 		}
 		if candidate.Detail.ID != id {
 			// The URL now serves a different extension. Applying it would
 			// replace one extension with another under the operator's existing
 			// bindings, which is not an update.
-			return Candidate{}, fmt.Errorf("%w: %s now serves extension %q, not %q", ErrInvalidRequest, m.Source.URL, candidate.Detail.ID, id)
+			return Candidate{}, current.Revision, fmt.Errorf("%w: %s now serves extension %q, not %q", ErrInvalidRequest, sourceURL, candidate.Detail.ID, id)
 		}
-		return candidate, nil
+		for _, installed := range current.Config.Modules {
+			if installed.ID == id && installed.Source.URL == sourceURL {
+				return candidate, current.Revision, nil
+			}
+		}
+		return Candidate{}, current.Revision, state.ErrRevisionConflict
 	}
-	return Candidate{}, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
+	return Candidate{}, view.Revision, fmt.Errorf("%w: %q", ErrModuleNotFound, id)
 }
 
 // InstallRequest is an import the operator has reviewed and confirmed.
@@ -211,41 +249,41 @@ func (e *Engine) Install(ctx context.Context, revision string, request InstallRe
 
 // ApplyUpdate replaces an installed extension with a reviewed candidate.
 //
-// The extension must be disabled. An update swaps every script the engine is
-// running, and doing that underneath live captured sessions would have requests
-// mid-flight served partly by the old code and partly by the new -- so the
-// operator disables, updates, reviews and re-enables, which is three deliberate
-// steps and one clear state at each of them.
+// Enabled extensions remain enabled. Runtime configs are immutable: a request
+// already holding the old pointer finishes entirely on its old programs, and a
+// request that starts after publication can only acquire the fully validated
+// replacement.
 func (e *Engine) ApplyUpdate(ctx context.Context, revision, id, digest string) (Snapshot, string, error) {
-	cfg, err := e.config.Current()
+	return e.ApplyUpdateWithSettings(ctx, revision, id, digest, nil)
+}
+
+// ApplyUpdateWithSettings applies an update and, when values is non-nil,
+// atomically replaces the complete candidate settings document with it. This
+// is how an operator supplies a newly required value without first installing
+// a half-configured version.
+func (e *Engine) ApplyUpdateWithSettings(ctx context.Context, revision, id, digest string, values SettingValues) (Snapshot, string, error) {
+	view, err := e.CommittedView()
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
-	installed, err := updatableModule(cfg, id)
+	if revision != "" && revision != view.Revision {
+		return Snapshot{}, view.Revision, state.ErrRevisionConflict
+	}
+	installed, err := updatableModule(view.Config, id)
 	if err != nil {
 		return Snapshot{}, revision, err
 	}
 	if strings.TrimSpace(installed.Source.URL) == "" {
 		return Snapshot{}, revision, fmt.Errorf("%w: extension %q has no source URL to update from", ErrInvalidRequest, id)
 	}
-	return e.applyUpdateFrom(ctx, revision, id, installed.Source.URL, digest, nil)
+	return e.applyUpdateFrom(ctx, revision, id, installed.Source.URL, digest, values, nil)
 }
 
-// updatableModule finds an installed extension that is in a state an update may
-// replace.
-//
-// Disabled is the requirement. An update swaps every script the engine is
-// running, and doing that underneath live captured sessions would have requests
-// mid-flight served partly by the old code and partly by the new -- so the
-// operator disables, updates, reviews and re-enables, which is three deliberate
-// steps and one clear state at each of them.
+// updatableModule finds the installed extension an update will replace.
 func updatableModule(cfg Config, id string) (Module, error) {
 	for _, m := range cfg.Modules {
 		if m.ID != id {
 			continue
-		}
-		if m.Enabled {
-			return Module{}, fmt.Errorf("%w: disable extension %q before updating it", ErrInvalidRequest, id)
 		}
 		return m, nil
 	}
@@ -259,6 +297,7 @@ func updatableModule(cfg Config, id string) (Module, error) {
 func (e *Engine) applyUpdateFrom(
 	ctx context.Context,
 	revision, id, sourceURL, digest string,
+	values SettingValues,
 	verify func(Module) error,
 ) (Snapshot, string, error) {
 	if strings.TrimSpace(digest) == "" {
@@ -285,5 +324,5 @@ func (e *Engine) applyUpdateFrom(
 			return Snapshot{}, revision, err
 		}
 	}
-	return e.install(revision, module)
+	return e.update(revision, module, values)
 }

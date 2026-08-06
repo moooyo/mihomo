@@ -57,6 +57,7 @@ func New(configPath, stateDir string) (*Engine, error) {
 	e := &Engine{
 		config: config, certs: certs, logs: logs, proxy: proxy,
 	}
+	proxy.runtimeReady = e.runtimeReadyForHostConfig
 	e.interceptor = NewInterceptor(proxy)
 	e.interceptor.engine = e
 	return e, nil

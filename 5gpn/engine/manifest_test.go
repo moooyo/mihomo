@@ -342,14 +342,19 @@ func TestInstallAndUpdateRequireADigest(t *testing.T) {
 	}
 }
 
-// An update swaps every script the engine is running. Doing that underneath
-// live sessions would serve one request partly by the old code and partly by
-// the new.
-func TestUpdateRequiresTheExtensionDisabled(t *testing.T) {
-	e := newTestEngine(t, twoExtensionDocument)
-	_, _, err := e.ApplyUpdate(context.Background(), e.Revision(), "first", "some-digest")
-	if err == nil || !strings.Contains(err.Error(), "disable") {
-		t.Errorf("updating an enabled extension returned %v, want a refusal naming disable", err)
+// Enabled state is operator authorization, not a lock on the immutable runtime
+// pointer. A reviewed update may therefore replace an enabled extension.
+func TestEnabledExtensionIsUpdatable(t *testing.T) {
+	cfg, err := decodeConfig([]byte(twoExtensionDocument))
+	if err != nil {
+		t.Fatal(err)
+	}
+	module, err := updatableModule(cfg, "first")
+	if err != nil {
+		t.Fatalf("enabled extension is not updatable: %v", err)
+	}
+	if !module.Enabled {
+		t.Fatal("fixture extension unexpectedly disabled")
 	}
 }
 

@@ -125,7 +125,7 @@ func (e *Engine) moduleEgressReady(module Module) bool {
 
 func (e *Engine) readyCaptureHostPatterns(cfg Config) []string {
 	patterns := make([]string, 0)
-	if !cfg.MITM.Enabled || !e.clientBoundaryIsReady() {
+	if !cfg.MITM.Enabled || !e.clientBoundaryIsReady() || !e.certificateRuntimeReady(cfg) {
 		return patterns
 	}
 	policy, err := trafficPolicyForConfig(cfg)
@@ -164,6 +164,16 @@ func (e *Engine) captureDestinationReady(policy *compiledTrafficPolicy, host str
 	metadata := &C.Metadata{Type: C.INNER, NetWork: C.TCP, Host: canonicalHost(host), DstPort: 443}
 	_, matched, err := e.selectDestinationEgress(policy, metadata)
 	return matched && err == nil
+}
+
+func (e *Engine) runtimeReadyForHostConfig(cfg Config, host string) bool {
+	host = canonicalHost(host)
+	if e == nil || host == "" || !cfg.MITM.Enabled || !activeInterceptHost(cfg, host) ||
+		!e.certificateRuntimeReady(cfg) || !e.clientBoundaryIsReady() {
+		return false
+	}
+	policy, err := trafficPolicyForConfig(cfg)
+	return err == nil && e.captureDestinationReady(policy, host)
 }
 
 // TrafficPolicy exposes the immutable runtime policy backed by the engine's
@@ -400,13 +410,30 @@ func (e *Engine) RouteClient(metadata *C.Metadata) C.ClientRouteAction {
 	if metadata == nil || metadata.Type == C.INNER {
 		return C.ClientRouteNone
 	}
-	policy, err := e.compiledTrafficPolicy()
+	if e == nil || e.config == nil {
+		return C.ClientRouteNone
+	}
+	cfg, err := e.config.Current()
+	if err != nil {
+		return C.ClientRouteNone
+	}
+	policy, err := trafficPolicyForConfig(cfg)
 	if err != nil || !policy.enabled {
 		return C.ClientRouteNone
 	}
 	input := clientTrafficInput{
 		host: canonicalHost(metadata.RuleHost()), dstIP: metadata.DstIP,
 		network: metadata.NetWork, port: metadata.DstPort,
+	}
+	// Desired extensions remain visible while their global certificate plan or
+	// fixed client boundary is unavailable, but none of their routing decisions
+	// are live. Traffic already steered to a claimed HTTP(S) host is rejected
+	// here before capture and before ordinary mihomo fallback.
+	if !e.certificateRuntimeReady(cfg) || !e.clientBoundaryIsReady() {
+		if input.network == C.TCP && (input.port == 80 || input.port == 443) && policy.claimsCaptureHost(input.host) {
+			return C.ClientRouteReject
+		}
+		return C.ClientRouteNone
 	}
 	for _, rule := range policy.client {
 		if rule.matches(input) {
@@ -435,12 +462,34 @@ func (e *Engine) RouteClient(metadata *C.Metadata) C.ClientRouteAction {
 	return C.ClientRouteNone
 }
 
+func (p *compiledTrafficPolicy) claimsCaptureHost(host string) bool {
+	if p == nil || host == "" {
+		return false
+	}
+	for _, binding := range p.egress {
+		if binding.captureHosts.matchCanonical(host) {
+			return true
+		}
+	}
+	return false
+}
+
 // SelectEgress resolves one transformed flow to operator-owned state.
 func (e *Engine) SelectEgress(metadata *C.Metadata, owner string, ownerOnly bool) (string, error) {
 	if metadata == nil || metadata.Type != C.INNER {
 		return "", fmt.Errorf("%w: egress is only valid for INNER traffic", errEgressUnauthorized)
 	}
-	policy, err := e.compiledTrafficPolicy()
+	if e == nil || e.config == nil {
+		return "", errTrafficPolicyUnavailable
+	}
+	cfg, err := e.config.Current()
+	if err != nil {
+		return "", err
+	}
+	if !e.certificateRuntimeReady(cfg) || !e.clientBoundaryIsReady() {
+		return "", fmt.Errorf("%w: interception runtime is not ready", errEgressUnauthorized)
+	}
+	policy, err := trafficPolicyForConfig(cfg)
 	if err != nil {
 		return "", err
 	}
