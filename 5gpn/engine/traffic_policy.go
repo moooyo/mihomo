@@ -38,7 +38,7 @@ func (r *egressGroupRegistry) set(valid func(string) bool, available func() []st
 
 func (r *egressGroupRegistry) valid(name string) bool {
 	if name == "" {
-		return true
+		return false
 	}
 	if r == nil {
 		// Unit-assembled engines predate the live mihomo binding. Production
@@ -117,10 +117,10 @@ func (e *Engine) validEgressGroup(name string) bool {
 }
 
 func (e *Engine) moduleEgressReady(module Module) bool {
-	if !module.Enabled || module.EgressGroupRequired && module.EgressGroup == "" {
+	if !module.Enabled || module.EgressGroup == "" {
 		return false
 	}
-	return module.EgressGroup == "" || e.validEgressGroup(module.EgressGroup)
+	return e.validEgressGroup(module.EgressGroup)
 }
 
 func (e *Engine) readyCaptureHostPatterns(cfg Config) []string {
@@ -251,7 +251,6 @@ func (r compiledClientTrafficRule) matches(input clientTrafficInput) bool {
 type compiledModuleEgress struct {
 	id           string
 	group        string
-	required     bool
 	network      bool
 	captureHosts *compiledHostMatcher
 	mappingHosts map[string]struct{}
@@ -319,7 +318,6 @@ func compileTrafficPolicy(cfg Config) (*compiledTrafficPolicy, error) {
 		binding := compiledModuleEgress{
 			id:           module.ID,
 			group:        module.EgressGroup,
-			required:     module.EgressGroupRequired,
 			network:      module.Network,
 			captureHosts: newCompiledHostMatcher(module.CaptureHosts),
 			mappingHosts: make(map[string]struct{}),
@@ -449,8 +447,7 @@ func (e *Engine) RouteClient(metadata *C.Metadata) C.ClientRouteAction {
 				continue
 			}
 			if !e.clientBoundaryIsReady() ||
-				binding.required && binding.group == "" ||
-				binding.group != "" && !e.validEgressGroup(binding.group) {
+				binding.group == "" || !e.validEgressGroup(binding.group) {
 				return C.ClientRouteReject
 			}
 			if _, matched, err := e.selectDestinationEgress(policy, metadata); !matched || err != nil {
@@ -522,25 +519,23 @@ func (e *Engine) selectDestinationEgress(policy *compiledTrafficPolicy, metadata
 	if policy == nil {
 		return "", false, errTrafficPolicyUnavailable
 	}
-	// Explicit bindings win over the terminal operator route. Execution order
-	// resolves overlaps within each tier.
-	for _, bound := range []bool{true, false} {
-		for _, binding := range policy.egress {
-			if (binding.group != "") != bound || !binding.authorizes(metadata, false) {
-				continue
-			}
-			group, err := e.selectModuleEgress(binding)
-			return group, true, err
+	// Every extension has an explicit binding, so execution order alone resolves
+	// overlaps. There is no unbound tier that can fall through to terminal rules.
+	for _, binding := range policy.egress {
+		if !binding.authorizes(metadata, false) {
+			continue
 		}
+		group, err := e.selectModuleEgress(binding)
+		return group, true, err
 	}
 	return "", false, nil
 }
 
 func (e *Engine) selectModuleEgress(binding compiledModuleEgress) (string, error) {
-	if binding.required && binding.group == "" {
-		return "", fmt.Errorf("%w: extension %q requires an egress group", errEgressUnauthorized, binding.id)
+	if binding.group == "" {
+		return "", fmt.Errorf("%w: extension %q has no explicit egress binding", errEgressUnauthorized, binding.id)
 	}
-	if binding.group != "" && !e.validEgressGroup(binding.group) {
+	if !e.validEgressGroup(binding.group) {
 		return "", fmt.Errorf("%w: extension %q egress group %q is unavailable", errEgressUnauthorized, binding.id, binding.group)
 	}
 	return binding.group, nil

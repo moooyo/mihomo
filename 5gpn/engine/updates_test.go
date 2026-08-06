@@ -313,7 +313,7 @@ func TestEnabledUpdateRequiresNewSettingInTheApplyTransaction(t *testing.T) {
 	}
 }
 
-func TestEnabledUpdateRejectsANewUnboundEgressRequirement(t *testing.T) {
+func TestEnabledUpdateKeepsTheExplicitDirectDefault(t *testing.T) {
 	const sourceURL = "https://updates.example.com/example.yaml"
 	withoutEgress := strings.Replace(validManifest, "requirements:\n  egressGroup:\n    required: true\n", "", 1)
 	e := installEnabledUpdateFixture(t, sourceURL, withoutEgress, false)
@@ -324,12 +324,21 @@ func TestEnabledUpdateRejectsANewUnboundEgressRequirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	revision := e.Revision()
-	_, returned, err := e.ApplyUpdate(context.Background(), revision, "example.plugin", candidate.Digest)
-	if !errors.Is(err, ErrInvalidRequest) || !errors.Is(err, ErrUnprocessable) {
-		t.Fatalf("unbound egress update returned %v", err)
+	snapshot, returned, err := e.ApplyUpdate(context.Background(), revision, "example.plugin", candidate.Digest)
+	if err != nil {
+		t.Fatalf("DIRECT-default egress update returned %v", err)
 	}
-	if returned != revision || e.Revision() != revision {
-		t.Fatalf("rejected egress update moved revision returned=%q current=%q want=%q", returned, e.Revision(), revision)
+	if returned == revision || e.Revision() != returned {
+		t.Fatalf("successful egress update revision returned=%q current=%q old=%q", returned, e.Revision(), revision)
+	}
+	found := false
+	for _, module := range snapshot.Modules {
+		if module.ID == "example.plugin" {
+			found = module.EgressGroup == defaultExtensionEgressGroup
+		}
+	}
+	if !found {
+		t.Fatalf("updated module did not retain DIRECT: %+v", snapshot.Modules)
 	}
 }
 

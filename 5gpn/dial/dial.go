@@ -205,7 +205,7 @@ func authorizeEgress(state *trafficAuthorization, metadata *C.Metadata, owner st
 		return "", fmt.Errorf("5gpn/dial: transformed egress denied: %w", err)
 	}
 	if proxy == "" {
-		return "", nil
+		return "", errors.New("5gpn/dial: transformed egress policy returned no explicit binding")
 	}
 	if state.proxyExists == nil || !state.proxyExists(proxy) {
 		return "", fmt.Errorf("5gpn/dial: transformed egress proxy %q is unavailable", proxy)

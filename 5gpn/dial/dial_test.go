@@ -130,6 +130,23 @@ func TestTransformedDialFailsBeforeHandlerWhenGroupIsMissing(t *testing.T) {
 	}
 }
 
+func TestTransformedDialRejectsAnEmptyPolicyBinding(t *testing.T) {
+	policy := &dialTestPolicy{group: ""}
+	state := &trafficAuthorization{policy: policy, proxyExists: func(string) bool { return true }}
+	handled := 0
+	_, err := tcpWithAuthorization(
+		context.Background(), nil, state,
+		func(C.Tunnel, string, string) (net.Conn, error) {
+			handled++
+			return nil, nil
+		},
+		"origin.example.com", 443, "extension.a", false,
+	)
+	if err == nil || handled != 0 {
+		t.Fatalf("empty binding err=%v handler calls=%d, want fail before handler", err, handled)
+	}
+}
+
 func TestTransformedDialFailsBeforeHandlerWhenBindingIsUnauthorized(t *testing.T) {
 	policy := &dialTestPolicy{err: errors.New("required binding missing")}
 	state := &trafficAuthorization{policy: policy, proxyExists: func(string) bool { return true }}

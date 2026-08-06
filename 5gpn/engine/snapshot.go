@@ -32,8 +32,9 @@ type ModuleSummary struct {
 	SettingCount int                   `json:"setting_count"`
 	CaptureHosts []string              `json:"capture_hosts"`
 	CaptureDNS   string                `json:"capture_dns"`
-	EgressGroup  string                `json:"egress_group,omitempty"`
-	// EgressGroupRequired is what makes an empty EgressGroup meaningful.
+	EgressGroup  string                `json:"egress_group"`
+	// EgressGroupRequired remains manifest review metadata. Every module still
+	// has an explicit binding, defaulting to DIRECT whether this is true or not.
 	EgressGroupRequired bool `json:"egress_group_required"`
 }
 
@@ -165,11 +166,8 @@ func summariseModule(m Module) ModuleSummary {
 		CaptureHosts: append(make([]string, 0, len(m.CaptureHosts)), m.CaptureHosts...),
 		CaptureDNS:   m.CaptureDNS,
 		EgressGroup:  m.EgressGroup,
-		// Reported separately from EgressGroup because the two answer different
-		// questions. An empty group on a module that does not require one is
-		// fine; on a module that does, it is the reason the module is installed
-		// and enabled and still not capturing anything -- a state the console
-		// has to be able to name.
+		// Reported separately because the manifest requirement remains part of
+		// what the operator reviewed even though DIRECT satisfies it by default.
 		EgressGroupRequired: m.EgressGroupRequired,
 	}
 }

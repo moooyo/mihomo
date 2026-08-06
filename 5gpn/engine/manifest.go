@@ -368,6 +368,7 @@ func (imp *Importer) parse(ctx context.Context, sourceURL string, body []byte) (
 		Description:         strings.TrimSpace(doc.Metadata.Description),
 		CaptureHosts:        captureHosts,
 		CaptureDNS:          "trust",
+		EgressGroup:         defaultExtensionEgressGroup,
 		HostMappings:        mappings,
 		RoutingRules:        routes,
 		Settings:            settings,

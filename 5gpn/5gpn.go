@@ -40,7 +40,7 @@ const (
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
 
-	capabilityInterceptionVersion = 2
+	capabilityInterceptionVersion = 3
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.

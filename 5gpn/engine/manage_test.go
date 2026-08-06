@@ -31,7 +31,8 @@ const twoExtensionDocument = `{
       "capture_dns": "trust",
       "upstream_mappings": [{"host": "shared.example.com", "target": "origin-one.example.net"}],
       "persistent_storage": false,
-      "egress_group_required": false
+      "egress_group_required": false,
+      "egress_group": "DIRECT"
     },
     {
       "id": "second",
@@ -45,6 +46,7 @@ const twoExtensionDocument = `{
       "upstream_mappings": [{"host": "api.second.example", "target": "origin-two.example.net"}],
       "persistent_storage": false,
       "egress_group_required": true,
+      "egress_group": "DIRECT",
       "settings": [
         {"key": "region", "type": "select", "required": true, "options": ["cn", "hk"], "value": "cn"}
       ]
@@ -81,13 +83,8 @@ func TestCaptureOwnershipFollowsExecutionOrder(t *testing.T) {
 		t.Error("the binding is not ready with the master on")
 	}
 
-	// Enable the second and put it at the head of the order: it takes the host.
-	if _, revision, err := e.SetEnabled(e.Revision(), "second", true); err == nil {
-		t.Fatalf("enabling an extension that requires an egress group with none bound was accepted (revision %s)", revision)
-	}
-	if _, _, err := e.SetEgressGroup(e.Revision(), "second", "Proxies"); err != nil {
-		t.Fatal(err)
-	}
+	// Every installed extension has an explicit DIRECT default, so enabling the
+	// second needs no separate binding step. Reordering then gives it ownership.
 	if _, _, err := e.SetEnabled(e.Revision(), "second", true); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +100,37 @@ func TestCaptureOwnershipFollowsExecutionOrder(t *testing.T) {
 	// reordering is a reviewed change rather than a cosmetic one.
 	if binding.CaptureDNS != "china" {
 		t.Errorf("capture DNS %q, want china -- the new owner's binding", binding.CaptureDNS)
+	}
+}
+
+func TestOldEmptyEgressBindingsArePersistedAsDirect(t *testing.T) {
+	legacy := strings.ReplaceAll(twoExtensionDocument, ",\n      \"egress_group\": \"DIRECT\"", "")
+	e := newTestEngine(t, legacy)
+	snapshot, err := e.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, module := range snapshot.Modules {
+		if module.EgressGroup != defaultExtensionEgressGroup {
+			t.Fatalf("module %q egress = %q, want DIRECT", module.ID, module.EgressGroup)
+		}
+	}
+	body, err := os.ReadFile(e.config.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(body), `"egress_group": "DIRECT"`); got != len(snapshot.Modules) {
+		t.Fatalf("persisted DIRECT bindings = %d, want %d; body=%s", got, len(snapshot.Modules), body)
+	}
+	if e.Revision() != documentRevision(body) {
+		t.Fatalf("revision %q does not name normalized bytes", e.Revision())
+	}
+}
+
+func TestCurrentConfigDecodeRejectsAnEmptyEgressBinding(t *testing.T) {
+	currentWithEmpty := strings.Replace(twoExtensionDocument, `"egress_group": "DIRECT"`, `"egress_group": ""`, 1)
+	if _, err := decodeConfig([]byte(currentWithEmpty)); err == nil || !strings.Contains(err.Error(), "egress_group") {
+		t.Fatalf("current empty egress decode returned %v", err)
 	}
 }
 

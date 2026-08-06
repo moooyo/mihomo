@@ -38,6 +38,7 @@ const maxModuleRoutingRules = 256
 const maxActiveModuleRoutingRules = 2048
 const maxModuleRouteKeywords = 8
 const reservedTerminalMatchEgressGroup = "__5GPN_TERMINAL_MATCH__"
+const defaultExtensionEgressGroup = "DIRECT"
 
 var nativeExtensionIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$`)
 var nativeExtensionRouteKeywordPattern = regexp.MustCompile(`^[a-z0-9._-]+$`)
@@ -360,7 +361,7 @@ type Module struct {
 	// as such.
 	Network             bool   `json:"network,omitempty"`
 	EgressGroupRequired bool   `json:"egress_group_required"`
-	EgressGroup         string `json:"egress_group,omitempty"`
+	EgressGroup         string `json:"egress_group"`
 }
 
 func loadConfig(path string) (Config, error) {
@@ -1193,20 +1194,18 @@ func validateExecutionOrder(modules []Module, order []string) error {
 }
 
 func validateModuleNetworkPermissions(module Module) error {
-	if module.Enabled && module.EgressGroupRequired && strings.TrimSpace(module.EgressGroup) == "" {
-		return errors.New("egress_group is required")
+	if strings.TrimSpace(module.EgressGroup) == "" {
+		return errors.New("egress_group must be DIRECT or an available proxy group")
 	}
-	if module.EgressGroup != "" {
-		if module.EgressGroup == reservedTerminalMatchEgressGroup {
-			return errors.New("egress_group uses a reserved internal name")
-		}
-		if !utf8.ValidString(module.EgressGroup) || module.EgressGroup != strings.TrimSpace(module.EgressGroup) || len(module.EgressGroup) > 128 {
-			return errors.New("egress_group must contain at most 128 bytes without surrounding whitespace")
-		}
-		for _, character := range module.EgressGroup {
-			if character == ',' || unicode.IsControl(character) {
-				return errors.New("egress_group contains a comma or control character")
-			}
+	if module.EgressGroup == reservedTerminalMatchEgressGroup {
+		return errors.New("egress_group uses a reserved internal name")
+	}
+	if !utf8.ValidString(module.EgressGroup) || module.EgressGroup != strings.TrimSpace(module.EgressGroup) || len(module.EgressGroup) > 128 {
+		return errors.New("egress_group must contain at most 128 bytes without surrounding whitespace")
+	}
+	for _, character := range module.EgressGroup {
+		if character == ',' || unicode.IsControl(character) {
+			return errors.New("egress_group contains a comma or control character")
 		}
 	}
 	return nil
@@ -1761,9 +1760,18 @@ func newConfigStore(path string) (*configStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	body, changed, err := normalizeExplicitEgressBindings(body)
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := decodeConfig(body)
 	if err != nil {
 		return nil, err
+	}
+	if changed {
+		if err := state.WriteFile(path, body); err != nil {
+			return nil, fmt.Errorf("persist explicit egress bindings: %w", err)
+		}
 	}
 	cfg.generation = 1
 	store := &configStore{path: path, generation: 1}
@@ -1777,6 +1785,45 @@ func newConfigStore(path string) (*configStore, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// normalizeExplicitEgressBindings upgrades the one state the previous runtime
+// could write but the current schema no longer represents. It runs only while
+// opening or explicitly reloading a document; normal decode and every current
+// write remain strict and reject an empty binding.
+func normalizeExplicitEgressBindings(body []byte) ([]byte, bool, error) {
+	if err := rejectDuplicateJSONKeys(body); err != nil {
+		return nil, false, fmt.Errorf("decode config: %w", err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		return nil, false, err
+	}
+	modules, ok := document["modules"].([]any)
+	if !ok {
+		return body, false, nil
+	}
+	changed := false
+	for _, raw := range modules {
+		module, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		group, present := module["egress_group"]
+		name, stringValue := group.(string)
+		if !present || group == nil || stringValue && strings.TrimSpace(name) == "" {
+			module["egress_group"] = defaultExtensionEgressGroup
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	normalized, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal explicit egress bindings: %w", err)
+	}
+	return normalized, true, nil
 }
 
 // Current returns the compiled snapshot. A pointer load: no syscall, no lock,
@@ -1892,6 +1939,11 @@ func (s *configStore) Reload() error {
 	if revision == view.Revision {
 		return nil
 	}
+	body, changed, err := normalizeExplicitEgressBindings(body)
+	if err != nil {
+		s.publishEngineLog("error", "configuration egress normalization failed: "+err.Error())
+		return err
+	}
 	cfg, err := decodeConfig(body)
 	if err != nil {
 		// Retain the last valid snapshot: an invalid document on disk must not
@@ -1899,6 +1951,13 @@ func (s *configStore) Reload() error {
 		s.publishEngineLog("error", "configuration reload rejected: "+err.Error())
 		return err
 	}
+	if changed {
+		if err := state.WriteFile(s.path, body); err != nil {
+			s.publishEngineLog("error", "configuration egress normalization failed: "+err.Error())
+			return err
+		}
+	}
+	revision = documentRevision(body)
 	s.generation++
 	cfg.generation = s.generation
 	s.committed.Store(&CommittedConfigView{Config: cfg, Revision: revision})

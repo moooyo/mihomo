@@ -177,14 +177,15 @@ func TestTrafficPolicySelectsBoundEgressAndFailsClosed(t *testing.T) {
 		t.Fatalf("A-first egress = %q, %v; want GroupA", group, err)
 	}
 
-	// An explicit binding wins over an earlier terminal/unbound module.
+	// An empty binding fails closed at the first matching extension and cannot
+	// fall through to a later bound module.
 	cfg, _ := e.config.Current()
 	cfg.Modules[1].EgressGroup = ""
 	e = engineWithTrafficConfig(t, cfg)
 	e.SetEgressGroupSource(func(name string) bool { return groups[name] }, nil)
 	group, err = e.SelectEgress(metadata, "", false)
-	if err != nil || group != "GroupB" {
-		t.Fatalf("bound-first egress = %q, %v; want GroupB", group, err)
+	if !errors.Is(err, errEgressUnauthorized) || group != "" {
+		t.Fatalf("empty first egress = %q, %v; want fail closed", group, err)
 	}
 
 	// Once the winning selected group vanishes, do not fall through to B.
@@ -214,6 +215,10 @@ func TestSetEgressGroupAcceptsOnlyLiveNarrowCatalog(t *testing.T) {
 	e.SetEgressGroupSource(func(name string) bool { return groups[name] }, func() []string { return []string{"Proxies", "DIRECT"} })
 	if _, _, err := e.SetEgressGroup(e.Revision(), "second", "LeafNode"); err == nil {
 		t.Fatal("SetEgressGroup accepted a proxy outside the live group catalog")
+	}
+	revision := e.Revision()
+	if _, returned, err := e.SetEgressGroup(revision, "second", ""); err == nil || returned != revision || e.Revision() != revision {
+		t.Fatalf("empty egress clear returned revision=%q err=%v current=%q", returned, err, e.Revision())
 	}
 	if _, _, err := e.SetEgressGroup(e.Revision(), "second", "Proxies"); err != nil {
 		t.Fatalf("SetEgressGroup rejected a live group: %v", err)
@@ -340,18 +345,18 @@ func TestCaptureReadinessRequiresOwnerAndBoundWinner(t *testing.T) {
 	}
 
 	groups["GroupB"] = true
-	if binding, _ := e.CaptureFor(host); !binding.Ready {
-		t.Fatal("capture did not recover when the bound-first winner returned")
+	if binding, _ := e.CaptureFor(host); binding.Ready {
+		t.Fatal("a later valid binding satisfied the first owner's empty egress")
 	}
 
-	a.EgressGroupRequired = true
-	a.EgressGroup = ""
+	a.EgressGroup = defaultExtensionEgressGroup
+	groups[defaultExtensionEgressGroup] = true
 	e = engineWithTrafficConfig(t, Config{
 		MITM: MITMSettings{Enabled: true}, Modules: []Module{a, b}, ExecutionOrder: []string{"a", "b"},
 	})
 	e.SetEgressGroupSource(func(name string) bool { return groups[name] }, nil)
-	if binding, _ := e.CaptureFor(host); binding.Ready {
-		t.Fatal("later valid destination binding silently satisfied the first capture owner's missing required group")
+	if binding, _ := e.CaptureFor(host); !binding.Ready {
+		t.Fatal("capture did not recover when the first owner's DIRECT binding became available")
 	}
 }
 

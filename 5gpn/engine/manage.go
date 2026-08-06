@@ -272,12 +272,8 @@ func (e *Engine) SetEnabled(revision, id string, enabled bool) (Snapshot, string
 		if err != nil {
 			return err
 		}
-		if enabled && m.EgressGroupRequired && strings.TrimSpace(m.EgressGroup) == "" {
-			// Fail closed rather than fall back to a group nobody chose. An
-			// extension that declared it needs a specific egress and is enabled
-			// without one would otherwise send captured traffic out somewhere
-			// the operator did not pick.
-			return fmt.Errorf("%w: extension %q requires an egress group binding before it can be enabled", ErrInvalidRequest, id)
+		if enabled && strings.TrimSpace(m.EgressGroup) == "" {
+			return fmt.Errorf("%w: extension %q has no explicit egress binding", ErrInvalidRequest, id)
 		}
 		if enabled && m.EgressGroup != "" && !e.validEgressGroup(m.EgressGroup) {
 			return fmt.Errorf("%w: extension %q egress group %q is unavailable", ErrInvalidRequest, id, m.EgressGroup)
@@ -317,14 +313,17 @@ func (e *Engine) Reorder(revision string, ids []string) (Snapshot, string, error
 }
 
 // SetEgressGroup binds an extension's transformed traffic to an operator proxy
-// group. An empty value clears the binding.
+// group. Every extension always has a binding; an empty value is invalid.
 //
 // The extension cannot name the group, inspect it, or learn that it changed:
 // the manifest may declare that one is required and nothing more. This is the
 // operator's choice about where decrypted traffic leaves the box.
 func (e *Engine) SetEgressGroup(revision, id, group string) (Snapshot, string, error) {
 	group = strings.TrimSpace(group)
-	if group != "" && !e.validEgressGroup(group) {
+	if group == "" {
+		return Snapshot{}, revision, fmt.Errorf("%w: egress group must be DIRECT or an available proxy group", ErrInvalidRequest)
+	}
+	if !e.validEgressGroup(group) {
 		return Snapshot{}, revision, fmt.Errorf("%w: egress group %q is unavailable", ErrInvalidRequest, group)
 	}
 	return e.mutate(revision, func(c *Config) error {
@@ -463,6 +462,9 @@ func installMutation(m Module) func(*Config) error {
 	return func(c *Config) error {
 		m.Enabled = false
 		m.Settings = cloneModuleSettings(m.Settings)
+		if strings.TrimSpace(m.EgressGroup) == "" {
+			m.EgressGroup = defaultExtensionEgressGroup
+		}
 		if strings.TrimSpace(m.CaptureDNS) == "" {
 			m.CaptureDNS = "trust"
 		}
@@ -476,6 +478,9 @@ func installMutation(m Module) func(*Config) error {
 			// would leave a required setting empty and the extension refusing to
 			// enable with no explanation.
 			m.EgressGroup = c.Modules[i].EgressGroup
+			if strings.TrimSpace(m.EgressGroup) == "" {
+				m.EgressGroup = defaultExtensionEgressGroup
+			}
 			m.CaptureDNS = c.Modules[i].CaptureDNS
 			m.Settings = carryOverSettingValues(c.Modules[i].Settings, m.Settings)
 			c.Modules[i] = m
@@ -514,6 +519,9 @@ func updateMutation(incoming Module, values SettingValues) func(*Config) error {
 func prepareUpdatedModule(previous, incoming Module, values SettingValues, requireReady bool) (Module, error) {
 	incoming.Enabled = previous.Enabled
 	incoming.EgressGroup = previous.EgressGroup
+	if strings.TrimSpace(incoming.EgressGroup) == "" {
+		incoming.EgressGroup = defaultExtensionEgressGroup
+	}
 	incoming.CaptureDNS = previous.CaptureDNS
 	if strings.TrimSpace(incoming.CaptureDNS) == "" {
 		incoming.CaptureDNS = "trust"
@@ -532,8 +540,8 @@ func prepareUpdatedModule(previous, incoming Module, values SettingValues, requi
 	if err := validateModuleSettings(incoming.Settings, true); err != nil {
 		return Module{}, unprocessableRequest("extension %q settings are not ready: %v", incoming.ID, err)
 	}
-	if incoming.EgressGroupRequired && strings.TrimSpace(incoming.EgressGroup) == "" {
-		return Module{}, unprocessableRequest("extension %q requires an egress group binding before it can be updated", incoming.ID)
+	if strings.TrimSpace(incoming.EgressGroup) == "" {
+		return Module{}, unprocessableRequest("extension %q has no explicit egress binding", incoming.ID)
 	}
 	return incoming, nil
 }
