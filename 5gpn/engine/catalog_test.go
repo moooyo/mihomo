@@ -241,80 +241,6 @@ func TestCatalogProjectsWhetherTheInstalledManifestIsCurrent(t *testing.T) {
 	}
 }
 
-func TestCatalogCurrentIncludesEveryExternalScriptDigest(t *testing.T) {
-	manifestDigest := strings.Repeat("a", 64)
-	scriptDigest := strings.Repeat("b", 64)
-	entry := CatalogEntry{
-		ID: "example.plugin", Version: "1.2.0",
-		Manifest:  CatalogResource{SHA256: manifestDigest},
-		Resources: []CatalogResource{{URL: "https://scripts.example.com/action.js", SHA256: scriptDigest}},
-	}
-	module := Module{
-		ID: "example.plugin", Version: "1.2.0", Source: ModuleSource{Digest: manifestDigest},
-		Scripts: []ScriptRule{{ScriptURL: "https://scripts.example.com/action.js", ScriptDigest: scriptDigest}},
-	}
-	if !catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
-		t.Fatal("matching manifest and external script digests were not current")
-	}
-
-	module.Scripts[0].ScriptDigest = strings.Repeat("c", 64)
-	if catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
-		t.Fatal("a changed external script was reported current")
-	}
-	module.Scripts = nil
-	if catalogEntryMatchesInstalled(entry, module.Version, module.Source.Digest, []Module{module}) {
-		t.Fatal("a missing external script was reported current")
-	}
-}
-
-func TestCatalogReviewRefusesAnExternalScriptDigestMismatch(t *testing.T) {
-	manifestDigest := strings.Repeat("a", 64)
-	entry := CatalogEntry{
-		ID: "example.plugin", Version: "1.2.0",
-		Manifest:  CatalogResource{URL: catalogManifestURL, SHA256: manifestDigest},
-		Resources: []CatalogResource{{URL: "https://scripts.example.com/action.js", SHA256: strings.Repeat("b", 64)}},
-	}
-	module := Module{
-		ID: "example.plugin", Version: "1.2.0", Source: ModuleSource{Digest: manifestDigest},
-		Scripts: []ScriptRule{{ScriptURL: "https://scripts.example.com/action.js", ScriptDigest: strings.Repeat("c", 64)}},
-	}
-	err := (&Engine{}).verifyAgainstEntry(entry, Candidate{Detail: detailOf(module), module: &module})
-	if err == nil {
-		t.Fatal("a catalog review accepted different external script bytes")
-	}
-	if !strings.Contains(err.Error(), "external script digests") {
-		t.Fatalf("the refusal does not name the resource drift: %v", err)
-	}
-}
-
-func TestCatalogReviewFetchesAndVerifiesExternalScriptResources(t *testing.T) {
-	const scriptURL = "https://scripts.example.com/action.js"
-	const scriptBody = "function transform(context) { return {}; }"
-	externalManifest := strings.Replace(
-		validManifest,
-		`inline: "function transform(context) { return {}; }"`,
-		"source: "+scriptURL,
-		1,
-	)
-	if externalManifest == validManifest {
-		t.Fatal("the fixture did not replace the inline script")
-	}
-	index := catalogIndexJSON(t, honestCapabilities, digestText(externalManifest))
-	index = strings.Replace(index, `"resources": []`, fmt.Sprintf(
-		`"resources": [{"path":"action.js","url":%q,"sha256":%q,"size":%d}]`,
-		scriptURL, digestText(scriptBody), len(scriptBody)), 1)
-	stubImporter(t, stubFetch{
-		catalogIndexURL:    index,
-		catalogManifestURL: externalManifest,
-		scriptURL:          scriptBody,
-	})
-	e := catalogTestEngine(t)
-
-	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err != nil {
-		t.Fatalf("matching external script resource was refused: %v", err)
-	}
-}
-
 // A catalog that advertises something milder than the manifest declares is the
 // case this check exists for: the operator reads the listing, and the listing is
 // what they believe they are confirming.
@@ -350,6 +276,33 @@ func TestAnEntryWhoseDigestDoesNotMatchIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "digest") {
 		t.Errorf("the refusal does not name the digest: %v", err)
+	}
+}
+
+func TestCatalogReviewDoesNotAuditExternalScriptResources(t *testing.T) {
+	const scriptURL = "https://scripts.example.com/action.js"
+	const scriptBody = "function transform(context) { return {}; }"
+	externalManifest := strings.Replace(
+		validManifest,
+		`inline: "function transform(context) { return {}; }"`,
+		"source: "+scriptURL,
+		1,
+	)
+	if externalManifest == validManifest {
+		t.Fatal("the fixture did not replace the inline script")
+	}
+	index := catalogIndexJSON(t, honestCapabilities, digestText(externalManifest))
+	index = strings.Replace(index, `"resources": []`,
+		`"resources": [{"path":"action.js","url":"https://scripts.example.com/action.js","sha256":"deadbeef","size":1}]`, 1)
+	stubImporter(t, stubFetch{
+		catalogIndexURL:    index,
+		catalogManifestURL: externalManifest,
+		scriptURL:          scriptBody,
+	})
+	e := catalogTestEngine(t)
+
+	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err != nil {
+		t.Fatalf("live external script bytes were audited against catalog resources: %v", err)
 	}
 }
 

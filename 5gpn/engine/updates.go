@@ -110,9 +110,6 @@ type Candidate struct {
 	Installed string `json:"installed,omitempty"`
 	// InstalledVersion lets a client say "1.2.0 to 1.3.0" without a second read.
 	InstalledVersion string `json:"installedVersion,omitempty"`
-	// module is the freshly imported publisher snapshot used by catalog-only
-	// verification. It is never serialized; the public review remains Detail.
-	module *Module
 }
 
 // Fetch retrieves and parses a candidate without touching installed state.
@@ -147,7 +144,7 @@ func (e *Engine) fetchCandidateView(ctx context.Context, request ImportRequest) 
 		return Candidate{}, CommittedConfigView{}, err
 	}
 	proposed := module
-	candidate := Candidate{Digest: SnapshotDigest(module), module: &module}
+	candidate := Candidate{Digest: SnapshotDigest(module)}
 
 	for _, installed := range view.Config.Modules {
 		if installed.ID == module.ID {
