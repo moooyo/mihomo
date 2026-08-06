@@ -357,17 +357,26 @@ func TestInstallAlwaysLandsDisabled(t *testing.T) {
 	}
 }
 
-// Reinstalling keeps what the operator entered. The publisher does not own the
+func TestInstallRejectsAnExistingID(t *testing.T) {
+	e := newTestEngine(t, twoExtensionDocument)
+	revision := e.Revision()
+	_, returned, err := e.install(revision, Module{ID: "first", Version: "9.9.9"})
+	if !errors.Is(err, ErrInvalidRequest) || returned != revision || e.Revision() != revision {
+		t.Fatalf("duplicate install returned revision=%q err=%v current=%q", returned, err, e.Revision())
+	}
+}
+
+// Updating keeps what the operator entered. The publisher does not own the
 // egress binding, the resolver binding, or the values typed into settings, and
 // silently clearing them leaves a required setting empty with the extension
 // refusing to enable and nothing saying why.
-func TestReinstallCarriesOperatorStateForward(t *testing.T) {
+func TestUpdateCarriesOperatorStateForward(t *testing.T) {
 	e := newTestEngine(t, twoExtensionDocument)
 	if _, _, err := e.SetEgressGroup(e.Revision(), "second", "Proxies"); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, _, err := e.install(e.Revision(), Module{
+	if _, _, err := e.update(e.Revision(), Module{
 		ID:           "second",
 		Version:      "2.1.0",
 		Name:         "Second",
@@ -380,7 +389,7 @@ func TestReinstallCarriesOperatorStateForward(t *testing.T) {
 			{Key: "region", Type: "select", Required: true, Options: []string{"cn", "hk"}},
 		},
 		EgressGroupRequired: true,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 

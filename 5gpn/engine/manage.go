@@ -416,7 +416,8 @@ func settingsWithCompleteValues(settings []ModuleSetting, values SettingValues) 
 	return next, nil
 }
 
-// install adds or replaces an extension, always disabled.
+// install adds a new extension, always disabled. Installed IDs can change only
+// through the reviewed Marketplace update path.
 //
 // Disabled is not a default a caller can override. An import is a decision to
 // have the code on the box; enabling it is a separate decision about letting it
@@ -426,7 +427,14 @@ func settingsWithCompleteValues(settings []ModuleSetting, values SettingValues) 
 // Unexported because there is exactly one way in: a reviewed, digest-checked
 // fetch. See updates.go.
 func (e *Engine) install(revision string, m Module) (Snapshot, string, error) {
-	return e.mutate(revision, installMutation(m))
+	return e.mutate(revision, func(c *Config) error {
+		for _, installed := range c.Modules {
+			if installed.ID == m.ID {
+				return fmt.Errorf("%w: extension %q is already installed; select its Marketplace entry to update", ErrInvalidRequest, m.ID)
+			}
+		}
+		return installMutation(m)(c)
+	})
 }
 
 func (e *Engine) update(revision string, m Module, values SettingValues) (Snapshot, string, error) {
