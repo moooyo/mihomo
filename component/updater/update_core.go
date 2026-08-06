@@ -78,6 +78,9 @@ func (u *CoreUpdater) CoreBaseName() string {
 }
 
 func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) (err error) {
+	if ManagedDistribution() {
+		return ErrManagedDistribution
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 

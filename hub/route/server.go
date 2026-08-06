@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
@@ -151,6 +152,9 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 			fs := http.StripPrefix("/ui", http.FileServer(http.Dir(uiPath)))
 			redirect := http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP
 			serveUI := func(w http.ResponseWriter, r *http.Request) {
+				if updater.ManagedDistribution() {
+					w.Header().Set("Cache-Control", "no-store")
+				}
 				if strings.EqualFold(path.Ext(r.URL.Path), ".mobileconfig") {
 					w.Header().Set("Content-Type", "application/x-apple-aspen-config")
 				}

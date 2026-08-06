@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/metacubex/mihomo/component/updater"
+
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
 )
@@ -62,6 +64,36 @@ func TestUIProfileContentType(t *testing.T) {
 	}
 	if !bytes.Equal(response.Body.Bytes(), plain) {
 		t.Fatalf("ordinary asset body %q, want %q", response.Body.Bytes(), plain)
+	}
+}
+
+func TestManagedDistributionUIIsNeverCached(t *testing.T) {
+	previousUIPath := uiPath
+	previousEmbedMode := embedMode
+	previousManagedDistribution := updater.ManagedDistribution()
+	t.Cleanup(func() {
+		uiPath = previousUIPath
+		embedMode = previousEmbedMode
+		updater.SetManagedDistribution(previousManagedDistribution)
+	})
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("console"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uiPath = dir
+	embedMode = true
+	updater.SetManagedDistribution(true)
+	handler := router(false, "controller-secret", "", Cors{})
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		response := requestRoute(handler, method, "/ui/", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status %d, want %d", method, response.Code, http.StatusOK)
+		}
+		if cacheControl := response.Header().Get("Cache-Control"); cacheControl != "no-store" {
+			t.Fatalf("%s Cache-Control %q, want no-store", method, cacheControl)
+		}
 	}
 }
 

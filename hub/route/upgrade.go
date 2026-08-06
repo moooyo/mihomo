@@ -23,6 +23,9 @@ func upgradeRouter() http.Handler {
 }
 
 func upgradeCore(w http.ResponseWriter, r *http.Request) {
+	if rejectManagedSelfUpgrade(w, r) {
+		return
+	}
 	// modify from https://github.com/AdguardTeam/AdGuardHome/blob/595484e0b3fb4c457f9bb727a6b94faa78a66c5f/internal/home/controlupdate.go#L108
 	log.Infoln("start update")
 	execPath, err := os.Executable()
@@ -53,6 +56,9 @@ func upgradeCore(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateUI(w http.ResponseWriter, r *http.Request) {
+	if rejectManagedSelfUpgrade(w, r) {
+		return
+	}
 	err := updater.DefaultUiUpdater.DownloadUI()
 	if err != nil {
 		log.Warnln("%s", err)
@@ -65,4 +71,13 @@ func updateUI(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func rejectManagedSelfUpgrade(w http.ResponseWriter, r *http.Request) bool {
+	if !updater.ManagedDistribution() {
+		return false
+	}
+	render.Status(r, http.StatusForbidden)
+	render.JSON(w, r, newError("self-upgrade is disabled; install a digest-pinned 5gpn release instead"))
+	return true
 }

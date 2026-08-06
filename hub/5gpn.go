@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	fivegpn "github.com/metacubex/mihomo/5gpn"
+	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
@@ -34,6 +35,9 @@ var (
 // isolated inside fivegpn.Start.
 func startFiveGPN() error {
 	fivegpnOnce.Do(func() {
+		// 5gpn publishes both core and Console through its digest-pinned installer.
+		// Upstream self-updaters cannot preserve the fork or its artifact pins.
+		updater.SetManagedDistribution(true)
 		fivegpnStartErr = fivegpn.Start(C.Path.HomeDir(), func(err error) {
 			log.Fatalln("[5GPN] fatal runtime failure: %v", err)
 		})

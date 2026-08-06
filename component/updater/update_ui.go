@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -48,6 +49,21 @@ func (t compressionType) String() string {
 
 var DefaultUiUpdater = &UIUpdater{}
 
+var managedDistribution atomic.Bool
+
+var ErrManagedDistribution = errors.New("self-upgrade is disabled by the managed distribution")
+
+// SetManagedDistribution makes the digest-pinned release manager the sole
+// owner of core and UI publication. It is safe to call before or after an
+// updater is constructed.
+func SetManagedDistribution(managed bool) {
+	managedDistribution.Store(managed)
+}
+
+func ManagedDistribution() bool {
+	return managedDistribution.Load()
+}
+
 func NewUiUpdater(externalUI, externalUIURL, externalUIName string) *UIUpdater {
 	updater := &UIUpdater{}
 	// checkout externalUI exist
@@ -72,6 +88,10 @@ func NewUiUpdater(externalUI, externalUIURL, externalUIName string) *UIUpdater {
 }
 
 func (u *UIUpdater) AutoDownloadUI() {
+	if ManagedDistribution() {
+		log.Infoln("External UI is managed by the distribution, skip downloading")
+		return
+	}
 	u.mutex.Lock()
 	defer u.mutex.Unlock()
 	if u.autoDownloadUI {
@@ -89,6 +109,9 @@ func (u *UIUpdater) AutoDownloadUI() {
 }
 
 func (u *UIUpdater) DownloadUI() error {
+	if ManagedDistribution() {
+		return ErrManagedDistribution
+	}
 	u.mutex.Lock()
 	defer u.mutex.Unlock()
 	return u.downloadUI()
