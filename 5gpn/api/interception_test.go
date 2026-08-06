@@ -28,6 +28,17 @@ func newInterceptionAPIEngine(t *testing.T) *engine.Engine {
 	return e
 }
 
+func TestInstalledSourceUpdateRoutesAreNotExposed(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(method, "/extensions/example.plugin/update", nil)
+		interceptionRouter().ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s installed-source update route returned %d, want 404", method, response.Code)
+		}
+	}
+}
+
 func TestSettingsRejectHTTP3WithoutPublishing(t *testing.T) {
 	e := newInterceptionAPIEngine(t)
 

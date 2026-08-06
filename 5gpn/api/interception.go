@@ -61,8 +61,6 @@ func interceptionRouter() http.Handler {
 	r.Route("/extensions/{id}", func(r chi.Router) {
 		r.Get("/", getExtension)
 		r.Delete("/", deleteExtension)
-		r.Get("/update", getUpdate)
-		r.Post("/update", postUpdate)
 		r.Put("/enabled", putExtensionEnabled)
 		r.Put("/egress", putExtensionEgress)
 		r.Put("/capture-dns", putExtensionCaptureDNS)
@@ -145,44 +143,6 @@ func postInstall(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	snapshot, revision, err := e.Install(ctx, body.Revision, body.InstallRequest)
-	respondEngine(w, r, snapshot, revision, err, e)
-}
-
-func getUpdate(w http.ResponseWriter, r *http.Request) {
-	e := currentEngine()
-	if e == nil {
-		unavailable(w, r, "the interception engine is not installed")
-		return
-	}
-	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
-	defer cancel()
-
-	candidate, revision, err := e.CheckUpdateView(ctx, chi.URLParam(r, "id"))
-	if err != nil {
-		writeEngineError(w, r, err, e)
-		return
-	}
-	render.JSON(w, r, render.M{"candidate": candidate, "revision": revision})
-}
-
-type updateRequest struct {
-	Revision string               `json:"revision"`
-	Digest   string               `json:"digest"`
-	Values   engine.SettingValues `json:"values"`
-}
-
-func (b *updateRequest) revision() string { return b.Revision }
-
-func postUpdate(w http.ResponseWriter, r *http.Request) {
-	var body updateRequest
-	e, ok := decodeWrite(w, r, &body)
-	if !ok {
-		return
-	}
-	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
-	defer cancel()
-
-	snapshot, revision, err := e.ApplyUpdateWithSettings(ctx, body.Revision, chi.URLParam(r, "id"), body.Digest, body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
