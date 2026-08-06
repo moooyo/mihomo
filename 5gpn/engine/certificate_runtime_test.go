@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,18 @@ func publishTestCertificateResult(t *testing.T, e *Engine, status, code, message
 	}
 	e.certs.invalidateRuntimePlan()
 	return request
+}
+
+func writeTestCertificateResult(t *testing.T, e *Engine, result certificateResult) {
+	t.Helper()
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certificateStatePath(mustCurrentConfig(t, e)), raw, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	e.certs.invalidateRuntimePlan()
 }
 
 func publishTestReadyCertificate(t *testing.T, e *Engine, serial int64) certificateRequest {
@@ -226,6 +239,62 @@ func TestEmptyCertificateTargetCanBeReadyWithoutAKeypair(t *testing.T) {
 	}
 	if _, err := e.certs.GetCertificate(&tls.ClientHelloInfo{ServerName: "unclaimed.example"}); err == nil {
 		t.Fatal("empty target served a certificate")
+	}
+}
+
+func TestStaleEmptyReadyResultIsPendingForNewNonemptyRequest(t *testing.T) {
+	e, _, _ := newCertificateStateTestEngine(t)
+	e.certs.runtimeTTL = -1
+	request, err := readCertificateRequest(certificateRequestPath(e.config.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Hosts) == 0 {
+		t.Fatal("test requires a nonempty current request")
+	}
+	writeTestCertificateResult(t, e, certificateResult{
+		Version: certificateStateVersion, TargetDigest: digestText("\n"),
+		Attempt: "11111111111111111111111111111111", Status: "ready",
+	})
+	state := e.CertificateRuntimeState()
+	if state.Ready || state.Status != "pending" || state.ErrorCode != "" || state.Attempt != request.Attempt {
+		t.Fatalf("stale empty result = %+v, want current request pending", state)
+	}
+}
+
+func TestStaleNonemptyReadyResultIsPendingForNewEmptyRequest(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultDocument()
+	cfg.TLSCert = filepath.Join(dir, "tls", "fullchain.pem")
+	cfg.TLSKey = filepath.Join(dir, "tls", "privkey.pem")
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "intercept.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(path, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.certs.runtimeTTL = -1
+	request, err := readCertificateRequest(certificateRequestPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Hosts) != 0 {
+		t.Fatal("test requires an empty current request")
+	}
+	writeTestCertificateResult(t, e, certificateResult{
+		Version: certificateStateVersion, TargetDigest: digestText("stale.example\n"),
+		Attempt: "22222222222222222222222222222222", Status: "ready",
+		CertificateSHA256: strings.Repeat("a", 64), PrivateKeySHA256: strings.Repeat("b", 64),
+	})
+	state := e.CertificateRuntimeState()
+	if state.Ready || state.Status != "pending" || state.ErrorCode != "" || state.Attempt != request.Attempt {
+		t.Fatalf("stale nonempty result = %+v, want current request pending", state)
 	}
 }
 

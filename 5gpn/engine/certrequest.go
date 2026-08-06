@@ -204,7 +204,7 @@ func (e *Engine) RetryCertificateRequest(expectedRevision, expectedTargetDigest,
 			expectedTargetDigest != current.TargetDigest || expectedAttempt != current.Attempt {
 			return ErrCertificateRetryConflict
 		}
-		result, err := readCertificateResult(certificateStatePath(cfg), len(current.Hosts) == 0)
+		result, err := readCertificateResult(certificateStatePath(cfg))
 		if err != nil || result.TargetDigest != current.TargetDigest || result.Attempt != current.Attempt {
 			// Missing, malformed and stale results are all still pending. Preserve
 			// the identity but atomically rewrite the request so a path-unit event
@@ -216,6 +216,16 @@ func (e *Engine) RetryCertificateRequest(expectedRevision, expectedTargetDigest,
 			return nil
 		}
 		if result.Status == "ready" {
+			if !result.readyShapeMatches(len(current.Hosts) == 0) {
+				if err := writeCertificateRequest(certificateRequestPath(e.config.path), current); err != nil {
+					return fmt.Errorf("5gpn/engine: retry mismatched certificate request: %w", err)
+				}
+				if e.certs != nil {
+					e.certs.invalidateRuntimePlan()
+				}
+				snapshot, err = e.SnapshotFromConfig(cfg)
+				return err
+			}
 			return ErrCertificateAlreadyReady
 		}
 		if result.Status != "error" {

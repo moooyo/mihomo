@@ -134,7 +134,7 @@ func (s *certificateStore) loadRuntimePlan(cfg Config, now time.Time) certificat
 		!equalStrings(request.Hosts, certificateHostPatterns(cfg)) {
 		return pending("")
 	}
-	result, err := readCertificateResult(certificateStatePath(cfg), len(request.Hosts) == 0)
+	result, err := readCertificateResult(certificateStatePath(cfg))
 	if errors.Is(err, os.ErrNotExist) {
 		return pending(request.Attempt)
 	}
@@ -146,6 +146,9 @@ func (s *certificateStore) loadRuntimePlan(cfg Config, now time.Time) certificat
 	}
 	if result.Status == "error" {
 		return failure(request.Attempt, result.Code, result.Message)
+	}
+	if !result.readyShapeMatches(len(request.Hosts) == 0) {
+		return failure(request.Attempt, "invalid_certificate_state", "The certificate publisher state does not match the requested host set.")
 	}
 	if len(request.Hosts) == 0 {
 		return certificateRuntimePlan{state: CertificateRuntimeState{
@@ -193,7 +196,7 @@ func runtimePlanGeneration(cfg Config, targetDigest, attempt, certificateDigestV
 	}, "\n") + "\n")
 }
 
-func readCertificateResult(path string, emptyTarget bool) (certificateResult, error) {
+func readCertificateResult(path string) (certificateResult, error) {
 	raw, err := readBoundedControlFile(path)
 	if err != nil {
 		return certificateResult{}, err
@@ -211,11 +214,12 @@ func readCertificateResult(path string, emptyTarget bool) (certificateResult, er
 		if result.Code != "" || result.Message != "" {
 			return certificateResult{}, errors.New("ready certificate state contains an error")
 		}
-		if emptyTarget {
-			if result.CertificateSHA256 != "" || result.PrivateKeySHA256 != "" {
-				return certificateResult{}, errors.New("empty certificate target contains material hashes")
-			}
-		} else if !validLowerHex(result.CertificateSHA256, 64) || !validLowerHex(result.PrivateKeySHA256, 64) {
+		certificateEmpty := result.CertificateSHA256 == ""
+		keyEmpty := result.PrivateKeySHA256 == ""
+		if certificateEmpty != keyEmpty {
+			return certificateResult{}, errors.New("ready certificate state has only one material hash")
+		}
+		if !certificateEmpty && (!validLowerHex(result.CertificateSHA256, 64) || !validLowerHex(result.PrivateKeySHA256, 64)) {
 			return certificateResult{}, errors.New("ready certificate state has invalid material hashes")
 		}
 	case "error":
@@ -227,6 +231,14 @@ func readCertificateResult(path string, emptyTarget bool) (certificateResult, er
 		return certificateResult{}, errors.New("invalid certificate state status")
 	}
 	return result, nil
+}
+
+func (r certificateResult) readyShapeMatches(emptyTarget bool) bool {
+	if r.Status != "ready" {
+		return true
+	}
+	hasMaterial := r.CertificateSHA256 != "" && r.PrivateKeySHA256 != ""
+	return hasMaterial != emptyTarget
 }
 
 func validCertificateErrorCode(code string) bool {
