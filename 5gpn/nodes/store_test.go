@@ -228,6 +228,7 @@ func TestImportRejectsConflictsUnsafeNamesAndProhibitedTypes(t *testing.T) {
 		{name: "wireguard", content: "name: Forbidden\ntype: wireguard\nserver: a.example\nport: 51820\nip: 10.0.0.2\nprivate-key: secret\npublic-key: secret\n"},
 		{name: "tailscale", content: "name: Forbidden\ntype: tailscale\n"},
 		{name: "openvpn", content: "name: Forbidden\ntype: openvpn\nserver: a.example\nport: 1194\n"},
+		{name: "zerotier", content: "name: Forbidden\ntype: zerotier\nserver: a.example\nport: 9993\n"},
 		{name: "YAML anchor", content: "name: &node-name Anchored\ntype: http\nserver: a.example\nport: 80\n"},
 	}
 	for _, test := range tests {

@@ -43,6 +43,7 @@ var prohibitedProxyTypes = map[string]struct{}{
 	"openvpn":   {},
 	"tailscale": {},
 	"wireguard": {},
+	"zerotier":  {},
 }
 
 func parseImportedProxies(content []byte) ([]*yaml.Node, error) {
