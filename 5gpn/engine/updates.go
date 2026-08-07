@@ -130,6 +130,23 @@ func (e *Engine) FetchView(ctx context.Context, request ImportRequest) (Candidat
 	return candidate, view.Revision, err
 }
 
+// FetchInstallView is the install-only review path for a pasted manifest or
+// manifest URL. An installed id may be reviewed for replacement only through
+// an explicitly selected Marketplace entry, which continues to use FetchView.
+func (e *Engine) FetchInstallView(ctx context.Context, request ImportRequest) (Candidate, string, error) {
+	candidate, revision, err := e.FetchView(ctx, request)
+	if err != nil {
+		return Candidate{}, revision, err
+	}
+	if candidate.Installed != "" {
+		return Candidate{}, revision, fmt.Errorf(
+			"%w: extension %q is already installed; review its Marketplace entry to update",
+			ErrInvalidRequest, candidate.Detail.ID,
+		)
+	}
+	return candidate, revision, nil
+}
+
 func (e *Engine) fetchCandidateView(ctx context.Context, request ImportRequest) (Candidate, CommittedConfigView, error) {
 	imp, err := currentImporter()
 	if err != nil {
@@ -242,7 +259,7 @@ func (e *Engine) Install(ctx context.Context, revision string, request InstallRe
 		return Snapshot{}, revision, err
 	}
 	if got := SnapshotDigest(module); got != request.Digest {
-		return Snapshot{}, revision, fmt.Errorf("%w: the extension changed since you reviewed it (%s, not %s)", ErrInvalidRequest, got, request.Digest)
+		return Snapshot{}, revision, reviewConflictf("the extension changed since you reviewed it (%s, not %s)", got, request.Digest)
 	}
 	return e.install(revision, module)
 }
@@ -314,14 +331,14 @@ func (e *Engine) applyUpdateFrom(
 	if module.ID != id {
 		// Applying it would replace one extension with another under the
 		// operator's existing bindings, which is not an update.
-		return Snapshot{}, revision, fmt.Errorf("%w: %s now serves extension %q, not %q", ErrInvalidRequest, sourceURL, module.ID, id)
+		return Snapshot{}, revision, reviewConflictf("%s now serves extension %q, not %q", sourceURL, module.ID, id)
 	}
 	if got := SnapshotDigest(module); got != digest {
-		return Snapshot{}, revision, fmt.Errorf("%w: the extension changed since you reviewed it (%s, not %s)", ErrInvalidRequest, got, digest)
+		return Snapshot{}, revision, reviewConflictf("the extension changed since you reviewed it (%s, not %s)", got, digest)
 	}
 	if verify != nil {
 		if err := verify(module); err != nil {
-			return Snapshot{}, revision, err
+			return Snapshot{}, revision, reviewConflictf("%v", err)
 		}
 	}
 	return e.update(revision, module, values)

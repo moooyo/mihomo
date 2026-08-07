@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/metacubex/mihomo/5gpn/state"
 )
 
 // The catalog, at the two points where it can do harm: what it accepts off the
@@ -37,6 +40,29 @@ func (s stubFetch) RoundTrip(r *http.Request) (*http.Response, error) {
 		Header:     make(http.Header),
 		Request:    r,
 	}, nil
+}
+
+type catalogReviewBarrier struct {
+	served  stubFetch
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *catalogReviewBarrier) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.String() != catalogManifestURL {
+		return b.served.RoundTrip(request)
+	}
+	select {
+	case <-b.started:
+	default:
+		close(b.started)
+	}
+	select {
+	case <-b.release:
+	case <-request.Context().Done():
+		return nil, request.Context().Err()
+	}
+	return b.served.RoundTrip(request)
 }
 
 func stubImporter(t *testing.T, served stubFetch) *Importer {
@@ -187,6 +213,46 @@ func TestAnHonestCatalogEntryReviewsLikeAPastedURL(t *testing.T) {
 	}
 	if candidate.Installed != "" {
 		t.Errorf("nothing is installed, but the review reported %q", candidate.Installed)
+	}
+}
+
+func TestCatalogReviewDoesNotMixAStaleSourceWithANewRevision(t *testing.T) {
+	barrier := &catalogReviewBarrier{
+		served: stubFetch{
+			catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+			catalogManifestURL: validManifest,
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	setTestImporter(t, &Importer{client: &http.Client{Transport: barrier}, now: time.Now})
+	e := catalogTestEngine(t)
+	initialRevision := e.Revision()
+	type result struct {
+		revision string
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, _, revision, err := e.ReviewCatalogEntryView(
+			context.Background(), "io.5gpn.official", "example.plugin",
+		)
+		done <- result{revision: revision, err: err}
+	}()
+	<-barrier.started
+	_, changedRevision, err := e.SetCatalogSources(initialRevision, []CatalogSource{{
+		ID: "io.5gpn.official", Name: "Renamed while reviewing", URL: catalogIndexURL, Enabled: true,
+	}})
+	if err != nil {
+		t.Fatalf("SetCatalogSources: %v", err)
+	}
+	close(barrier.release)
+	got := <-done
+	if !errors.Is(got.err, state.ErrRevisionConflict) {
+		t.Fatalf("ReviewCatalogEntryView error = %v, want revision conflict", got.err)
+	}
+	if got.revision != changedRevision {
+		t.Fatalf("review returned revision %q, want current %q", got.revision, changedRevision)
 	}
 }
 
@@ -620,12 +686,89 @@ func TestACatalogUpdateMovesTheExtensionsSource(t *testing.T) {
 	}
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest); err != nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest); err != nil {
 		t.Fatalf("ApplyCatalogUpdate: %v", err)
 	}
 	after, _ := e.ReadDocument()
 	if got := after.Modules[0].Source.URL; got != catalogManifestURL {
 		t.Errorf("source is %q, want the catalog entry's %q", got, catalogManifestURL)
+	}
+}
+
+func TestACatalogUpdateBindsTheReviewedManifestURL(t *testing.T) {
+	const (
+		oldURL = "https://elsewhere.example.com/example.yaml"
+		newURL = "https://catalog.example.com/repointed.yaml"
+	)
+	served := stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+		newURL:             validManifest,
+		oldURL:             validManifest,
+	}
+	stubImporter(t, served)
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, oldURL)
+	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
+		context.Background(), "io.5gpn.official", "example.plugin",
+	)
+	if err != nil {
+		t.Fatalf("ReviewCatalogEntryView: %v", err)
+	}
+	if reviewRevision != revision || reviewedURL != catalogManifestURL {
+		t.Fatalf("review returned revision %q URL %q, want %q %q", reviewRevision, reviewedURL, revision, catalogManifestURL)
+	}
+
+	served[catalogIndexURL] = strings.Replace(served[catalogIndexURL], catalogManifestURL, newURL, 1)
+	if _, err := e.Catalog(context.Background(), true); err != nil {
+		t.Fatalf("refresh changed catalog: %v", err)
+	}
+	_, _, err = e.ApplyCatalogUpdate(
+		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin", reviewedURL, candidate.Digest,
+	)
+	if !errors.Is(err, ErrReviewConflict) {
+		t.Fatalf("ApplyCatalogUpdate error = %v, want review conflict", err)
+	}
+	after, afterRevision := e.ReadDocument()
+	if afterRevision != revision || after.Modules[0].Source.URL != oldURL {
+		t.Fatalf("stale review changed revision/source to %q/%q", afterRevision, after.Modules[0].Source.URL)
+	}
+}
+
+func TestACatalogUpdateTreatsARemovedReviewedEntryAsConflict(t *testing.T) {
+	const oldURL = "https://elsewhere.example.com/example.yaml"
+	served := stubFetch{
+		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL: validManifest,
+		oldURL:             validManifest,
+	}
+	stubImporter(t, served)
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, oldURL)
+	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
+		context.Background(), "io.5gpn.official", "example.plugin",
+	)
+	if err != nil {
+		t.Fatalf("ReviewCatalogEntryView: %v", err)
+	}
+	served[catalogIndexURL] = `{
+  "apiVersion": "5gpn.io/marketplace/v1",
+  "kind": "ExtensionMarketplace",
+  "metadata": {"id": "io.5gpn.official", "name": "Official", "homepage": "https://example.com"},
+  "entries": []
+}`
+	if _, err := e.Catalog(context.Background(), true); err != nil {
+		t.Fatalf("refresh removed catalog entry: %v", err)
+	}
+	_, _, err = e.ApplyCatalogUpdate(
+		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin", reviewedURL, candidate.Digest,
+	)
+	if !errors.Is(err, ErrReviewConflict) {
+		t.Fatalf("ApplyCatalogUpdate error = %v, want review conflict", err)
+	}
+	after, afterRevision := e.ReadDocument()
+	if afterRevision != revision || after.Modules[0].Source.URL != oldURL {
+		t.Fatalf("removed entry changed revision/source to %q/%q", afterRevision, after.Modules[0].Source.URL)
 	}
 }
 
@@ -649,7 +792,7 @@ func TestACatalogUpdateKeepsAnEnabledExtensionEnabled(t *testing.T) {
 	}
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest)
+	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest)
 	if err != nil {
 		t.Fatalf("enabled catalog update: %v", err)
 	}
@@ -675,9 +818,12 @@ func TestACatalogUpdateStillChecksWhatTheEntryAdvertised(t *testing.T) {
 	revision := installFromCatalog(t, e, catalogManifestURL)
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	_, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", digest)
+	_, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest)
 	if err == nil {
 		t.Fatal("an entry that understates the manifest updated anyway")
+	}
+	if !errors.Is(err, ErrReviewConflict) {
+		t.Errorf("apply error = %v, want review conflict", err)
 	}
 	if !strings.Contains(err.Error(), "network grant") {
 		t.Errorf("the refusal does not name what diverged: %v", err)
@@ -693,11 +839,15 @@ func TestACatalogUpdateStillRequiresTheReviewedDigest(t *testing.T) {
 	})
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, catalogManifestURL)
+	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
 
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", ""); err == nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", "", digest); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("an update without the reviewed URL returned %v, want invalid request", err)
+	}
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, ""); err == nil {
 		t.Error("an update with no digest was applied")
 	}
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", strings.Repeat("b", 64)); err == nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, strings.Repeat("b", 64)); err == nil {
 		t.Error("an update quoting the wrong digest was applied")
 	}
 }

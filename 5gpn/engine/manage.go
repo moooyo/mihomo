@@ -24,6 +24,10 @@ var (
 	ErrModuleNotFound = errors.New("5gpn/engine: extension not found")
 	// ErrInvalidRequest wraps a caller-caused failure the API answers 400 for.
 	ErrInvalidRequest = errors.New("5gpn/engine: invalid request")
+	// ErrReviewConflict marks a candidate that no longer matches the review the
+	// operator confirmed. The API answers 409 so clients can preserve entered
+	// settings, fetch a fresh candidate, and require a new confirmation.
+	ErrReviewConflict = errors.New("5gpn/engine: reviewed candidate is stale")
 	// ErrUnprocessable marks a syntactically valid management request whose
 	// complete proposed state cannot run. The API answers it with 422 while it
 	// remains an ErrInvalidRequest for callers that classify engine failures.
@@ -42,6 +46,20 @@ func (e unprocessableRequestError) Unwrap() []error {
 
 func unprocessableRequest(format string, args ...any) error {
 	return unprocessableRequestError{message: fmt.Sprintf(format, args...)}
+}
+
+type reviewConflictError struct{ message string }
+
+func (e reviewConflictError) Error() string {
+	return ErrInvalidRequest.Error() + ": " + e.message
+}
+
+func (e reviewConflictError) Unwrap() []error {
+	return []error{ErrInvalidRequest, ErrReviewConflict}
+}
+
+func reviewConflictf(format string, args ...any) error {
+	return reviewConflictError{message: fmt.Sprintf(format, args...)}
 }
 
 // Revision names the current document.
@@ -90,9 +108,13 @@ type ModuleDetail struct {
 	Description string `json:"description,omitempty"`
 	ImportedAt  string `json:"imported_at,omitempty"`
 	SourceURL   string `json:"source_url,omitempty"`
-	// SourceDigest covers the manifest and every fetched script, so a review can
-	// say "this is byte for byte what you approved" without shipping the bytes.
+	// SourceDigest is the digest of the manifest snapshot. Script digests are
+	// reported with Actions; Candidate.Digest is the complete review digest.
 	SourceDigest string `json:"source_digest,omitempty"`
+	// SnapshotDigest covers the complete immutable capability and code shape.
+	// Unlike SourceDigest it includes scripts and normalized declarations, and
+	// unlike the document revision it excludes operator-owned bindings.
+	SnapshotDigest string `json:"snapshot_digest"`
 
 	// Network is the unrestricted grant. It carries no destination list, so
 	// every surface must present it as "any host it can reach" rather than as a
@@ -137,6 +159,7 @@ func detailOf(m Module) ModuleDetail {
 		ImportedAt:        m.ImportedAt,
 		SourceURL:         m.Source.URL,
 		SourceDigest:      m.Source.Digest,
+		SnapshotDigest:    SnapshotDigest(m),
 		Network:           m.Network,
 		PersistentStorage: m.PersistentStorage,
 		Settings:          cloneModuleSettings(m.Settings),

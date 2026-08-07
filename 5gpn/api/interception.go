@@ -98,7 +98,8 @@ func getEngineLogs(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, render.M{"logs": e.Logs(filter)})
 }
 
-// postReview fetches a candidate and reports what it is, without installing it.
+// postReview fetches an install candidate and reports what it is, without
+// installing it. Installed ids must be reviewed through a Marketplace entry.
 //
 // It takes no revision because it changes nothing. The digest it returns is
 // what the install must quote back, and that is where the concurrency control
@@ -118,7 +119,7 @@ func postReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	candidate, revision, err := e.FetchView(ctx, body)
+	candidate, revision, err := e.FetchInstallView(ctx, body)
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
@@ -303,6 +304,7 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 type catalogUpdateRequest struct {
 	Revision string               `json:"revision"`
 	Digest   string               `json:"digest"`
+	URL      string               `json:"url"`
 	Values   engine.SettingValues `json:"values"`
 }
 
@@ -325,7 +327,7 @@ func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	snapshot, revision, err := e.ApplyCatalogUpdateWithSettings(
-		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.Digest, body.Values)
+		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.URL, body.Digest, body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
@@ -473,7 +475,15 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error, e *engi
 	case errors.Is(err, state.ErrRevisionConflict):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, render.M{
+			"code":     "revision_conflict",
 			"message":  "the interception document changed since you read it",
+			"revision": e.Revision(),
+		})
+	case errors.Is(err, engine.ErrReviewConflict):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, render.M{
+			"code":     "review_conflict",
+			"message":  err.Error(),
 			"revision": e.Revision(),
 		})
 	case errors.Is(err, engine.ErrCertificateRetryConflict):

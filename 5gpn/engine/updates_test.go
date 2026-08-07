@@ -57,7 +57,33 @@ func TestFetchDryRunsInstallWithoutMutation(t *testing.T) {
 	if candidate.Detail.ID != "example.plugin" || candidate.Digest == "" {
 		t.Fatalf("candidate = %+v", candidate)
 	}
+	if candidate.Detail.SnapshotDigest != candidate.Digest {
+		t.Fatalf("detail snapshot digest %q, candidate digest %q", candidate.Detail.SnapshotDigest, candidate.Digest)
+	}
 	assertConfigUnchanged(t, e, revision, body)
+	assertModuleNotInstalled(t, e, "example.plugin")
+}
+
+func TestInstallClassifiesAChangedReviewedCandidateAsConflict(t *testing.T) {
+	setTestImporter(t, &Importer{})
+	e := newTestEngine(t, twoExtensionDocument)
+	revision := e.Revision()
+
+	candidate, err := e.Fetch(context.Background(), ImportRequest{Content: validManifest})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	changed := strings.Replace(validManifest, "version: 1.2.0", "version: 1.3.0", 1)
+	_, next, err := e.Install(context.Background(), revision, InstallRequest{
+		ImportRequest: ImportRequest{Content: changed},
+		Digest:        candidate.Digest,
+	})
+	if !errors.Is(err, ErrReviewConflict) || !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("Install error = %v, want review conflict classified as invalid request", err)
+	}
+	if next != revision || e.Revision() != revision {
+		t.Fatalf("rejected install moved revision from %q to returned %q / live %q", revision, next, e.Revision())
+	}
 	assertModuleNotInstalled(t, e, "example.plugin")
 }
 

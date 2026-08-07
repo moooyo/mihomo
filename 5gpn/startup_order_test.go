@@ -63,8 +63,8 @@ func TestDNSDoesNotListenWhenInterceptionPlanCannotBeBuilt(t *testing.T) {
 }
 
 func TestInterceptionCapabilityUsesV3Schema(t *testing.T) {
-	if capabilityInterceptionVersion != 3 {
-		t.Fatalf("interception capability version = %d, want 3", capabilityInterceptionVersion)
+	if capabilityInterceptionVersion != 4 {
+		t.Fatalf("interception capability version = %d, want 4", capabilityInterceptionVersion)
 	}
 }
 

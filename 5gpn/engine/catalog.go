@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -275,18 +276,28 @@ func (e *Engine) ReviewCatalogEntry(ctx context.Context, sourceID, entryID strin
 // ReviewCatalogEntryView returns the exact manifest URL and committed revision
 // used by the review, so an API never reconstructs either through a second read.
 func (e *Engine) ReviewCatalogEntryView(ctx context.Context, sourceID, entryID string) (Candidate, string, string, error) {
-	entry, err := e.catalogEntry(ctx, sourceID, entryID)
+	reviewView, err := e.CommittedView()
 	if err != nil {
 		return Candidate{}, "", "", err
 	}
-	candidate, revision, err := e.FetchView(ctx, ImportRequest{URL: entry.Manifest.URL})
+	entry, err := e.catalogEntryForConfig(ctx, reviewView.Config, sourceID, entryID)
 	if err != nil {
-		return Candidate{}, entry.Manifest.URL, revision, err
+		return Candidate{}, "", reviewView.Revision, err
+	}
+	candidate, candidateView, err := e.fetchCandidateView(ctx, ImportRequest{URL: entry.Manifest.URL})
+	if err != nil {
+		if current := e.Revision(); current != reviewView.Revision {
+			return Candidate{}, entry.Manifest.URL, current, state.ErrRevisionConflict
+		}
+		return Candidate{}, entry.Manifest.URL, reviewView.Revision, err
+	}
+	if candidateView.Revision != reviewView.Revision {
+		return Candidate{}, entry.Manifest.URL, candidateView.Revision, state.ErrRevisionConflict
 	}
 	if err := e.verifyAgainstEntry(entry, candidate); err != nil {
-		return Candidate{}, entry.Manifest.URL, revision, err
+		return Candidate{}, entry.Manifest.URL, candidateView.Revision, err
 	}
-	return candidate, entry.Manifest.URL, revision, nil
+	return candidate, entry.Manifest.URL, candidateView.Revision, nil
 }
 
 // CatalogEntrySource resolves an entry to the manifest URL an install must
@@ -313,8 +324,8 @@ func (e *Engine) CatalogEntrySource(ctx context.Context, sourceID, entryID strin
 // manifest must still be the same extension id and its digest must match what
 // was reviewed. On top of that the entry's own claims are checked, so a catalog
 // cannot advertise one shape and update to another.
-func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, entryID, digest string) (Snapshot, string, error) {
-	return e.ApplyCatalogUpdateWithSettings(ctx, revision, sourceID, entryID, digest, nil)
+func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, entryID, reviewedURL, digest string) (Snapshot, string, error) {
+	return e.ApplyCatalogUpdateWithSettings(ctx, revision, sourceID, entryID, reviewedURL, digest, nil)
 }
 
 // ApplyCatalogUpdateWithSettings is the catalog-source variant of
@@ -322,9 +333,13 @@ func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, ent
 // settings document for the freshly fetched candidate.
 func (e *Engine) ApplyCatalogUpdateWithSettings(
 	ctx context.Context,
-	revision, sourceID, entryID, digest string,
+	revision, sourceID, entryID, reviewedURL, digest string,
 	values SettingValues,
 ) (Snapshot, string, error) {
+	reviewedURL = strings.TrimSpace(reviewedURL)
+	if reviewedURL == "" {
+		return Snapshot{}, revision, fmt.Errorf("%w: reviewed catalog manifest URL is required", ErrInvalidRequest)
+	}
 	view, err := e.CommittedView()
 	if err != nil {
 		return Snapshot{}, revision, err
@@ -332,9 +347,18 @@ func (e *Engine) ApplyCatalogUpdateWithSettings(
 	if revision != "" && revision != view.Revision {
 		return Snapshot{}, view.Revision, state.ErrRevisionConflict
 	}
-	entry, err := e.catalogEntry(ctx, sourceID, entryID)
+	entry, err := e.catalogEntryForConfig(ctx, view.Config, sourceID, entryID)
 	if err != nil {
+		if errors.Is(err, ErrModuleNotFound) {
+			return Snapshot{}, revision, reviewConflictf("the selected Marketplace entry changed since you reviewed it: %v", err)
+		}
 		return Snapshot{}, revision, err
+	}
+	if entry.Manifest.URL != reviewedURL {
+		return Snapshot{}, revision, reviewConflictf(
+			"the selected Marketplace entry changed manifest URL since you reviewed it (%s, not %s)",
+			entry.Manifest.URL, reviewedURL,
+		)
 	}
 	installed, err := updatableModule(view.Config, entry.ID)
 	if err != nil {
@@ -345,7 +369,7 @@ func (e *Engine) ApplyCatalogUpdateWithSettings(
 	if previous := strings.TrimSpace(installed.Source.URL); previous != "" && previous != entry.Manifest.URL {
 		log.Infoln("[5GPN] extension %s updates from %s, previously %s", entry.ID, entry.Manifest.URL, previous)
 	}
-	return e.applyUpdateFrom(ctx, revision, entry.ID, entry.Manifest.URL, digest, values, func(module Module) error {
+	return e.applyUpdateFrom(ctx, revision, entry.ID, reviewedURL, digest, values, func(module Module) error {
 		return e.verifyAgainstEntry(entry, Candidate{Detail: detailOf(module)})
 	})
 }
@@ -355,6 +379,10 @@ func (e *Engine) catalogEntry(ctx context.Context, sourceID, entryID string) (Ca
 	if err != nil {
 		return CatalogEntry{}, err
 	}
+	return e.catalogEntryForConfig(ctx, cfg, sourceID, entryID)
+}
+
+func (e *Engine) catalogEntryForConfig(ctx context.Context, cfg Config, sourceID, entryID string) (CatalogEntry, error) {
 	for _, source := range cfg.Catalogs {
 		if source.ID != sourceID {
 			continue

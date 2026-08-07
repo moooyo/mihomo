@@ -28,6 +28,167 @@ func newInterceptionAPIEngine(t *testing.T) *engine.Engine {
 	return e
 }
 
+const installOnlyReviewManifest = `
+apiVersion: 5gpn.io/v1
+kind: Extension
+metadata:
+  id: api.install-only
+  name: Install-only API fixture
+  version: 1.0.0
+permissions:
+  persistentStorage: false
+  network: false
+traffic:
+  captureHosts:
+    - install-only.example.com
+actions:
+  - id: passthrough
+    phase: request
+    match:
+      hosts: [install-only.example.com]
+    script:
+      inline: "function transform(context) { return {}; }"
+      bodyMode: text
+`
+
+func TestInstallOnlyReviewRejectsAnInstalledID(t *testing.T) {
+	e := newInterceptionAPIEngine(t)
+	engine.SetImporter(engine.NewImporter(nil))
+	t.Cleanup(func() { engine.SetImporter(nil) })
+
+	importRequest := engine.ImportRequest{Content: installOnlyReviewManifest}
+	reviewBody, err := json.Marshal(importRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewRequest := httptest.NewRequest(http.MethodPost, "/review", strings.NewReader(string(reviewBody)))
+	reviewRequest.Header.Set("Content-Type", "application/json")
+	reviewResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(reviewResponse, reviewRequest)
+	if reviewResponse.Code != http.StatusOK {
+		t.Fatalf("initial review status %d, want %d; body=%s", reviewResponse.Code, http.StatusOK, reviewResponse.Body.String())
+	}
+	var review struct {
+		Candidate engine.Candidate `json:"candidate"`
+		Revision  string           `json:"revision"`
+	}
+	if err := json.Unmarshal(reviewResponse.Body.Bytes(), &review); err != nil {
+		t.Fatalf("decode review response: %v", err)
+	}
+	if review.Candidate.Digest == "" || review.Revision == "" {
+		t.Fatalf("initial review omitted digest or revision: %+v", review)
+	}
+
+	installBody, err := json.Marshal(installRequest{
+		Revision: review.Revision,
+		InstallRequest: engine.InstallRequest{
+			ImportRequest: importRequest,
+			Digest:        review.Candidate.Digest,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	installHTTP := httptest.NewRequest(http.MethodPost, "/extensions", strings.NewReader(string(installBody)))
+	installHTTP.Header.Set("Content-Type", "application/json")
+	installResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(installResponse, installHTTP)
+	if installResponse.Code != http.StatusOK {
+		t.Fatalf("install status %d, want %d; body=%s", installResponse.Code, http.StatusOK, installResponse.Body.String())
+	}
+
+	before, revision := e.ReadDocument()
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/review", strings.NewReader(string(reviewBody)))
+	repeatRequest.Header.Set("Content-Type", "application/json")
+	repeatResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(repeatResponse, repeatRequest)
+	if repeatResponse.Code != http.StatusBadRequest {
+		t.Fatalf("repeat review status %d, want %d; body=%s", repeatResponse.Code, http.StatusBadRequest, repeatResponse.Body.String())
+	}
+	var failure struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(repeatResponse.Body.Bytes(), &failure); err != nil {
+		t.Fatalf("decode repeat review failure: %v", err)
+	}
+	if !strings.Contains(failure.Message, "Marketplace") {
+		t.Fatalf("repeat review failure %q does not direct the operator to Marketplace", failure.Message)
+	}
+
+	after, afterRevision := e.ReadDocument()
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRevision != revision || string(afterJSON) != string(beforeJSON) {
+		t.Fatalf("rejected repeat review changed interception state: revision %q -> %q", revision, afterRevision)
+	}
+}
+
+func TestInstallReturnsAReviewConflictWhenTheCandidateChanged(t *testing.T) {
+	e := newInterceptionAPIEngine(t)
+	engine.SetImporter(engine.NewImporter(nil))
+	t.Cleanup(func() { engine.SetImporter(nil) })
+
+	reviewBody, err := json.Marshal(engine.ImportRequest{Content: installOnlyReviewManifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewRequest := httptest.NewRequest(http.MethodPost, "/review", strings.NewReader(string(reviewBody)))
+	reviewRequest.Header.Set("Content-Type", "application/json")
+	reviewResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(reviewResponse, reviewRequest)
+	if reviewResponse.Code != http.StatusOK {
+		t.Fatalf("review status %d, want %d; body=%s", reviewResponse.Code, http.StatusOK, reviewResponse.Body.String())
+	}
+	var review struct {
+		Candidate engine.Candidate `json:"candidate"`
+		Revision  string           `json:"revision"`
+	}
+	if err := json.Unmarshal(reviewResponse.Body.Bytes(), &review); err != nil {
+		t.Fatalf("decode review response: %v", err)
+	}
+	if review.Candidate.Detail.SnapshotDigest != review.Candidate.Digest {
+		t.Fatalf("review detail digest %q, candidate digest %q", review.Candidate.Detail.SnapshotDigest, review.Candidate.Digest)
+	}
+
+	changed := strings.Replace(installOnlyReviewManifest, "version: 1.0.0", "version: 1.1.0", 1)
+	applyBody, err := json.Marshal(installRequest{
+		Revision: review.Revision,
+		InstallRequest: engine.InstallRequest{
+			ImportRequest: engine.ImportRequest{Content: changed},
+			Digest:        review.Candidate.Digest,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyRequest := httptest.NewRequest(http.MethodPost, "/extensions", strings.NewReader(string(applyBody)))
+	applyRequest.Header.Set("Content-Type", "application/json")
+	applyResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(applyResponse, applyRequest)
+	if applyResponse.Code != http.StatusConflict {
+		t.Fatalf("apply status %d, want %d; body=%s", applyResponse.Code, http.StatusConflict, applyResponse.Body.String())
+	}
+	var failure struct {
+		Code     string `json:"code"`
+		Revision string `json:"revision"`
+	}
+	if err := json.Unmarshal(applyResponse.Body.Bytes(), &failure); err != nil {
+		t.Fatalf("decode apply failure: %v", err)
+	}
+	if failure.Code != "review_conflict" || failure.Revision != review.Revision {
+		t.Fatalf("apply failure = %+v, want review_conflict at revision %q", failure, review.Revision)
+	}
+	if _, err := e.Detail("api.install-only"); err == nil {
+		t.Fatal("stale reviewed candidate was installed")
+	}
+}
+
 func TestInstalledSourceUpdateRoutesAreNotExposed(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		response := httptest.NewRecorder()
