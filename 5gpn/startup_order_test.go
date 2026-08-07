@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/metacubex/mihomo/5gpn/api"
 	"github.com/metacubex/mihomo/5gpn/engine"
 )
 
@@ -62,9 +63,22 @@ func TestDNSDoesNotListenWhenInterceptionPlanCannotBeBuilt(t *testing.T) {
 	}
 }
 
-func TestInterceptionCapabilityUsesV3Schema(t *testing.T) {
-	if capabilityInterceptionVersion != 4 {
-		t.Fatalf("interception capability version = %d, want 4", capabilityInterceptionVersion)
+func TestInterceptionCapabilityV5PublishAndWithdraw(t *testing.T) {
+	advertiseInterceptionCapability(false)
+	t.Cleanup(func() { advertiseInterceptionCapability(false) })
+	if _, ok := api.LookupFeature(capabilityInterceptionKey); ok {
+		t.Fatal("withdrawn interception capability remains advertised")
+	}
+
+	advertiseInterceptionCapability(true)
+	feature, ok := api.LookupFeature(capabilityInterceptionKey)
+	if !ok || feature.Version != 5 {
+		t.Fatalf("advertised interception capability = %+v, present %v; want version 5", feature, ok)
+	}
+
+	advertiseInterceptionCapability(false)
+	if _, ok := api.LookupFeature(capabilityInterceptionKey); ok {
+		t.Fatal("interception capability remains advertised after withdrawal")
 	}
 }
 

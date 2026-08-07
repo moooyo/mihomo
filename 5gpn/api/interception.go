@@ -51,6 +51,7 @@ func interceptionRouter() http.Handler {
 	r.Put("/settings", putInterceptionSettings)
 	r.Put("/order", putInterceptionOrder)
 	r.Post("/certificate/retry", postCertificateRetry)
+	r.Post("/location/search", postLocationSearch)
 	r.Post("/review", postReview)
 	r.Post("/extensions", postInstall)
 	r.Get("/logs", getEngineLogs)

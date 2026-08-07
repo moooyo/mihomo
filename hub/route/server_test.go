@@ -7,11 +7,37 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/metacubex/chi"
 	"github.com/metacubex/mihomo/component/updater"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
 )
+
+func TestExternalControllerRoutesShareAuthenticationBoundary(t *testing.T) {
+	previousRouters := externalRouters
+	previousUIPath := uiPath
+	t.Cleanup(func() {
+		externalRouters = previousRouters
+		uiPath = previousUIPath
+	})
+	externalRouters = []externalRouter{func(router chi.Router) {
+		router.Post("/5gpn/interception/location/search", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+	}}
+	uiPath = ""
+	handler := router(false, "controller-secret", "", Cors{})
+
+	unauthenticated := requestRoute(handler, http.MethodPost, "/5gpn/interception/location/search", "")
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated external route status %d, want %d", unauthenticated.Code, http.StatusUnauthorized)
+	}
+	authenticated := requestRoute(handler, http.MethodPost, "/5gpn/interception/location/search", "controller-secret")
+	if authenticated.Code != http.StatusNoContent {
+		t.Fatalf("authenticated external route status %d, want %d", authenticated.Code, http.StatusNoContent)
+	}
+}
 
 func TestUIProfileContentType(t *testing.T) {
 	previousUIPath := uiPath

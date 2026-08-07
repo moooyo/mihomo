@@ -65,6 +65,16 @@ func snapshot() map[string]Feature {
 	return out
 }
 
+// LookupFeature returns one advertised feature snapshot. It exists so the
+// subsystem that owns a capability can verify its publish/withdraw lifecycle
+// without reaching through the HTTP router.
+func LookupFeature(name string) (Feature, bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	feature, ok := features[name]
+	return feature, ok
+}
+
 type capabilitiesResponse struct {
 	ControllerAPI string             `json:"controllerApi"`
 	Features      map[string]Feature `json:"features"`

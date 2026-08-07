@@ -20,6 +20,7 @@ import (
 	"github.com/metacubex/mihomo/5gpn/dial"
 	"github.com/metacubex/mihomo/5gpn/dns"
 	"github.com/metacubex/mihomo/5gpn/engine"
+	"github.com/metacubex/mihomo/5gpn/location"
 	"github.com/metacubex/mihomo/5gpn/state"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -40,7 +41,9 @@ const (
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
 
-	capabilityInterceptionVersion = 4
+	// Version 5 retains the version-4 reviewed-source and snapshot contract and
+	// adds the authenticated same-origin location search projection.
+	capabilityInterceptionVersion = 5
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.
@@ -76,6 +79,9 @@ func Start(home string, onFatal func(error)) error {
 	})
 
 	api.Advertise(capabilityCoreKey, api.Feature{Version: 1})
+	api.SetLocationSearcher(location.New(func(ctx context.Context, host string, port int) (net.Conn, error) {
+		return dial.SystemTCP(ctx, host, port)
+	}))
 	installed.Store(true)
 	log.Infoln("[5GPN] state directory %s", dir)
 
@@ -265,6 +271,14 @@ func StateDir() string {
 	return ""
 }
 
+func advertiseInterceptionCapability(available bool) {
+	if !available {
+		api.Advertise(capabilityInterceptionKey, api.Feature{})
+		return
+	}
+	api.Advertise(capabilityInterceptionKey, api.Feature{Version: capabilityInterceptionVersion})
+}
+
 // StartInterception assembles the plugin engine and installs it as the core's
 // capture stage. Calling it with an empty path, or not calling it at all,
 // leaves the core routing every connection normally.
@@ -280,7 +294,7 @@ func StartInterception(configPath string, onFatal func(error)) error {
 	// the client render a panel over an engine that is not there, which is a
 	// worse failure than an absent panel: the operator would read its emptiness
 	// as "no extensions enabled".
-	api.Advertise(capabilityInterceptionKey, api.Feature{})
+	advertiseInterceptionCapability(false)
 	api.SetInterceptionEngine(nil)
 	engineRef.Store(nil)
 	tunnel.SetTrafficPolicy(nil)
@@ -315,7 +329,7 @@ func StartInterception(configPath string, onFatal func(error)) error {
 	tunnel.SetInterceptor(e.Interceptor())
 	engineRef.Store(e)
 	api.SetInterceptionEngine(e)
-	api.Advertise(capabilityInterceptionKey, api.Feature{Version: capabilityInterceptionVersion})
+	advertiseInterceptionCapability(true)
 	if svc := dnsRef.Load(); svc != nil {
 		svc.Resolver().SetCaptureLookup(func(name string) (dns.Capture, bool) {
 			binding, ok := e.CaptureFor(name)
