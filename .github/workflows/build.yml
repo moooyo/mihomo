@@ -1,5 +1,7 @@
 name: Build
 
+# This workflow is the release authority for the 5gpn delivery branch.
+
 on:
   workflow_dispatch:
     inputs:
