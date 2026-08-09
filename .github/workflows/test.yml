@@ -1,5 +1,7 @@
 name: Test
 
+# This workflow validates the 5gpn delivery branch across supported platforms.
+
 on:
   push:
     paths-ignore:
