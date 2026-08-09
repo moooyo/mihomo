@@ -82,6 +82,13 @@ Build with gvisor tun stack:
 go build -tags with_gvisor
 ```
 
+### 5gpn delivery
+
+The `moooyo/mihomo` fork publishes monolith artifacts only from
+`feat/5gpn-monolith` through the manually dispatched `Build` workflow. Release
+tags use `vX.Y.Z-monolith.N`; repository administration keeps those tags
+protected from update or deletion and keeps immutable releases enabled.
+
 ### IPTABLES configuration
 
 Work on Linux OS which supported `iptables`
