@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"hash"
-	"net/netip"
 	"strconv"
 )
 
@@ -44,13 +43,6 @@ type upstreamModuleProjection struct {
 	hosts    *compiledHostMatcher
 	mappings []HostMapping
 	network  bool
-}
-
-// inboundUDPAuthorization is captured when a datagram or QUIC association starts.
-// The snapshot preserves association authorization without retaining scripts.
-type inboundUDPAuthorization struct {
-	enabled     bool
-	activeHosts *compiledHostMatcher
 }
 
 func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
@@ -96,8 +88,7 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 		for _, mapping := range module.HostMappings {
 			// The resolver form names nameservers for the 5gpn DNS subsystem, not a
 			// destination. Keeping it out of the projection is what stops it
-			// reaching the dialler, and it covers the HTTP/3 path with the
-			// same edit.
+			// reaching the dialler.
 			if mapping.resolverForm() {
 				continue
 			}
@@ -140,13 +131,6 @@ func writeFingerprintBool(digest hash.Hash, value bool) {
 		return
 	}
 	_, _ = digest.Write([]byte{0})
-}
-
-func newInboundUDPAuthorization(cfg Config) inboundUDPAuthorization {
-	return inboundUDPAuthorization{
-		enabled:     cfg.MITM.Enabled,
-		activeHosts: projectedActiveHostMatcher(cfg),
-	}
 }
 
 func projectedActiveHostMatcher(cfg Config) *compiledHostMatcher {
@@ -216,15 +200,4 @@ func (p upstreamTargetProjection) upstreamTarget(rawHost, portText, owner string
 		return netTarget{}, false
 	}
 	return netTarget{Host: host, Port: port, Owner: owner}, true
-}
-
-func (a inboundUDPAuthorization) allows(target netTarget) bool {
-	if !a.enabled || target.Port != 443 {
-		return false
-	}
-	if a.activeHosts.Match(target.Host) {
-		return true
-	}
-	ip, err := netip.ParseAddr(target.Host)
-	return err == nil && ip.Zone() == ""
 }

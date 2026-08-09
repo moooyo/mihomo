@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -22,13 +23,13 @@ const (
 	pollRetryMax = 5 * time.Minute
 )
 
-func (s *Service) run(ctx context.Context, doc Document) {
-	s.runWithClient(ctx, doc, newClient(doc.Token, s.dial))
+func (s *Service) run(ctx context.Context, doc Document, generation uint64) {
+	s.runWithClient(ctx, doc, newClient(doc.Token, s.dial), generation)
 }
 
 // runWithClient is the loop proper. Split from run so a test can point the
 // whole conversation at a local server rather than at Telegram.
-func (s *Service) runWithClient(ctx context.Context, doc Document, c *client) {
+func (s *Service) runWithClient(ctx context.Context, doc Document, c *client, generation uint64) {
 	me, err := c.getMe(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -38,10 +39,10 @@ func (s *Service) runWithClient(ctx context.Context, doc Document, c *client) {
 		// they look the same, so the loop backs off and keeps trying either
 		// way. What distinguishes them for the operator is the message, which
 		// the view carries.
-		s.setState("unreachable", redactToken(err.Error(), doc.Token))
+		s.setState(generation, "unreachable", redactToken(err.Error(), doc.Token))
 		log.Warnln("[5GPN/BOT] cannot reach Telegram: %v", redactToken(err.Error(), doc.Token))
 	} else {
-		s.setState("running", "")
+		s.setState(generation, "running", "")
 		log.Infoln("[5GPN/BOT] connected as @%s", me.Username)
 	}
 
@@ -50,9 +51,19 @@ func (s *Service) runWithClient(ctx context.Context, doc Document, c *client) {
 		admins[id] = struct{}{}
 	}
 
+	var alerts sync.WaitGroup
+	alertsCtx, stopAlerts := context.WithCancel(ctx)
 	if doc.Alerts {
-		go s.runAlerts(ctx, c, doc)
+		alerts.Add(1)
+		go func() {
+			defer alerts.Done()
+			s.runAlerts(alertsCtx, c, doc)
+		}()
 	}
+	defer func() {
+		stopAlerts()
+		alerts.Wait()
+	}()
 
 	var offset int64
 	backoff := pollRetryMin
@@ -65,7 +76,7 @@ func (s *Service) runWithClient(ctx context.Context, doc Document, c *client) {
 			if ctx.Err() != nil {
 				return
 			}
-			s.setState("unreachable", redactToken(err.Error(), doc.Token))
+			s.setState(generation, "unreachable", redactToken(err.Error(), doc.Token))
 			select {
 			case <-ctx.Done():
 				return
@@ -77,9 +88,15 @@ func (s *Service) runWithClient(ctx context.Context, doc Document, c *client) {
 			continue
 		}
 		backoff = pollRetryMin
-		s.setState("running", "")
+		s.setState(generation, "running", "")
 
 		for _, u := range updates {
+			// Cancellation revokes this generation before the replacement is
+			// allowed to start. Do not finish a batch under an obsolete admin set
+			// when cancellation raced with the long-poll response.
+			if ctx.Err() != nil {
+				return
+			}
 			// Advance past every update whether or not it is answered.
 			// Telegram replays anything below the offset, so an update the bot
 			// declines to act on -- a photo, a stranger's message -- would

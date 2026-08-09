@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validManifest = `
@@ -53,6 +55,47 @@ actions:
       inline: "function transform(context) { return {}; }"
       bodyMode: text
 `
+
+func TestGuardedDialFallsBackBeforeABlackholedAddressFamily(t *testing.T) {
+	server, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = peer.Close()
+	})
+	calls := make(chan string, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	conn, err := dialGuardedCandidates(
+		ctx,
+		"tcp",
+		"443",
+		[]netip.Addr{netip.MustParseAddr("2001:4860:4860::8888"), netip.MustParseAddr("8.8.8.8")},
+		5*time.Millisecond,
+		func(ctx context.Context, _, address string) (net.Conn, error) {
+			calls <- address
+			if strings.HasPrefix(address, "[") {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return server, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("dialGuardedCandidates() error = %v", err)
+	}
+	defer conn.Close()
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("address-family fallback took %s", elapsed)
+	}
+	for range 2 {
+		select {
+		case <-calls:
+		case <-time.After(time.Second):
+			t.Fatal("both address families were not attempted")
+		}
+	}
+}
 
 func parseFixture(t *testing.T, body string) Module {
 	t.Helper()
@@ -278,15 +321,35 @@ func TestDialGuardRefusesNonPublicAddresses(t *testing.T) {
 	for _, addr := range []string{
 		"127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "192.168.1.1",
 		"169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "240.0.0.1",
-		"fe80::1", "fd00::1",
+		"192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1",
+		"fe80::1", "fd00::1", "100::1", "2001:db8::1", "3fff::1", "::ffff:8.8.8.8",
 	} {
-		if publicUnicast(net.ParseIP(addr)) {
+		if publicUnicast(netip.MustParseAddr(addr)) {
 			t.Errorf("publicUnicast(%s) accepted it", addr)
 		}
 	}
 	for _, addr := range []string{"8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"} {
-		if !publicUnicast(net.ParseIP(addr)) {
+		if !publicUnicast(netip.MustParseAddr(addr)) {
 			t.Errorf("publicUnicast(%s) refused a public address", addr)
+		}
+	}
+}
+
+func TestHostTargetsUseTheSharedPublicAddressGuard(t *testing.T) {
+	for _, target := range []string{
+		"192.0.2.1",
+		"198.18.0.1",
+		"203.0.113.1",
+		"::ffff:8.8.8.8",
+		"server:192.0.2.1",
+	} {
+		if validHostTarget(target) {
+			t.Errorf("validHostTarget(%q) accepted a special-purpose address", target)
+		}
+	}
+	for _, target := range []string{"8.8.8.8", "server:8.8.8.8"} {
+		if !validHostTarget(target) {
+			t.Errorf("validHostTarget(%q) refused a public IPv4 target", target)
 		}
 	}
 }
@@ -325,6 +388,45 @@ func TestSnapshotDigestCoversThePublisherAndNotTheOperator(t *testing.T) {
 	hostEdits.CaptureHosts = []string{"*.api.example.com", "shared.example.com", "extra.example.com"}
 	if SnapshotDigest(hostEdits) == want {
 		t.Error("the digest survived a new capture host")
+	}
+}
+
+func TestSnapshotDigestSurvivesPersistenceOfEmptyOptionalLists(t *testing.T) {
+	module := parseFixture(t, `
+apiVersion: 5gpn.io/v1
+kind: Extension
+metadata:
+  id: stable.digest
+  name: Stable digest
+  version: 1.0.0
+  description: Digest persistence fixture
+permissions:
+  persistentStorage: false
+  network: false
+traffic:
+  captureHosts: [stable.example.com]
+actions:
+  - id: pass
+    phase: request
+    match:
+      hosts: [stable.example.com]
+    script:
+      inline: "function transform() { return {}; }"
+      bodyMode: none
+      timeoutMs: 1000
+      maxBodyBytes: 1024
+`)
+	want := SnapshotDigest(module)
+	raw, err := json.Marshal(module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored Module
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if got := SnapshotDigest(restored); got != want {
+		t.Fatalf("digest changed across persistence: %s -> %s", want, got)
 	}
 }
 

@@ -24,8 +24,23 @@ func newInterceptionAPIEngine(t *testing.T) *engine.Engine {
 		t.Fatalf("open interception engine: %v", err)
 	}
 	SetInterceptionEngine(e)
-	t.Cleanup(func() { SetInterceptionEngine(nil) })
+	t.Cleanup(func() {
+		SetInterceptionEngine(nil)
+		_ = e.Close()
+	})
 	return e
+}
+
+func TestHardIsolationUnavailableIsServiceUnavailable(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/5gpn/interception", nil)
+	response := httptest.NewRecorder()
+	writeEngineError(response, request, engine.ErrHardIsolationUnavailable, nil)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(response.Body.String(), "hard_isolation_unavailable") {
+		t.Fatalf("response omits stable error code: %s", response.Body.String())
+	}
 }
 
 const installOnlyReviewManifest = `
@@ -200,6 +215,49 @@ func TestInstalledSourceUpdateRoutesAreNotExposed(t *testing.T) {
 	}
 }
 
+func TestEngineLogsExposeRecoverableCursorEnvelope(t *testing.T) {
+	newInterceptionAPIEngine(t)
+
+	read := func(path string) (int, engine.EngineLogPage) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		interceptionRouter().ServeHTTP(response, request)
+		var page engine.EngineLogPage
+		if response.Code == http.StatusOK {
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+				t.Fatalf("decode log page: %v", err)
+			}
+		}
+		return response.Code, page
+	}
+
+	status, initial := read("/logs?limit=2")
+	if status != http.StatusOK || initial.StreamID == "" || initial.Logs == nil || initial.Reset || initial.Dropped != 0 {
+		t.Fatalf("initial log page status=%d page=%+v", status, initial)
+	}
+	status, reset := read("/logs?limit=2&stream_id=" + initial.StreamID + "&after=9007199254740993")
+	if status != http.StatusOK || !reset.Reset || reset.StreamID != initial.StreamID || reset.Dropped != 0 {
+		t.Fatalf("future-cursor log page status=%d page=%+v", status, reset)
+	}
+	status, missingStream := read("/logs?limit=2&after=0")
+	if status != http.StatusOK || !missingStream.Reset {
+		t.Fatalf("missing-stream log page status=%d page=%+v", status, missingStream)
+	}
+	status, _ = read("/logs?after=not-a-sequence")
+	if status != http.StatusBadRequest {
+		t.Fatalf("malformed cursor status=%d, want %d", status, http.StatusBadRequest)
+	}
+	status, _ = read("/logs?after=01")
+	if status != http.StatusBadRequest {
+		t.Fatalf("non-canonical cursor status=%d, want %d", status, http.StatusBadRequest)
+	}
+	status, _ = read("/logs?after=18446744073709551616")
+	if status != http.StatusBadRequest {
+		t.Fatalf("out-of-range cursor status=%d, want %d", status, http.StatusBadRequest)
+	}
+}
+
 func TestSettingsRejectHTTP3WithoutPublishing(t *testing.T) {
 	e := newInterceptionAPIEngine(t)
 
@@ -261,6 +319,7 @@ func TestExtensionSettingsRouteRequiresACompleteValuesDocument(t *testing.T) {
     "upstream_mappings": [{"host": "settings.example.com", "target": "origin.settings.example.net"}],
     "settings": [{"key": "region", "type": "select", "required": true, "options": ["cn", "hk"], "value": "cn"}],
     "persistent_storage": false,
+    "egress_group": "DIRECT",
     "egress_group_required": false
   }],
   "catalogs": []

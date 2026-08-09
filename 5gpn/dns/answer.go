@@ -26,6 +26,7 @@ func SyntheticNODATA(r *D.Msg) *D.Msg {
 	m := new(D.Msg)
 	m.SetReply(r)
 	m.RecursionAvailable = true
+	m.AuthenticatedData = false
 	m.Ns = []D.RR{&D.SOA{
 		Hdr: D.RR_Header{
 			Name:   ".",
@@ -41,6 +42,12 @@ func SyntheticNODATA(r *D.Msg) *D.Msg {
 		Expire:  86400,
 		Minttl:  300,
 	}}
+	return m
+}
+
+func tunedSyntheticNODATA(r *D.Msg, tuning runtimeTuning) *D.Msg {
+	m := SyntheticNODATA(r)
+	clampSyntheticTTLs(m, tuning)
 	return m
 }
 
@@ -79,9 +86,10 @@ func GatewayReply(r *D.Msg, gateway netip.Addr) *D.Msg {
 	m := new(D.Msg)
 	m.SetReply(r)
 	m.RecursionAvailable = true
+	m.AuthenticatedData = false
 
 	gateway = gateway.Unmap()
-	if !gateway.Is4() || gateway.IsUnspecified() {
+	if !usableGateway(gateway) {
 		m.SetRcode(r, D.RcodeNameError)
 		return m
 	}
@@ -103,4 +111,33 @@ func GatewayReply(r *D.Msg, gateway netip.Addr) *D.Msg {
 		A: gateway.AsSlice(),
 	}}
 	return m
+}
+
+func usableGateway(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	return addr.Is4() && addr.IsGlobalUnicast() && !addr.IsLoopback()
+}
+
+func tunedGatewayReply(r *D.Msg, gateway netip.Addr, tuning runtimeTuning) *D.Msg {
+	m := GatewayReply(r, gateway)
+	clampSyntheticTTLs(m, tuning)
+	return m
+}
+
+func clampSyntheticTTLs(m *D.Msg, tuning runtimeTuning) {
+	if m == nil {
+		return
+	}
+	sections := [][]D.RR{m.Answer, m.Ns, m.Extra}
+	for _, section := range sections {
+		for _, rr := range section {
+			if _, ok := rr.(*D.OPT); ok {
+				continue
+			}
+			rr.Header().Ttl = clampTTL(rr.Header().Ttl, tuning.ttlMin, tuning.ttlMax)
+			if soa, ok := rr.(*D.SOA); ok {
+				soa.Minttl = clampTTL(soa.Minttl, tuning.ttlMin, tuning.ttlMax)
+			}
+		}
+	}
 }

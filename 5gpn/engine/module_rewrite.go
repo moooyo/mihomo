@@ -3,10 +3,13 @@ package engine
 import (
 	"errors"
 	"fmt"
-	"github.com/metacubex/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/metacubex/http"
 )
 
 // Three more directives the published modules declare and this manifest could
@@ -126,9 +129,9 @@ func (b *BodyReplace) validate() error {
 	if err != nil {
 		return fmt.Errorf("body replace pattern is invalid: %w", err)
 	}
-	// A pattern that matches the empty string substitutes at every byte offset,
-	// so a 64 MiB body multiplies by the length of `to` with nothing to stop it.
-	// No body-replace directive this kind exists to carry ever wants that.
+	// A pattern that matches the empty string substitutes at every byte offset.
+	// The executor is allocation-bounded too, but no body-replace directive this
+	// kind exists to carry ever wants that surprising behaviour.
 	if compiled.MatchString("") {
 		return errors.New("body replace pattern must not match the empty string")
 	}
@@ -240,7 +243,156 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 	if !replace.compiled.Match(body) {
 		return scriptResult{}, nil
 	}
-	return scriptResult{Body: replace.compiled.ReplaceAll(body, []byte(template)), ChangedBody: true}, nil
+	limit := maxModuleHTTPBody
+	if rule.MaxBodyBytes > 0 && rule.MaxBodyBytes < limit {
+		limit = rule.MaxBodyBytes
+	}
+	replaced, err := replaceBodyBounded(replace.compiled, body, template, limit)
+	if err != nil {
+		return scriptResult{}, err
+	}
+	return scriptResult{Body: replaced, ChangedBody: true}, nil
+}
+
+// replaceBodyBounded proves an upper bound before regexp.ReplaceAll is allowed
+// to allocate its result. The proof preserves the standard regexp replacement
+// grammar: literal bytes and $$ have exact sizes, while a valid capture is at
+// most as long as the full match. Returning nil from the preflight callback
+// makes its discarded output no larger than the already-bounded input body.
+//
+// A capture-heavy template can make the proof conservative, but never unsafe:
+// an accepted replacement is guaranteed to fit before the real result builder
+// runs. This keeps regexp's exact handling of anchors, word boundaries, named
+// captures, and unmatched groups without collecting every match index in
+// memory.
+func replaceBodyBounded(compiled *regexp.Regexp, body []byte, template string, limit int64) ([]byte, error) {
+	upper := int64(len(body))
+	ceiling := limit + int64(len(body)) + 1
+	replacementBound := compileBodyReplacementBound(compiled, template, ceiling)
+	_ = compiled.ReplaceAllFunc(body, func(match []byte) []byte {
+		upper -= int64(len(match))
+		replacement := replacementBound.upper(len(match), ceiling)
+		if replacement >= ceiling-upper {
+			upper = ceiling
+		} else {
+			upper += replacement
+		}
+		return nil
+	})
+	if upper > limit {
+		return nil, fmt.Errorf("body replacement exceeds %d bytes", limit)
+	}
+	replaced := compiled.ReplaceAll(body, []byte(template))
+	if int64(len(replaced)) > limit {
+		return nil, fmt.Errorf("body replacement exceeds %d bytes", limit)
+	}
+	return replaced, nil
+}
+
+type bodyReplacementBound struct {
+	literalBytes int64
+	captureRefs  int64
+}
+
+func (b bodyReplacementBound) upper(matchBytes int, ceiling int64) int64 {
+	if b.literalBytes >= ceiling {
+		return ceiling
+	}
+	remaining := ceiling - b.literalBytes
+	if b.captureRefs > 0 && int64(matchBytes) >= (remaining+b.captureRefs-1)/b.captureRefs {
+		return ceiling
+	}
+	return b.literalBytes + b.captureRefs*int64(matchBytes)
+}
+
+func compileBodyReplacementBound(compiled *regexp.Regexp, template string, ceiling int64) bodyReplacementBound {
+	bound := bodyReplacementBound{}
+	add := func(amount int64) {
+		if amount >= ceiling-bound.literalBytes {
+			bound.literalBytes = ceiling
+			return
+		}
+		bound.literalBytes += amount
+	}
+	for len(template) > 0 && bound.literalBytes < ceiling {
+		before, after, found := strings.Cut(template, "$")
+		add(int64(len(before)))
+		if !found {
+			break
+		}
+		template = after
+		if template != "" && template[0] == '$' {
+			add(1)
+			template = template[1:]
+			continue
+		}
+		name, number, rest, ok := extractBodyReplacementName(template)
+		if !ok {
+			// regexp.Expand treats a malformed reference as a literal dollar
+			// and leaves the following bytes for the next iteration.
+			add(1)
+			continue
+		}
+		template = rest
+		valid := number >= 0 && number <= compiled.NumSubexp()
+		if number < 0 {
+			for _, candidate := range compiled.SubexpNames() {
+				if candidate == name {
+					valid = true
+					break
+				}
+			}
+		}
+		if valid {
+			if bound.captureRefs < ceiling {
+				bound.captureRefs++
+			}
+		}
+	}
+	return bound
+}
+
+// extractBodyReplacementName mirrors regexp's $name and ${name} grammar. It is
+// kept local because regexp intentionally does not export its template parser.
+func extractBodyReplacementName(template string) (name string, number int, rest string, ok bool) {
+	if template == "" {
+		return "", 0, "", false
+	}
+	braced := false
+	if template[0] == '{' {
+		braced = true
+		template = template[1:]
+	}
+	index := 0
+	for index < len(template) {
+		r, size := utf8.DecodeRuneInString(template[index:])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			break
+		}
+		index += size
+	}
+	if index == 0 {
+		return "", 0, "", false
+	}
+	name = template[:index]
+	if braced {
+		if index >= len(template) || template[index] != '}' {
+			return "", 0, "", false
+		}
+		index++
+	}
+	number = 0
+	for position := 0; position < len(name); position++ {
+		if name[position] < '0' || name[position] > '9' || number >= 1e8 {
+			number = -1
+			break
+		}
+		number = number*10 + int(name[position]-'0')
+	}
+	if name[0] == '0' && len(name) > 1 {
+		number = -1
+	}
+	return name, number, template[index:], true
 }
 
 // expandSettingsTemplate substitutes {{settings.key}} in a template. When the

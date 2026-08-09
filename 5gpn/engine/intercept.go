@@ -86,16 +86,3 @@ func (i *Interceptor) HandleTCP(conn net.Conn, metadata *C.Metadata) {
 		log.Debugln("[5GPN] intercepted session for %s failed: %v", metadata.Host, err)
 	}
 }
-
-// MatchUDP always leaves QUIC to the gateway's fixed UDP/443 reject rule.
-//
-// Extension interception supports plain HTTP and TLS over TCP only. Keeping
-// this refusal independent of document state is the defensive boundary: even
-// an invalid in-memory value cannot turn datagram capture back on.
-func (*Interceptor) MatchUDP(*C.Metadata) bool { return false }
-
-// HandleUDP retains the interface method for the dormant bridge. The core calls
-// it only after MatchUDP accepts an association, and MatchUDP always refuses.
-func (i *Interceptor) HandleUDP(metadata *C.Metadata) (C.PacketConn, error) {
-	return i.proxy.captureQUIC(metadata)
-}

@@ -87,6 +87,9 @@ func TestGatewayReplyFailsClosedWithoutAGateway(t *testing.T) {
 	for _, gw := range []netip.Addr{
 		{},                                 // never configured
 		netip.MustParseAddr("0.0.0.0"),     // configured to the unspecified address
+		netip.MustParseAddr("127.0.0.1"),   // unreachable from clients
+		netip.MustParseAddr("169.254.1.1"), // link-local rather than a gateway coordinate
+		netip.MustParseAddr("224.0.0.1"),   // multicast is not a dial target
 		netip.MustParseAddr("2001:db8::1"), // v6: egress is IPv4-only
 	} {
 		reply := GatewayReply(query("steered.example", D.TypeA), gw)

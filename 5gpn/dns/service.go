@@ -56,13 +56,77 @@ type Upstreams struct {
 	ECS string `json:"ecs,omitempty"`
 }
 
-// Tuning is the small set of knobs with no correct universal value.
+// Tuning is the small set of knobs with no correct universal value. Zero uses
+// the built-in default; non-zero values are bounded by normalized so a durable
+// write cannot turn the next process start into an allocation or duration
+// failure.
 type Tuning struct {
 	TimeoutMs     int `json:"timeoutMs,omitempty"`
 	TTLMinSeconds int `json:"ttlMinSeconds,omitempty"`
 	TTLMaxSeconds int `json:"ttlMaxSeconds,omitempty"`
 	CacheSize     int `json:"cacheSize,omitempty"`
 	MaxInflight   int `json:"maxInflight,omitempty"`
+}
+
+const (
+	minDocumentTimeout  = 100 * time.Millisecond
+	maxDocumentTimeout  = 30 * time.Second
+	maxDocumentTTLMin   = 24 * time.Hour
+	maxDocumentTTLMax   = 7 * 24 * time.Hour
+	minDocumentCache    = 128
+	maxDocumentCache    = 16384
+	maxDocumentInflight = 4096
+)
+
+// normalized validates operator-supplied values and expands zero to the
+// documented defaults. Negative, nonsensical, and resource-exhausting values
+// are rejected instead of being silently treated as defaults at startup.
+func (t Tuning) normalized() (runtimeTuning, error) {
+	if t.TimeoutMs < 0 || t.TTLMinSeconds < 0 || t.TTLMaxSeconds < 0 || t.CacheSize < 0 || t.MaxInflight < 0 {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning values cannot be negative", ErrInvalidPolicy)
+	}
+	if t.TimeoutMs != 0 && (t.TimeoutMs < int(minDocumentTimeout/time.Millisecond) || t.TimeoutMs > int(maxDocumentTimeout/time.Millisecond)) {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning timeoutMs must be 0 or between %d and %d", ErrInvalidPolicy, minDocumentTimeout/time.Millisecond, maxDocumentTimeout/time.Millisecond)
+	}
+	if t.TTLMinSeconds != 0 && (t.TTLMinSeconds < 1 || t.TTLMinSeconds > int(maxDocumentTTLMin/time.Second)) {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning ttlMinSeconds must be 0 or between 1 and %d", ErrInvalidPolicy, int(maxDocumentTTLMin/time.Second))
+	}
+	if t.TTLMaxSeconds != 0 && (t.TTLMaxSeconds < 1 || t.TTLMaxSeconds > int(maxDocumentTTLMax/time.Second)) {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning ttlMaxSeconds must be 0 or between 1 and %d", ErrInvalidPolicy, int(maxDocumentTTLMax/time.Second))
+	}
+	cacheSize := t.CacheSize
+	if cacheSize == 0 {
+		cacheSize = defaultCacheSize
+	}
+	if cacheSize < minDocumentCache || cacheSize > maxDocumentCache {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning cacheSize must be 0 or between %d and %d", ErrInvalidPolicy, minDocumentCache, maxDocumentCache)
+	}
+	maxInflight := t.MaxInflight
+	if maxInflight == 0 {
+		maxInflight = defaultMaxInflight
+	}
+	if maxInflight < 1 || maxInflight > maxDocumentInflight {
+		return runtimeTuning{}, fmt.Errorf("%w: tuning maxInflight must be 0 or between 1 and %d", ErrInvalidPolicy, maxDocumentInflight)
+	}
+	timeout := time.Duration(t.TimeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = defaultTimeout
+	}
+	ttlMin := time.Duration(t.TTLMinSeconds) * time.Second
+	if ttlMin == 0 {
+		ttlMin = defaultTTLMin
+	}
+	ttlMax := time.Duration(t.TTLMaxSeconds) * time.Second
+	if ttlMax == 0 {
+		ttlMax = defaultTTLMax
+	}
+	if ttlMax < ttlMin {
+		return runtimeTuning{}, fmt.Errorf("%w: effective tuning ttlMaxSeconds must be at least ttlMinSeconds", ErrInvalidPolicy)
+	}
+	return runtimeTuning{
+		timeout: timeout, ttlMin: ttlMin, ttlMax: ttlMax,
+		cacheSize: cacheSize, maxInflight: maxInflight,
+	}, nil
 }
 
 // DefaultDocument is what a gateway with no DNS state starts from.
@@ -136,6 +200,12 @@ func DefaultDocument() Document {
 
 // Validate checks a candidate document without applying it.
 func (d Document) Validate() error {
+	if d.Policy.Rules == nil {
+		return fmt.Errorf("%w: policy rules must be an array", ErrInvalidPolicy)
+	}
+	if !d.Policy.rulesAreGrouped() {
+		return fmt.Errorf("%w: hand-written rules must precede subscriptions", ErrInvalidPolicy)
+	}
 	if err := d.Policy.Validate(); err != nil {
 		return err
 	}
@@ -150,9 +220,12 @@ func (d Document) Validate() error {
 	}
 	if g := strings.TrimSpace(d.Gateway); g != "" {
 		addr, err := netip.ParseAddr(g)
-		if err != nil || !addr.Unmap().Is4() {
-			return fmt.Errorf("%w: gateway %q must be an IPv4 address", ErrInvalidPolicy, d.Gateway)
+		if err != nil || !usableGateway(addr) {
+			return fmt.Errorf("%w: gateway %q must be a usable unicast IPv4 address", ErrInvalidPolicy, d.Gateway)
 		}
+	}
+	if _, err := d.Tuning.normalized(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -179,10 +252,11 @@ type Service struct {
 }
 
 type preparedDocument struct {
-	policy       *compiledPolicy
-	china, trust []MemberSpec
-	ecs          netip.Prefix
-	gateway      netip.Addr
+	policy     *compiledPolicy
+	ups        *upstreams
+	localNames map[string]struct{}
+	gateway    netip.Addr
+	tuning     runtimeTuning
 }
 
 // Option configures process-level integration without putting process control
@@ -224,38 +298,12 @@ func Open(stateDir string, options ...Option) (*Service, error) {
 	if err := current.Validate(); err != nil {
 		return nil, err
 	}
-	// A document written before the seed emitted an explicit list carries a nil
-	// slice, which marshals back as `null` on every subsequent write. Normalise
-	// it on the way in so an upgraded gateway converges to `[]` the first time
-	// anything writes, rather than keeping the foot-gun until an operator
-	// happens to add a rule.
-	//
-	// The same pass groups hand-written rules ahead of subscriptions. A gateway
-	// configured while the two were edited as one interleaved list converges on
-	// load, not on the next write -- otherwise it would keep resolving in the
-	// old precedence while the console showed the new one.
-	if current.Policy.Rules == nil || !current.Policy.rulesAreGrouped() {
-		if _, err := doc.Update("", func(d Document) (Document, error) {
-			if d.Policy.Rules == nil {
-				d.Policy.Rules = []Rule{}
-			}
-			d.Policy = d.Policy.ordered()
-			return d, nil
-		}); err != nil {
-			return nil, fmt.Errorf("5gpn/dns: normalise the policy list: %w", err)
-		}
-		current = doc.Get().Value
-	}
-
-	tuning := current.Tuning
+	tuning, _ := current.Tuning.normalized()
 	s := &Service{
 		doc: doc,
 		resolver: NewResolver(Options{
-			Timeout:     time.Duration(tuning.TimeoutMs) * time.Millisecond,
-			TTLMin:      time.Duration(tuning.TTLMinSeconds) * time.Second,
-			TTLMax:      time.Duration(tuning.TTLMaxSeconds) * time.Second,
-			CacheSize:   tuning.CacheSize,
-			MaxInflight: tuning.MaxInflight,
+			Timeout: tuning.timeout, TTLMin: tuning.ttlMin, TTLMax: tuning.ttlMax,
+			CacheSize: tuning.cacheSize, MaxInflight: tuning.maxInflight,
 		}),
 		ing:      &ingress.Ingress{},
 		rulesDir: rulesDir,
@@ -270,7 +318,7 @@ func Open(stateDir string, options ...Option) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.publish(current, prepared)
+	s.publish(prepared)
 	s.subs = newSubscriptions(s)
 	return s, nil
 }
@@ -312,7 +360,7 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 		// impossible without socket activation, and persisting before a bind
 		// succeeds can turn one rejected API write into a permanent restart loop.
 		// Whole-document clients therefore round-trip this section unchanged.
-		if next.Listen != current.Listen && s.bound != (Listen{}) {
+		if next.Listen != current.Listen {
 			return current, fmt.Errorf("%w: listener settings are installation-owned", ErrInvalidPolicy)
 		}
 		prepared, err = prepareDocument(next, s.rulesDir)
@@ -322,9 +370,13 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 		return next, nil
 	})
 	if err != nil {
+		if prepared != nil && prepared.ups != nil {
+			prepared.ups.china.Close()
+			prepared.ups.trust.Close()
+		}
 		return snap.Value, snap.Revision, err
 	}
-	s.publish(snap.Value, prepared)
+	s.publish(prepared)
 	s.subs.wakeUp()
 	return snap.Value, snap.Revision, nil
 }
@@ -366,17 +418,29 @@ func prepareDocument(d Document, rulesDir string) (*preparedDocument, error) {
 	if g := strings.TrimSpace(d.Gateway); g != "" {
 		gateway, _ = netip.ParseAddr(g)
 	}
-	return &preparedDocument{policy: policy, china: china, trust: trust, ecs: ecs, gateway: gateway}, nil
+	chinaGroup := newGroup("china", china)
+	chinaGroup.SetECS(ecs)
+	localNames := make(map[string]struct{}, len(d.LocalNames))
+	for _, name := range d.LocalNames {
+		if name = normalizeDomain(name); name != "" {
+			localNames[name] = struct{}{}
+		}
+	}
+	tuning, _ := d.Tuning.normalized()
+	return &preparedDocument{
+		policy:     policy,
+		ups:        &upstreams{china: chinaGroup, trust: newGroup("trust", trust)},
+		localNames: localNames,
+		gateway:    gateway,
+		tuning:     tuning,
+	}, nil
 }
 
 // publish applies only objects that were completely prepared before the state
 // document became durable. It cannot fail, so a successful revision can never
 // describe runtime state the resolver refused to install.
-func (s *Service) publish(d Document, prepared *preparedDocument) {
-	s.resolver.setCompiledPolicy(prepared.policy)
-	s.resolver.SetUpstreams(prepared.china, prepared.trust, prepared.ecs)
-	s.resolver.SetLocalNames(d.LocalNames)
-	s.resolver.SetGateway(prepared.gateway)
+func (s *Service) publish(prepared *preparedDocument) {
+	s.resolver.applyDocumentRuntime(prepared.policy, prepared.ups, prepared.localNames, prepared.gateway, prepared.tuning)
 }
 
 // Listen binds the configured listeners.

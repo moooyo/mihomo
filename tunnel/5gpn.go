@@ -1,12 +1,19 @@
 package tunnel
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"sort"
+	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 
-	"github.com/metacubex/mihomo/component/nat"
+	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -25,6 +32,13 @@ var clientBoundaryUpdateCallback atomic.Pointer[func()]
 
 var routingConfigEpoch atomic.Uint64
 
+var extensionEgressAddressPolicy atomic.Pointer[func(netip.Addr) bool]
+
+const (
+	extensionEgressSpecialRulesRoot   = "\x005gpn-extension-egress:"
+	extensionEgressSpecialRulesPrefix = extensionEgressSpecialRulesRoot + "v1:"
+)
+
 // Protected by configMux and refreshed with the default rule list.
 var fixedClientBoundaryIndex = -1
 var fixedClientBoundaryError = "fixed UDP/443 guard is missing or disabled"
@@ -36,6 +50,17 @@ func SetTrafficPolicy(policy C.TrafficPolicy) {
 		return
 	}
 	trafficPolicy.Store(&policy)
+}
+
+// SetExtensionEgressAddressPolicy installs the product-owned public-address
+// predicate without making the upstream tunnel package import 5gpn code.
+// Passing nil withdraws the policy and makes extension egress fail closed.
+func SetExtensionEgressAddressPolicy(policy func(netip.Addr) bool) {
+	if policy == nil {
+		extensionEgressAddressPolicy.Store(nil)
+		return
+	}
+	extensionEgressAddressPolicy.Store(&policy)
 }
 
 // SetEgressProxyUpdateCallback installs a notification for live group-set
@@ -83,26 +108,28 @@ func fixedClientBoundaryReadyLocked() bool {
 func publishEgressProxyNames(newProxies map[string]C.Proxy) {
 	names := make(map[string]struct{})
 	for name, proxy := range newProxies {
-		if proxy == nil {
-			continue
-		}
-		if name == "DIRECT" {
-			if proxy.Type() == C.Direct {
-				names[name] = struct{}{}
-			}
-			continue
-		}
-		if name == "GLOBAL" {
-			continue
-		}
-		switch proxy.Type() {
-		case C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
+		if isOperatorEgressProxy(name, proxy) {
 			names[name] = struct{}{}
 		}
 	}
 	egressProxyNames.Store(&names)
 	if callback := egressProxyUpdateCallback.Load(); callback != nil {
 		(*callback)()
+	}
+}
+
+func isOperatorEgressProxy(name string, proxy C.Proxy) bool {
+	if proxy == nil || name == "GLOBAL" {
+		return false
+	}
+	if name == "DIRECT" {
+		return proxy.Type() == C.Direct
+	}
+	switch proxy.Type() {
+	case C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -157,6 +184,35 @@ func clientRouteProxyFor(metadata *C.Metadata) (string, bool) {
 	}
 }
 
+// fixedUDP443ClientReject is the product's global HTTP/3 guard, independent of
+// extension state and of the request's SpecialRules or SpecialProxy shortcut.
+// The default rule list remains the operator-owned readiness proof; once its
+// one canonical enabled guard and REJECT adapter are live, no alternate rule
+// list or earlier MATCH may make a non-INNER client UDP/443 flow bypass it.
+func fixedUDP443ClientReject(metadata *C.Metadata) (C.Proxy, C.Rule, bool, error) {
+	if metadata == nil || metadata.Type == C.INNER || metadata.NetWork != C.UDP || metadata.DstPort != 443 {
+		return nil, nil, false, nil
+	}
+	policy := trafficPolicy.Load()
+	policyActive := policy != nil && (*policy).ClientPolicyActive()
+	configMux.RLock()
+	defer configMux.RUnlock()
+	if fixedClientBoundaryReadyLocked() {
+		return proxies["REJECT"], rules[fixedClientBoundaryIndex], true, nil
+	}
+	if !policyActive {
+		return nil, nil, false, nil
+	}
+	// Once interception policy is active, losing the fixed-boundary proof is a
+	// readiness failure. Reject with the adapter when it is still available;
+	// otherwise return an error so a SpecialProxy or alternate rule list cannot
+	// turn that failure into forwarded HTTP/3.
+	if reject, exists := proxies["REJECT"]; exists && reject != nil && reject.Type() == C.Reject {
+		return reject, nil, true, nil
+	}
+	return nil, nil, true, errors.New("fixed UDP/443 guard REJECT adapter is unavailable")
+}
+
 func clientPolicyActiveFor(metadata *C.Metadata) bool {
 	if metadata == nil || metadata.Type == C.INNER || metadata.SpecialProxy != "" {
 		return false
@@ -174,8 +230,8 @@ func clientPolicyClaims(metadata *C.Metadata) bool {
 	if intercept == nil {
 		return false
 	}
-	if metadata.NetWork == C.UDP {
-		return (*intercept).MatchUDP(metadata)
+	if metadata.NetWork != C.TCP {
+		return false
 	}
 	return (*intercept).MatchTCP(metadata)
 }
@@ -184,6 +240,9 @@ func clientPolicyClaims(metadata *C.Metadata) bool {
 // non-nil prefix with decided=false means capture may run; if it declines, the
 // caller must resolve only prefix.remainder.
 func prepareClientRouting(metadata *C.Metadata) (prefix *clientRulePrefix, proxy C.Proxy, rule C.Rule, decided bool, err error) {
+	if guardProxy, guardRule, guarded, guardErr := fixedUDP443ClientReject(metadata); guarded {
+		return nil, guardProxy, guardRule, true, guardErr
+	}
 	if !clientPolicyActiveFor(metadata) {
 		return nil, nil, nil, false, nil
 	}
@@ -235,7 +294,7 @@ type clientRulePrefix struct {
 }
 
 // resolveClientRulePrefix evaluates the operator-owned rules through the fixed
-// UDP/443 guard. Extension routing and capture are allowed only after this
+// UDP/443 guard. Extension routing and TCP capture are allowed only after this
 // exact boundary, so DIRECT cannot bypass panel, console, or anti-loop rules.
 func resolveClientRulePrefix(metadata *C.Metadata) (clientRulePrefix, error) {
 	if metadata == nil {
@@ -248,11 +307,7 @@ func resolveClientRulePrefix(metadata *C.Metadata) (clientRulePrefix, error) {
 		return clientRulePrefix{}, errors.New("extension client routing requires mihomo rule mode")
 	}
 
-	ruleList := getRules(metadata)
 	boundary, boundaryError := fixedClientBoundaryIndex, fixedClientBoundaryError
-	if metadata.SpecialRules != "" {
-		boundary, boundaryError = analyzeFixedClientBoundary(ruleList)
-	}
 	if boundaryError != "" {
 		return clientRulePrefix{}, errors.New(boundaryError)
 	}
@@ -260,15 +315,25 @@ func resolveClientRulePrefix(metadata *C.Metadata) (clientRulePrefix, error) {
 		return clientRulePrefix{}, errors.New("fixed UDP/443 guard REJECT adapter is unavailable")
 	}
 
-	result := matchRuleList(metadata, helper, ruleList[:boundary+1])
+	// The protected prefix always comes from the operator's default rule list.
+	// A selected SpecialRules list is an ordinary remainder, not another owner
+	// of the global UDP/443 readiness proof.
+	prefixRules := rules[:boundary+1]
+	remainder := rules[boundary+1:]
+	if metadata.SpecialRules != "" {
+		if selected, exists := subRules[metadata.SpecialRules]; exists {
+			remainder = selected
+		}
+	}
+	result := matchRuleList(metadata, helper, prefixRules)
 	if result.rematch != nil {
 		return clientRulePrefix{}, fmt.Errorf("fixed rule prefix selected rematch proxy %q", result.rematch.Name())
 	}
 	state := clientRulePrefix{
 		proxy: result.proxy, rule: result.rule, helper: helper, matched: result.matched,
-		remainder: append(make([]C.Rule, 0, len(ruleList)-boundary-1), ruleList[boundary+1:]...),
+		remainder: append(make([]C.Rule, 0, len(remainder)), remainder...),
 		epoch:     routingConfigEpoch.Load(),
-		guard:     ruleList[boundary],
+		guard:     rules[boundary],
 	}
 	return state, nil
 }
@@ -331,6 +396,239 @@ func clientPrefixAllowsCapture(prefix *clientRulePrefix) bool {
 	return prefix != nil && clientRulePrefixCurrent(*prefix)
 }
 
+func encodeExtensionEgressCarrier(binding string) (string, error) {
+	if binding == "" || !utf8.ValidString(binding) {
+		return "", errors.New("extension egress binding is empty or invalid UTF-8")
+	}
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(binding))
+	return extensionEgressSpecialRulesPrefix + encoded, nil
+}
+
+func extensionEgressCarrierPresent(specialRules string) bool {
+	return strings.HasPrefix(specialRules, extensionEgressSpecialRulesRoot)
+}
+
+func decodeExtensionEgressCarrier(metadata *C.Metadata) (binding string, present bool, err error) {
+	if metadata == nil || !extensionEgressCarrierPresent(metadata.SpecialRules) {
+		return "", false, nil
+	}
+	if !strings.HasPrefix(metadata.SpecialRules, extensionEgressSpecialRulesPrefix) {
+		return "", true, errors.New("reserved extension egress carrier version is unsupported")
+	}
+	if metadata.Type != C.INNER || metadata.NetWork != C.TCP || metadata.SpecialProxy != "" {
+		return "", true, errors.New("reserved extension egress carrier requires an unforced INNER TCP flow")
+	}
+	encoded := strings.TrimPrefix(metadata.SpecialRules, extensionEgressSpecialRulesPrefix)
+	decoded, decodeErr := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	if decodeErr != nil || len(decoded) == 0 || !utf8.Valid(decoded) ||
+		base64.RawURLEncoding.EncodeToString(decoded) != encoded {
+		return "", true, errors.New("reserved extension egress carrier is malformed")
+	}
+	return string(decoded), true, nil
+}
+
+func newExtensionEgressMetadata(address string, binding string) (*C.Metadata, error) {
+	carrier, err := encodeExtensionEgressCarrier(binding)
+	if err != nil {
+		return nil, err
+	}
+	metadata := &C.Metadata{
+		NetWork:      C.TCP,
+		Type:         C.INNER,
+		DNSMode:      C.DNSNormal,
+		Process:      C.MihomoName,
+		SpecialRules: carrier,
+	}
+	if err := metadata.SetRemoteAddress(address); err != nil {
+		return nil, fmt.Errorf("invalid extension egress target: %w", err)
+	}
+	if !metadata.Valid() || metadata.DstPort == 0 {
+		return nil, errors.New("invalid extension egress target address")
+	}
+	return metadata, nil
+}
+
+// DialExtensionEgress enters the normal TCP tunnel without teaching the
+// upstream-owned inner listener about 5gpn. The reserved SpecialRules value is
+// private to this package and is removed before the selected outbound sees it.
+func (t tunnel) DialExtensionEgress(address string, binding string) (net.Conn, error) {
+	metadata, err := newExtensionEgressMetadata(address, binding)
+	if err != nil {
+		return nil, err
+	}
+	conn1, conn2 := N.Pipe()
+	go t.HandleTCPConn(conn2, metadata)
+	return conn1, nil
+}
+
+// resolveExtensionEgress applies the immutable operator safety prefix before
+// treating an extension binding as the terminal egress decision. The target is
+// resolved once and pinned so neither DIRECT nor a remote proxy can resolve the
+// hostname again to a private management address after this check.
+func resolveExtensionEgress(metadata *C.Metadata, binding string) (C.Proxy, C.Rule, error) {
+	if metadata == nil || binding == "" {
+		return nil, nil, errors.New("extension egress metadata is incomplete")
+	}
+	if metadata.NetWork != C.TCP {
+		return nil, nil, errors.New("extension egress supports TCP only")
+	}
+	if metadata.Type != C.INNER || metadata.SpecialProxy != "" {
+		return nil, nil, errors.New("extension egress requires an unforced INNER flow")
+	}
+	targetAllowed, targetErr := resolveExtensionEgressTarget(metadata)
+	// Rule matching needs both the dial target and the pinned address. Keep the
+	// target as the rule identity rather than a sniffed application host, while
+	// hiding Host from the helper's live lookup. This keeps pooled preflight and
+	// the eventual inner dial on the same safety decision, including IP targets
+	// and domain targets whose resolution failed.
+	ruleMetadata := metadata.Clone()
+	ruleMetadata.SniffHost = ruleMetadata.Host
+	ruleMetadata.Host = ""
+	ruleMetadata.SpecialRules = ""
+	prefix, err := resolveClientRulePrefix(ruleMetadata)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extension egress safety prefix: %w", err)
+	}
+	if prefix.matched {
+		configMux.RLock()
+		defer configMux.RUnlock()
+		if !clientRulePrefixCurrent(prefix) {
+			return nil, nil, errors.New("mihomo routing changed after the extension egress safety decision")
+		}
+		if prefix.proxy == nil {
+			return nil, nil, errors.New("extension egress safety prefix returned no proxy")
+		}
+		// An operator REJECT is terminal even when the resolved address itself is
+		// unsafe; no connection is opened in that case.
+		if prefix.proxy.Type() == C.Reject || prefix.proxy.Type() == C.RejectDrop {
+			return prefix.proxy, prefix.rule, nil
+		}
+		if targetErr != nil {
+			return nil, nil, targetErr
+		}
+		if !targetAllowed || !extensionEgressAddressAllowed(metadata.DstIP) {
+			return nil, nil, fmt.Errorf("extension egress target %s resolved to a non-public address", metadata.RuleHost())
+		}
+		if prefix.proxy.Name() != binding || !isOperatorEgressProxy(binding, prefix.proxy) {
+			return nil, nil, fmt.Errorf("operator safety prefix selected %s instead of extension egress %s", prefix.proxy.Name(), binding)
+		}
+		return prefix.proxy, prefix.rule, nil
+	}
+	if targetErr != nil {
+		return nil, nil, targetErr
+	}
+	if !targetAllowed || !extensionEgressAddressAllowed(metadata.DstIP) {
+		return nil, nil, fmt.Errorf("extension egress target %s resolved to a non-public address", metadata.RuleHost())
+	}
+
+	configMux.RLock()
+	defer configMux.RUnlock()
+	if !clientRulePrefixCurrent(prefix) {
+		return nil, nil, errors.New("mihomo routing changed after the extension egress safety decision")
+	}
+	proxy, exists := proxies[binding]
+	if !exists || !isOperatorEgressProxy(binding, proxy) {
+		return nil, nil, fmt.Errorf("extension egress proxy %q not found", binding)
+	}
+	return proxy, nil, nil
+}
+
+func resolveCarriedExtensionEgress(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
+	binding, present, err := decodeExtensionEgressCarrier(metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !present {
+		return nil, nil, errors.New("extension egress carrier is missing")
+	}
+	return resolveExtensionEgress(metadata, binding)
+}
+
+// AuthorizeExtensionEgress applies the same final-use safety decision for an
+// HTTP request that may reuse an existing upstream connection. A newly added
+// operator REJECT therefore revokes pooled traffic without waiting for a new
+// inner dial.
+func (t tunnel) AuthorizeExtensionEgress(metadata *C.Metadata, egressProxy string) error {
+	if metadata == nil {
+		return errors.New("extension egress metadata is missing")
+	}
+	candidate := metadata.Clone()
+	candidate.SpecialRules = ""
+	proxy, _, err := resolveExtensionEgress(candidate, egressProxy)
+	if err != nil {
+		return err
+	}
+	if proxy == nil {
+		return errors.New("extension egress safety decision returned no proxy")
+	}
+	if proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
+		return fmt.Errorf("operator safety rule selected %s", proxy.Name())
+	}
+	if proxy.Name() != egressProxy {
+		return fmt.Errorf("operator safety rule selected %s instead of %s", proxy.Name(), egressProxy)
+	}
+	return nil
+}
+
+func resolveExtensionEgressTarget(metadata *C.Metadata) (bool, error) {
+	if metadata.Host == "" {
+		if !metadata.DstIP.IsValid() {
+			return false, errors.New("extension egress target has no address")
+		}
+		return extensionEgressAddressAllowed(metadata.DstIP), nil
+	}
+	if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
+		// Preserve mihomo hosts alias semantics in this dedicated path. Both
+		// pooled preflight and the eventual inner dial pass here exactly once.
+		metadata.Host = node.Domain
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+	defer cancel()
+	addresses, err := resolver.LookupIP(ctx, metadata.Host)
+	if err != nil {
+		return false, fmt.Errorf("resolve extension egress target %s: %w", metadata.Host, err)
+	}
+	selected := netip.Addr{}
+	allPublic := true
+	for _, address := range addresses {
+		if !extensionEgressAddressAllowed(address) {
+			allPublic = false
+		}
+		normalized := address.Unmap()
+		if !selected.IsValid() || (normalized.Is4() && !selected.Is4()) {
+			selected = normalized
+		}
+	}
+	if !selected.IsValid() {
+		return false, fmt.Errorf("extension egress target %s resolved to no usable address", metadata.Host)
+	}
+	metadata.DstIP = selected
+	return allPublic, nil
+}
+
+func extensionEgressAddressAllowed(address netip.Addr) bool {
+	policy := extensionEgressAddressPolicy.Load()
+	return policy != nil && (*policy)(address) && !resolver.IsFakeIP(address.Unmap())
+}
+
+func extensionEgressDialMetadata(metadata *C.Metadata) *C.Metadata {
+	_, present, err := decodeExtensionEgressCarrier(metadata)
+	if !present || err != nil {
+		return metadata
+	}
+	// Only the outbound adapter receives the pinned address. The original
+	// metadata and the HTTP transport above this connection retain the hostname
+	// used for rule matching, Host, SNI, and certificate verification.
+	pinned := metadata.Clone()
+	if pinned.DstIP.IsValid() {
+		pinned.Host = ""
+	}
+	pinned.SpecialRules = ""
+	metadata.SpecialRules = ""
+	return pinned
+}
+
 // SetInterceptor installs (or with nil, removes) the capture stage.
 //
 // An atomic pointer rather than a mutex-guarded field because the interceptor is
@@ -362,54 +660,6 @@ func captureTCPFor(metadata *C.Metadata) C.Interceptor {
 		return nil
 	}
 	return ic
-}
-
-// captureUDPFor is the datagram equivalent, used for QUIC.
-//
-// Same INNER guard and for the same reason: the engine reaches its own H3
-// upstreams by listening on a packet conn dialled back through this tunnel.
-func captureUDPFor(metadata *C.Metadata) C.Interceptor {
-	p := interceptor.Load()
-	if p == nil || metadata.Type == C.INNER {
-		return nil
-	}
-	ic := *p
-	if !ic.MatchUDP(metadata) {
-		return nil
-	}
-	return ic
-}
-
-// dialCapturedUDP completes an association the interceptor has claimed.
-//
-// It lives here rather than at the call site so the hook in tunnel.go stays
-// three lines. The bookkeeping is deliberately the same as the uncaptured path
-// below it -- the destination NAT mapping, the write-back proxy, the reader
-// pump -- because the core still owns both directions of the association. What
-// capture replaces is only where the datagrams go: the interceptor's packet
-// conn instead of an outbound's.
-//
-// There is no statistic tracker and no rule, for the same reason the TCP
-// capture has neither: this association was never routed. The engine's own
-// upstream is dialled back through the tunnel and appears in the connection
-// table there, which is the row that describes an egress choice actually made.
-func dialCapturedUDP(
-	ic C.Interceptor,
-	packet C.PacketAdapter,
-	sender C.PacketSender,
-	originMetadata *C.Metadata,
-	metadata *C.Metadata,
-	key string,
-) (C.PacketConn, C.WriteBackProxy, error) {
-	pc, err := ic.HandleUDP(metadata)
-	if err != nil {
-		return nil, nil, err
-	}
-	dialMetadata := metadata.Pure()
-	sender.AddMapping(originMetadata, dialMetadata)
-	writeBackProxy := nat.NewWriteBackProxy(packet)
-	go handleUDPToLocal(writeBackProxy, pc, sender, key, dialMetadata.AddrPort())
-	return pc, writeBackProxy, nil
 }
 
 // ResolveMetadata exposes rule evaluation to fork-owned packages.

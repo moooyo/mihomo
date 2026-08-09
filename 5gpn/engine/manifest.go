@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/metacubex/mihomo/5gpn/netguard"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,11 +35,12 @@ const (
 	manifestAPIVersion = "5gpn.io/v1"
 	manifestKind       = "Extension"
 	manifestUserAgent  = "5gpn-extension-fetch/1"
+	guardedDialLimit   = 16
+	guardedDialDelay   = 250 * time.Millisecond
 )
 
 const (
 	maxManifestBytes    = 2 << 20
-	maxScriptBytes      = 2 << 20
 	maxScriptTotalBytes = 8 << 20
 	maxResourceURLBytes = 4096
 	maxManifestSettings = 64
@@ -934,7 +938,7 @@ func resolveResourceURL(manifestURL, resource string) (string, error) {
 }
 
 // guardedDialer resolves through the injected resolver and refuses any address
-// that is not public unicast.
+// that is not an ordinary, publicly routable unicast destination.
 //
 // Resolving here rather than letting the transport do it is what makes the
 // check mean anything: a guard applied to a name the dialer then resolves again
@@ -946,7 +950,7 @@ func guardedDialer(resolve Resolver) func(context.Context, string, string) (net.
 			return nil, err
 		}
 		candidates := []string{host}
-		if net.ParseIP(host) == nil {
+		if _, parseErr := netip.ParseAddr(host); parseErr != nil {
 			if resolve == nil {
 				return nil, errors.New("5gpn/engine: no resolver for extension fetches")
 			}
@@ -954,44 +958,119 @@ func guardedDialer(resolve Resolver) func(context.Context, string, string) (net.
 				return nil, fmt.Errorf("resolve %s: %w", host, err)
 			}
 		}
+		addresses := make([]netip.Addr, 0, min(len(candidates), guardedDialLimit))
 		var lastErr error
 		for _, candidate := range candidates {
-			ip := net.ParseIP(candidate)
-			if ip == nil {
+			ip, parseErr := netip.ParseAddr(candidate)
+			if parseErr != nil {
+				lastErr = parseErr
 				continue
 			}
 			if !publicUnicast(ip) {
 				lastErr = fmt.Errorf("refusing to dial %s for %s", ip, host)
 				continue
 			}
-			conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-			if err == nil {
-				return conn, nil
+			if len(addresses) < guardedDialLimit {
+				addresses = append(addresses, ip)
 			}
-			lastErr = err
 		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no usable address for %s", host)
+		if len(addresses) == 0 {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("no usable address for %s", host)
+			}
+			return nil, lastErr
 		}
-		return nil, lastErr
+		conn, err := dialGuardedCandidates(ctx, network, port, addresses, guardedDialDelay, func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, address)
+		})
+		if err != nil && lastErr != nil {
+			return nil, errors.Join(lastErr, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
 	}
 }
 
-func publicUnicast(ip net.IP) bool {
-	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
-		ip.IsPrivate() {
-		return false
+type guardedDialResult struct {
+	conn net.Conn
+	err  error
+}
+
+func dialGuardedCandidates(
+	ctx context.Context,
+	network string,
+	port string,
+	addresses []netip.Addr,
+	delay time.Duration,
+	dial func(context.Context, string, string) (net.Conn, error),
+) (net.Conn, error) {
+	if len(addresses) == 0 {
+		return nil, errors.New("no guarded dial candidates")
 	}
-	if v4 := ip.To4(); v4 != nil {
-		// 100.64.0.0/10 behaves like private space on a hosted gateway, and the
-		// reserved top of the range is not routable.
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-			return false
-		}
-		if v4[0] == 0 || v4[0] == 127 || v4[0] >= 240 {
-			return false
+	racingCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan guardedDialResult)
+	next := 0
+	active := 0
+	launch := func() {
+		address := net.JoinHostPort(addresses[next].String(), port)
+		next++
+		active++
+		go func() {
+			conn, err := dial(racingCtx, network, address)
+			select {
+			case results <- guardedDialResult{conn: conn, err: err}:
+			case <-racingCtx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+	launch()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	var lastErr error
+	for active > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-results:
+			active--
+			if result.err == nil && result.conn != nil {
+				cancel()
+				return result.conn, nil
+			}
+			if result.err != nil {
+				lastErr = result.err
+			}
+			if next < len(addresses) {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				launch()
+				timer.Reset(delay)
+			}
+		case <-timer.C:
+			if next < len(addresses) {
+				launch()
+			}
+			if next < len(addresses) {
+				timer.Reset(delay)
+			}
 		}
 	}
-	return true
+	if lastErr == nil {
+		lastErr = errors.New("all guarded dial candidates failed")
+	}
+	return nil, lastErr
+}
+
+func publicUnicast(address netip.Addr) bool {
+	return netguard.IsPubliclyRoutable(address)
 }

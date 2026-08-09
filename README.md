@@ -42,10 +42,25 @@ Configuration example is located at [/docs/config.yaml](https://github.com/MetaC
 
 Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 
+## 5gpn production boundary
+
+This fork publishes production binaries only for Linux and Windows. Extension
+JavaScript, GoJQ, and DOM work runs in a mandatory one-shot child process;
+startup fails when that hard-isolation boundary cannot be established.
+
+Linux deployment requires kernel 5.7 or newer, a pure cgroup-v2 hierarchy with
+the memory and pids controllers, and the 5gpn-managed systemd 257 or newer unit.
+The installer consumes the `linux-amd64-compatible` artifact. Windows uses
+nested Job Objects. Darwin, FreeBSD, and Android are not production targets;
+macOS CI is only a test harness for the private worker protocol.
+
+Standalone Linux packages and container images are not published because they
+do not provide the required systemd and delegated-cgroup boundary.
+
 ## For development
 
 Requirements:
-[Go 1.20 or newer](https://go.dev/dl/)
+[Go 1.25 or newer](https://go.dev/dl/)
 
 Build mihomo:
 

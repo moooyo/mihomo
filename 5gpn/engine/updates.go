@@ -54,9 +54,9 @@ func SnapshotDigest(m Module) string {
 		Settings     []settingShape `json:"settings"`
 	}{
 		Source:       m.Source.Digest,
-		CaptureHosts: m.CaptureHosts,
-		Mappings:     m.HostMappings,
-		Routing:      m.RoutingRules,
+		CaptureHosts: append([]string{}, m.CaptureHosts...),
+		Mappings:     append([]HostMapping{}, m.HostMappings...),
+		Routing:      append(RoutingRules{}, m.RoutingRules...),
 		Storage:      m.PersistentStorage,
 		Network:      m.Network,
 		EgressReq:    m.EgressGroupRequired,

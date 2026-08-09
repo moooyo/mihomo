@@ -4,7 +4,6 @@ import (
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
-	"github.com/metacubex/mihomo/log"
 )
 
 type Option func(*config.Config)
@@ -56,34 +55,10 @@ func ApplyConfig(cfg *config.Config) error {
 	if err := startFiveGPN(); err != nil {
 		return err
 	}
-	applyRoute(cfg)
-	executor.ApplyConfig(cfg, true)
-	return nil
-}
-
-func applyRoute(cfg *config.Config) {
-	if cfg.Controller.ExternalUI != "" {
-		route.SetUIPath(cfg.Controller.ExternalUI)
+	if err := route.ApplyConfig(cfg, true); err != nil {
+		return err
 	}
-	route.ReCreateServer(&route.Config{
-		Addr:           cfg.Controller.ExternalController,
-		TLSAddr:        cfg.Controller.ExternalControllerTLS,
-		UnixAddr:       cfg.Controller.ExternalControllerUnix,
-		PipeAddr:       cfg.Controller.ExternalControllerPipe,
-		RoutingMark:    cfg.Controller.ExternalControllerRoutingMark,
-		Secret:         cfg.Controller.Secret,
-		Certificate:    cfg.TLS.Certificate,
-		PrivateKey:     cfg.TLS.PrivateKey,
-		ClientAuthType: cfg.TLS.ClientAuthType,
-		ClientAuthCert: cfg.TLS.ClientAuthCert,
-		EchKey:         cfg.TLS.EchKey,
-		DohServer:      cfg.Controller.ExternalDohServer,
-		IsDebug:        cfg.General.LogLevel == log.DEBUG,
-		Cors: route.Cors{
-			AllowOrigins:        cfg.Controller.Cors.AllowOrigins,
-			AllowPrivateNetwork: cfg.Controller.Cors.AllowPrivateNetwork,
-		},
-	})
+	return nil
 }
 
 // Parse call at the beginning of mihomo

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"testing"
-	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 )
@@ -31,40 +30,67 @@ func (p *dialTestPolicy) SelectEgress(metadata *C.Metadata, owner string, ownerO
 	return p.group, p.err
 }
 
-type dialTestPacketConn struct{}
-
-func (*dialTestPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
-func (*dialTestPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return len(p), nil
+type dialTestTunnel struct {
+	metadata     *C.Metadata
+	binding      string
+	authorizeErr error
+	dialAddress  string
+	dialBinding  string
+	dialCalls    int
+	dialErr      error
 }
-func (*dialTestPacketConn) Close() error                     { return nil }
-func (*dialTestPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
-func (*dialTestPacketConn) SetDeadline(time.Time) error      { return nil }
-func (*dialTestPacketConn) SetReadDeadline(time.Time) error  { return nil }
-func (*dialTestPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
-func TestTransformedTCPPassesSelectedSpecialProxy(t *testing.T) {
+func (*dialTestTunnel) HandleTCPConn(net.Conn, *C.Metadata)      {}
+func (*dialTestTunnel) HandleUDPPacket(C.UDPPacket, *C.Metadata) {}
+func (*dialTestTunnel) NatTable() C.NatTable                     { return nil }
+
+func (t *dialTestTunnel) AuthorizeExtensionEgress(metadata *C.Metadata, binding string) error {
+	t.metadata = metadata.Clone()
+	t.binding = binding
+	return t.authorizeErr
+}
+
+func (t *dialTestTunnel) DialExtensionEgress(address string, binding string) (net.Conn, error) {
+	t.dialCalls++
+	t.dialAddress = address
+	t.dialBinding = binding
+	if t.dialErr != nil {
+		return nil, t.dialErr
+	}
+	client, server := net.Pipe()
+	_ = server.Close()
+	return client, nil
+}
+
+func TestAuthorizeRunsFinalTunnelSafetyForPooledConnections(t *testing.T) {
 	policy := &dialTestPolicy{group: "GroupA"}
 	state := &trafficAuthorization{policy: policy, proxyExists: func(name string) bool { return name == "GroupA" }}
-	handled := 0
-	var address, proxy string
+	tunnel := &dialTestTunnel{}
+	proxy, err := authorizeWithTunnel(tunnel, state, C.TCP, "origin.example.com", 443, "extension.a", true)
+	if err != nil || proxy != "GroupA" || tunnel.binding != "GroupA" || tunnel.metadata == nil || tunnel.metadata.Host != "origin.example.com" {
+		t.Fatalf("authorize = proxy:%q binding:%q metadata:%+v err:%v", proxy, tunnel.binding, tunnel.metadata, err)
+	}
+
+	tunnel.authorizeErr = errors.New("operator REJECT")
+	if proxy, err = authorizeWithTunnel(tunnel, state, C.TCP, "origin.example.com", 443, "extension.a", true); err == nil || proxy != "" {
+		t.Fatalf("rejected pooled authorize = proxy:%q err:%v", proxy, err)
+	}
+}
+
+func TestTransformedTCPPassesSelectedEgressBinding(t *testing.T) {
+	policy := &dialTestPolicy{group: "GroupA"}
+	state := &trafficAuthorization{policy: policy, proxyExists: func(name string) bool { return name == "GroupA" }}
+	tunnel := &dialTestTunnel{}
 	conn, err := tcpWithAuthorization(
-		context.Background(), nil, state,
-		func(_ C.Tunnel, gotAddress, gotProxy string) (net.Conn, error) {
-			handled++
-			address, proxy = gotAddress, gotProxy
-			client, server := net.Pipe()
-			_ = server.Close()
-			return client, nil
-		},
+		context.Background(), tunnel, state,
 		"origin.example.com", 443, "extension.a", true,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if handled != 1 || address != "origin.example.com:443" || proxy != "GroupA" {
-		t.Fatalf("TCP handler calls=%d address=%q proxy=%q", handled, address, proxy)
+	if tunnel.dialCalls != 1 || tunnel.dialAddress != "origin.example.com:443" || tunnel.dialBinding != "GroupA" {
+		t.Fatalf("TCP dial calls=%d address=%q binding=%q", tunnel.dialCalls, tunnel.dialAddress, tunnel.dialBinding)
 	}
 	if len(policy.metadata) != 1 || policy.metadata[0].Type != C.INNER || policy.metadata[0].NetWork != C.TCP {
 		t.Fatalf("TCP authorization metadata = %+v", policy.metadata)
@@ -74,92 +100,41 @@ func TestTransformedTCPPassesSelectedSpecialProxy(t *testing.T) {
 	}
 }
 
-func TestTransformedUDPPassesSelectedSpecialProxy(t *testing.T) {
-	policy := &dialTestPolicy{group: "GroupA"}
-	state := &trafficAuthorization{policy: policy, proxyExists: func(name string) bool { return name == "GroupA" }}
-	handled := 0
-	var network, address, proxy string
-	packetConn, err := udpWithAuthorization(
-		context.Background(), nil, state,
-		func(_ C.Tunnel, gotNetwork, gotAddress, gotProxy string) (net.PacketConn, net.Addr, error) {
-			handled++
-			network, address, proxy = gotNetwork, gotAddress, gotProxy
-			return &dialTestPacketConn{}, &net.UDPAddr{}, nil
-		},
-		"origin.example.com", 443, "extension.a", true,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer packetConn.Close()
-	if handled != 1 || network != "udp" || address != "origin.example.com:443" || proxy != "GroupA" {
-		t.Fatalf("UDP handler calls=%d network=%q address=%q proxy=%q", handled, network, address, proxy)
-	}
-	if len(policy.metadata) != 1 || policy.metadata[0].Type != C.INNER || policy.metadata[0].NetWork != C.UDP {
-		t.Fatalf("UDP authorization metadata = %+v", policy.metadata)
-	}
-}
-
-func TestTransformedDialFailsBeforeHandlerWhenGroupIsMissing(t *testing.T) {
+func TestTransformedTCPFailsBeforeHandlerWhenGroupIsMissing(t *testing.T) {
 	policy := &dialTestPolicy{group: "RemovedGroup"}
 	state := &trafficAuthorization{policy: policy, proxyExists: func(string) bool { return false }}
-	tcpCalls := 0
+	tunnel := &dialTestTunnel{}
 	_, err := tcpWithAuthorization(
-		context.Background(), nil, state,
-		func(C.Tunnel, string, string) (net.Conn, error) {
-			tcpCalls++
-			return nil, nil
-		},
+		context.Background(), tunnel, state,
 		"origin.example.com", 443, "extension.a", false,
 	)
-	if err == nil || tcpCalls != 0 {
-		t.Fatalf("missing group TCP err=%v handler calls=%d", err, tcpCalls)
-	}
-
-	udpCalls := 0
-	_, err = udpWithAuthorization(
-		context.Background(), nil, state,
-		func(C.Tunnel, string, string, string) (net.PacketConn, net.Addr, error) {
-			udpCalls++
-			return nil, nil, nil
-		},
-		"origin.example.com", 443, "extension.a", false,
-	)
-	if err == nil || udpCalls != 0 {
-		t.Fatalf("missing group UDP err=%v handler calls=%d", err, udpCalls)
+	if err == nil || tunnel.dialCalls != 0 {
+		t.Fatalf("missing group TCP err=%v dial calls=%d", err, tunnel.dialCalls)
 	}
 }
 
 func TestTransformedDialRejectsAnEmptyPolicyBinding(t *testing.T) {
 	policy := &dialTestPolicy{group: ""}
 	state := &trafficAuthorization{policy: policy, proxyExists: func(string) bool { return true }}
-	handled := 0
+	tunnel := &dialTestTunnel{}
 	_, err := tcpWithAuthorization(
-		context.Background(), nil, state,
-		func(C.Tunnel, string, string) (net.Conn, error) {
-			handled++
-			return nil, nil
-		},
+		context.Background(), tunnel, state,
 		"origin.example.com", 443, "extension.a", false,
 	)
-	if err == nil || handled != 0 {
-		t.Fatalf("empty binding err=%v handler calls=%d, want fail before handler", err, handled)
+	if err == nil || tunnel.dialCalls != 0 {
+		t.Fatalf("empty binding err=%v dial calls=%d, want fail before dial", err, tunnel.dialCalls)
 	}
 }
 
 func TestTransformedDialFailsBeforeHandlerWhenBindingIsUnauthorized(t *testing.T) {
 	policy := &dialTestPolicy{err: errors.New("required binding missing")}
 	state := &trafficAuthorization{policy: policy, proxyExists: func(string) bool { return true }}
-	calls := 0
+	tunnel := &dialTestTunnel{}
 	_, err := tcpWithAuthorization(
-		context.Background(), nil, state,
-		func(C.Tunnel, string, string) (net.Conn, error) {
-			calls++
-			return nil, nil
-		},
+		context.Background(), tunnel, state,
 		"origin.example.com", 443, "extension.a", true,
 	)
-	if err == nil || calls != 0 {
-		t.Fatalf("unauthorized binding err=%v handler calls=%d", err, calls)
+	if err == nil || tunnel.dialCalls != 0 {
+		t.Fatalf("unauthorized binding err=%v dial calls=%d", err, tunnel.dialCalls)
 	}
 }

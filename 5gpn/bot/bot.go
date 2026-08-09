@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/5gpn/state"
-	"github.com/metacubex/mihomo/log"
 )
 
 // documentVersion is the exact bot.json schema this build accepts.
@@ -146,11 +145,20 @@ type Service struct {
 	facts Facts
 	dial  Dialer
 
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	running   bool
-	state     string
-	lastError string
+	// lifecycleMu joins a durable document transition to the poll-loop
+	// transition that enacts it. state.Doc serialises the writes themselves,
+	// but without this second boundary two successful writers can return from
+	// persistence in order and call Apply in the opposite order, reviving an
+	// older token and admin set after the newer document is already current.
+	lifecycleMu sync.Mutex
+	loop        func(context.Context, Document, uint64)
+
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	running    bool
+	state      string
+	lastError  string
+	generation uint64
 	// stopped is closed by the run loop when it exits, so Apply can wait for
 	// the previous generation to be gone before starting the next. Two loops
 	// long-polling one token make Telegram hand each update to whichever asked
@@ -165,6 +173,7 @@ func Open(path string, facts Facts, dial Dialer) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{doc: doc, facts: facts, dial: dial, state: "stopped"}
+	s.loop = s.run
 	if err := s.validate(doc.Get().Value); err != nil {
 		return nil, fmt.Errorf("5gpn/bot: %s is unusable: %w", path, err)
 	}
@@ -179,7 +188,22 @@ func (s *Service) Document() (Document, string) {
 
 // View renders the document without its token, plus what the loop is doing.
 func (s *Service) View() View {
-	doc, _ := s.Document()
+	view, _ := s.Snapshot()
+	return view
+}
+
+// Snapshot returns one document projection and the revision that names that
+// exact document. Callers must not compose View and Document themselves: a
+// successful concurrent update could otherwise pair the old projection with
+// the new revision (or the reverse).
+func (s *Service) Snapshot() (View, string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	snapshot := s.doc.Get()
+	return s.viewOf(snapshot.Value), snapshot.Revision
+}
+
+func (s *Service) viewOf(doc Document) View {
 	s.mu.Lock()
 	runState, lastErr := s.state, s.lastError
 	s.mu.Unlock()
@@ -203,6 +227,9 @@ const ClearToken = "-"
 // Update applies an operator write. token == "" keeps the stored token,
 // token == ClearToken removes it.
 func (s *Service) Update(revision string, next Document, token string) (View, string, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	next.Version = documentVersion
 	updated, err := s.doc.Update(revision, func(current Document) (Document, error) {
 		switch strings.TrimSpace(token) {
@@ -220,10 +247,10 @@ func (s *Service) Update(revision string, next Document, token string) (View, st
 		return next, nil
 	})
 	if err != nil {
-		return s.View(), updated.Revision, err
+		return s.viewOf(updated.Value), updated.Revision, err
 	}
-	s.Apply()
-	return s.View(), updated.Revision, nil
+	s.applyLocked(updated.Value)
+	return s.viewOf(updated.Value), updated.Revision, nil
 }
 
 func (s *Service) validate(doc Document) error {
@@ -270,62 +297,88 @@ func normaliseAdmins(ids []int64) []int64 {
 // generation down first and waits for it, because two loops long-polling one
 // token make Telegram hand each update to whichever asked first.
 func (s *Service) Apply() {
-	doc, _ := s.Document()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.applyLocked(s.doc.Get().Value)
+}
 
-	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	previous := s.stopped
-	s.stopped = nil
-	s.running = false
-	s.mu.Unlock()
-
-	if previous != nil {
-		select {
-		case <-previous:
-		case <-time.After(pollTimeout + 5*time.Second):
-			log.Warnln("[5GPN/BOT] the previous poll loop did not stop in time")
-		}
-	}
-
+func (s *Service) applyLocked(doc Document) {
+	s.stopLocked()
+	s.setStateCurrent("stopped", "")
 	if !doc.Enabled || strings.TrimSpace(doc.Token) == "" {
-		s.setState("stopped", "")
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	s.mu.Lock()
+	generation := s.generation
 	s.cancel, s.stopped, s.running = cancel, stopped, true
 	s.mu.Unlock()
 
 	go func() {
-		defer close(stopped)
-		s.run(ctx, doc)
+		defer func() {
+			close(stopped)
+			s.finishGeneration(generation, stopped)
+		}()
+		s.loop(ctx, doc, generation)
 	}()
 }
 
 // Shutdown stops the loop.
 func (s *Service) Shutdown() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.stopLocked()
+	s.setStateCurrent("stopped", "")
+}
+
+// stopLocked invalidates the current generation before cancelling it, then
+// waits without a timeout. Starting another Telegram long poll while the old
+// one may still be alive would leak updates to an obsolete admin set. Every
+// network operation in the client is context-bound, so failure to stop is an
+// invariant failure worth blocking the transition rather than violating the
+// authorization boundary.
+func (s *Service) stopLocked() {
 	s.mu.Lock()
+	s.generation++
 	cancel, stopped := s.cancel, s.stopped
-	s.cancel, s.stopped, s.running = nil, nil, false
+	s.cancel = nil
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(pollTimeout + 5*time.Second):
-		}
+		<-stopped
 	}
-	s.setState("stopped", "")
+	s.mu.Lock()
+	if s.stopped == stopped {
+		s.stopped = nil
+		s.running = false
+	}
+	s.mu.Unlock()
 }
 
-func (s *Service) setState(runState, lastError string) {
+func (s *Service) finishGeneration(generation uint64, stopped chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation != generation || s.stopped != stopped {
+		return
+	}
+	s.cancel = nil
+	s.stopped = nil
+	s.running = false
+}
+
+func (s *Service) setState(generation uint64, runState, lastError string) {
+	s.mu.Lock()
+	if s.generation == generation {
+		s.state, s.lastError = runState, lastError
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) setStateCurrent(runState, lastError string) {
 	s.mu.Lock()
 	s.state, s.lastError = runState, lastError
 	s.mu.Unlock()

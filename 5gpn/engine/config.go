@@ -2,16 +2,16 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net"
+	"net/netip"
 	"net/url"
-	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -23,10 +23,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/metacubex/mihomo/5gpn/netguard"
 	"github.com/metacubex/mihomo/5gpn/state"
-
-	"github.com/dop251/goja"
-	"github.com/itchyny/gojq"
 )
 
 const configVersion = 6
@@ -51,12 +49,10 @@ type Config struct {
 	TLSKey         string       `json:"tls_key"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
-	// Catalogs are the operator's, but a document written before they existed
-	// has no key at all -- and without this every already-installed gateway
-	// would get extension discovery shipped dark. An absent key seeds the
-	// default; an explicitly empty list does not, which is why the field is not
-	// omitempty: `[]` has to survive a round trip as a decision the operator
-	// made, distinct from never having had one.
+	// Catalogs are exclusively operator-selected. The field is not omitempty so
+	// a fresh or explicitly emptied document round-trips as `[]`, never `null`.
+	// An absent key is normalized to the same empty list and does not authorize
+	// an implicit marketplace fetch.
 	Catalogs []CatalogSource `json:"catalogs"`
 	runtime  *compiledScriptConfig
 	// generation is assigned by configStore and advances only when validated
@@ -155,23 +151,10 @@ type ScriptRule struct {
 	ReplaceBody  *BodyReplace `json:"replace_body,omitempty"`
 	TimeoutMS    int          `json:"timeout_ms"`
 	MaxBodyBytes int64        `json:"max_body_bytes"`
-	// program, jq and settings belong to the immutable compiled config snapshot.
-	//
-	// jq is here rather than in a runtime-side cache for the reason program is:
-	// an artifact compiled from this rule must die with the generation that
-	// carries it. A process-lifetime cache keyed on the rule's identity cannot
-	// see a bundle that changes the expression, and a jq action's ScriptDigest
-	// is always empty, so such a cache served the first expression it ever
-	// compiled for a given (extension, action) until the process restarted.
-	program  *goja.Program
-	jq       *gojq.Code
+	// Decoded settings are safe parent-owned data. Guest code is deliberately
+	// not compiled into this snapshot: JavaScript and jq validation and
+	// execution happen only in a memory-limited one-shot worker.
 	settings map[string]any
-}
-
-type scriptProgramKey struct {
-	moduleID string
-	actionID string
-	digest   string
 }
 
 type LocationValue struct {
@@ -373,114 +356,28 @@ func loadConfig(path string) (Config, error) {
 }
 
 func readConfigDocument(path string) ([]byte, error) {
-	body, _, err := readConfigDocumentWithInfo(path)
-	return body, err
-}
-
-func readConfigDocumentWithInfo(path string) ([]byte, os.FileInfo, error) {
-	body, info, err := readConfigBoundedWithOpenInfo(path, os.Open)
+	body, err := state.ReadPrivateFile(path, maxConfigBytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return body, info, nil
-}
-
-// retiredDocumentFields are keys this build no longer understands but that a
-// document written by an earlier one still carries. Each is dropped before the
-// strict decode and never written again.
-//
-// This is a migration, not compatibility. The field is discarded rather than
-// mapped, the document is rewritten without it on the next write, and nothing
-// downstream can read it. What it buys is that an upgrade does not turn the
-// operator's installed extensions into a document the engine refuses to open --
-// which is what a rename does to every deployed gateway at once, silently,
-// because "interception engine not installed" is a warning and the gateway
-// still resolves and forwards.
-//
-// The strictness itself stays. DisallowUnknownFields is what stops a typo in a
-// hand-edited document from being ignored, and a *typo* is exactly what it
-// should refuse. A key this program itself retired is not a typo.
-var retiredDocumentFields = [][]string{
-	// Replaced by mitm.http3 when datagram capture was wired. It was stored,
-	// surfaced in the API and the snapshot, and read by nothing.
-	{"mitm", "quic_fallback_protection"},
-}
-
-// dropRetiredFields removes retired keys from a document's bytes.
-//
-// It re-marshals only when something was actually removed, so an ordinary
-// document is passed through byte for byte and its revision is unchanged.
-func dropRetiredFields(body []byte) ([]byte, error) {
-	touched := false
-	for _, path := range retiredDocumentFields {
-		if bytes.Contains(body, []byte(`"`+path[len(path)-1]+`"`)) {
-			touched = true
-			break
-		}
-	}
-	if !touched {
-		return body, nil
-	}
-
-	var document map[string]any
-	if err := json.Unmarshal(body, &document); err != nil {
-		// Leave it to the strict decode below to produce the real message.
-		return body, nil
-	}
-	removed := false
-	for _, path := range retiredDocumentFields {
-		node := document
-		for _, key := range path[:len(path)-1] {
-			child, ok := node[key].(map[string]any)
-			if !ok {
-				node = nil
-				break
-			}
-			node = child
-		}
-		if node == nil {
-			continue
-		}
-		if _, present := node[path[len(path)-1]]; present {
-			delete(node, path[len(path)-1])
-			removed = true
-		}
-	}
-	if !removed {
-		return body, nil
-	}
-	rewritten, err := json.Marshal(document)
-	if err != nil {
-		return nil, fmt.Errorf("drop retired fields: %w", err)
-	}
-	return rewritten, nil
+	return body, nil
 }
 
 func decodeConfig(body []byte) (Config, error) {
-	if err := rejectDuplicateJSONKeys(body); err != nil {
+	if err := state.ValidateJSONBytes(body, maxConfigBytes); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
-	body, err := dropRetiredFields(body)
-	if err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
 	var cfg Config
-	if err := decoder.Decode(&cfg); err != nil {
+	if err := state.DecodeJSONBytes(body, maxConfigBytes, &cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return Config{}, err
 	}
 	if cfg.Catalogs == nil {
 		cfg.Catalogs = defaultCatalogSources()
 	}
-	programs := make(map[scriptProgramKey]*goja.Program)
-	if err := cfg.validate(programs); err != nil {
+	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
-	runtime, err := compileScriptConfigWithPrograms(cfg, programs)
+	runtime, err := compileScriptConfig(cfg)
 	if err != nil {
 		return Config{}, fmt.Errorf("compile config runtime: %w", err)
 	}
@@ -493,16 +390,8 @@ func loadCertificateConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if err := rejectDuplicateJSONKeys(body); err != nil {
-		return Config{}, err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
 	var cfg Config
-	if err := decoder.Decode(&cfg); err != nil {
-		return Config{}, err
-	}
-	if err := requireJSONEOF(decoder); err != nil {
+	if err := state.DecodeJSONBytes(body, maxConfigBytes, &cfg); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.ValidateCertificateRequest(); err != nil {
@@ -512,128 +401,14 @@ func loadCertificateConfig(path string) (Config, error) {
 }
 
 func readConfigBounded(path string) ([]byte, error) {
-	return readConfigBoundedWithOpen(path, os.Open)
-}
-
-func readConfigBoundedWithOpen(path string, openFile func(string) (*os.File, error)) ([]byte, error) {
-	body, _, err := readConfigBoundedWithOpenInfo(path, openFile)
-	return body, err
-}
-
-func readConfigBoundedWithOpenInfo(path string, openFile func(string) (*os.File, error)) ([]byte, os.FileInfo, error) {
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !pathInfo.Mode().IsRegular() {
-		return nil, nil, errors.New("config path is not a regular file")
-	}
-	// Windows resolves the file ID stored in FileInfo lazily. Comparing the
-	// pre-open value with itself pins that identity before the path can change.
-	if !os.SameFile(pathInfo, pathInfo) {
-		return nil, nil, errors.New("could not establish config file identity")
-	}
-	file, err := openFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer file.Close()
-	openedInfo, err := file.Stat()
-	if err != nil {
-		return nil, nil, err
-	}
-	if !openedInfo.Mode().IsRegular() {
-		return nil, nil, errors.New("opened config is not a regular file")
-	}
-	if !os.SameFile(pathInfo, openedInfo) {
-		return nil, nil, errors.New("config path changed while opening")
-	}
-	body, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(body) > maxConfigBytes {
-		return nil, nil, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
-	}
-	return body, openedInfo, nil
-}
-
-func rejectDuplicateJSONKeys(body []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := scanJSONValue(decoder); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("config contains multiple JSON values")
-		}
-		return err
-	}
-	return nil
-}
-
-func scanJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delim {
-	case '{':
-		keys := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return errors.New("object key is not a string")
-			}
-			canonicalKey := strings.ToLower(key)
-			if _, duplicate := keys[canonicalKey]; duplicate {
-				return fmt.Errorf("duplicate JSON key %q", key)
-			}
-			keys[canonicalKey] = struct{}{}
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
-	case '[':
-		for decoder.More() {
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delim)
-	}
-}
-
-func requireJSONEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("config contains multiple JSON values")
-		}
-		return fmt.Errorf("decode trailing config data: %w", err)
-	}
-	return nil
+	return state.ReadPrivateFile(path, maxConfigBytes)
 }
 
 func (c Config) Validate() error {
-	return c.validate(nil)
+	return c.validate()
 }
 
-func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
+func (c Config) validate() error {
 	if c.Version != configVersion {
 		return fmt.Errorf("config version must be %d", configVersion)
 	}
@@ -643,7 +418,7 @@ func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 	if strings.TrimSpace(c.TLSCert) == "" || strings.TrimSpace(c.TLSKey) == "" {
 		return errors.New("tls_cert and tls_key are required")
 	}
-	if err := validateModulesWithPrograms(c.Modules, programs); err != nil {
+	if err := validateModules(c.Modules); err != nil {
 		return err
 	}
 	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
@@ -966,10 +741,6 @@ func hostCoveredBy(patterns []string, candidate string) bool {
 }
 
 func validateModules(modules []Module) error {
-	return validateModulesWithPrograms(modules, nil)
-}
-
-func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey]*goja.Program) error {
 	if len(modules) > 64 {
 		return errors.New("at most 64 interception extensions are allowed")
 	}
@@ -1124,27 +895,13 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 				if rule.BodyMode != "text" {
 					return fmt.Errorf("extension %q action %q jq program requires a text body", module.ID, rule.ID)
 				}
-				if _, err := compileJQProgram(rule.JQProgram); err != nil {
-					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
+				if len(rule.JQProgram) > maxJQProgramBytes {
+					return fmt.Errorf("extension %q action %q jq program exceeds %d bytes", module.ID, rule.ID, maxJQProgramBytes)
 				}
 				continue
 			}
-			if len(rule.ScriptBody) == 0 || len(rule.ScriptBody) > 1<<20 || rule.ScriptDigest != digestText(rule.ScriptBody) {
+			if len(rule.ScriptBody) == 0 || len(rule.ScriptBody) > maxScriptBytes || rule.ScriptDigest != digestText(rule.ScriptBody) {
 				return fmt.Errorf("extension %q action %q script snapshot is invalid", module.ID, rule.ID)
-			}
-			// Before goja sees it: the parser's recursion is bounded by the
-			// goroutine stack, and exceeding that is a fatal runtime throw rather
-			// than an error this function could return.
-			if err := checkScriptNesting(rule.ScriptBody); err != nil {
-				return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
-			}
-			filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
-			program, err := goja.Compile(filename, rule.ScriptBody, false)
-			if err != nil {
-				return fmt.Errorf("extension %q action %q script does not compile: %w", module.ID, rule.ID, err)
-			}
-			if programs != nil {
-				programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}] = program
 			}
 			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
 				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
@@ -1467,15 +1224,7 @@ func validateSettingValue(setting ModuleSetting, raw json.RawMessage, complete b
 }
 
 func unmarshalStrictRaw(raw []byte, target any) error {
-	if err := rejectDuplicateJSONKeys(raw); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	return requireJSONEOF(decoder)
+	return state.DecodeJSONBytes(raw, maxConfigBytes, target)
 }
 
 func settingReady(setting ModuleSetting) bool {
@@ -1552,8 +1301,8 @@ func validHostTarget(value string) bool {
 		return validHostTargetServers(rest)
 	}
 	value = canonicalHost(value)
-	if ip := net.ParseIP(value); ip != nil {
-		return ip.To4() != nil && hostTargetAddressAllowed(ip)
+	if ip, err := netip.ParseAddr(value); err == nil {
+		return ip.Is4() && hostTargetAddressAllowed(ip)
 	}
 	return !strings.HasPrefix(value, "*.") && value != "localhost" && !strings.HasSuffix(value, ".local") && validHostPattern(value)
 }
@@ -1603,8 +1352,8 @@ func validHostTargetServers(rest string) bool {
 		if !ok {
 			return false
 		}
-		ip := net.ParseIP(dial)
-		if ip == nil || ip.To4() == nil || !hostTargetAddressAllowed(ip) {
+		ip, err := netip.ParseAddr(dial)
+		if err != nil || !ip.Is4() || !hostTargetAddressAllowed(ip) {
 			return false
 		}
 	}
@@ -1634,18 +1383,10 @@ func hostTargetServerDialAddress(spec string) (string, bool) {
 	return dial, true
 }
 
-// hostTargetAddressAllowed refuses every address the gateway must never be
-// pointed at. Carrier-grade NAT is refused alongside the private ranges:
-// IsGlobalUnicast reports true for 100.64/10, but it is neither globally
-// routable nor the operator's own network.
-func hostTargetAddressAllowed(ip net.IP) bool {
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-		return false
-	}
-	if four := ip.To4(); four != nil && four[0] == 100 && four[1]&0xc0 == 64 {
-		return false
-	}
-	return true
+// hostTargetAddressAllowed shares the same audited address-scope boundary as
+// importer fetches and live extension egress.
+func hostTargetAddressAllowed(ip netip.Addr) bool {
+	return netguard.IsPubliclyRoutable(ip)
 }
 
 func validModuleID(id string) bool {
@@ -1734,7 +1475,8 @@ func certificateDigest(cfg Config) string {
 // underneath me -- and in one address space nobody else can. What is left is a
 // pointer to load and a mutex to write under.
 type configStore struct {
-	path string
+	path    string
+	workers *workerController
 
 	mu         sync.Mutex
 	committed  atomic.Pointer[CommittedConfigView]
@@ -1755,12 +1497,8 @@ type CommittedConfigView struct {
 	Revision string
 }
 
-func newConfigStore(path string) (*configStore, error) {
+func newConfigStore(path string, workers ...*workerController) (*configStore, error) {
 	body, err := readConfigDocument(path)
-	if err != nil {
-		return nil, err
-	}
-	body, changed, err := normalizeExplicitEgressBindings(body)
 	if err != nil {
 		return nil, err
 	}
@@ -1768,13 +1506,23 @@ func newConfigStore(path string) (*configStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if changed {
-		if err := state.WriteFile(path, body); err != nil {
-			return nil, fmt.Errorf("persist explicit egress bindings: %w", err)
+	var worker *workerController
+	if len(workers) > 0 {
+		worker = workers[0]
+	}
+	if configHasGuestCode(cfg) {
+		if worker == nil {
+			return nil, ErrHardIsolationUnavailable
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := worker.Validate(ctx, body)
+		cancel()
+		if err != nil {
+			return nil, err
 		}
 	}
 	cfg.generation = 1
-	store := &configStore{path: path, generation: 1}
+	store := &configStore{path: path, generation: 1, workers: worker}
 	store.committed.Store(&CommittedConfigView{
 		Config:   cfg,
 		Revision: documentRevision(body),
@@ -1785,45 +1533,6 @@ func newConfigStore(path string) (*configStore, error) {
 		return nil, err
 	}
 	return store, nil
-}
-
-// normalizeExplicitEgressBindings upgrades the one state the previous runtime
-// could write but the current schema no longer represents. It runs only while
-// opening or explicitly reloading a document; normal decode and every current
-// write remain strict and reject an empty binding.
-func normalizeExplicitEgressBindings(body []byte) ([]byte, bool, error) {
-	if err := rejectDuplicateJSONKeys(body); err != nil {
-		return nil, false, fmt.Errorf("decode config: %w", err)
-	}
-	var document map[string]any
-	if err := json.Unmarshal(body, &document); err != nil {
-		return nil, false, err
-	}
-	modules, ok := document["modules"].([]any)
-	if !ok {
-		return body, false, nil
-	}
-	changed := false
-	for _, raw := range modules {
-		module, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		group, present := module["egress_group"]
-		name, stringValue := group.(string)
-		if !present || group == nil || stringValue && strings.TrimSpace(name) == "" {
-			module["egress_group"] = defaultExtensionEgressGroup
-			changed = true
-		}
-	}
-	if !changed {
-		return body, false, nil
-	}
-	normalized, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		return nil, false, fmt.Errorf("marshal explicit egress bindings: %w", err)
-	}
-	return normalized, true, nil
 }
 
 // Current returns the compiled snapshot. A pointer load: no syscall, no lock,
@@ -1903,6 +1612,9 @@ func (s *configStore) Update(expected string, mutate func(Config) (Config, error
 	if err != nil {
 		return current, view.Revision, err
 	}
+	if err := s.validateGuestCode(raw, compiled); err != nil {
+		return current, view.Revision, err
+	}
 	if err := state.WriteFile(s.path, raw); err != nil {
 		return current, view.Revision, err
 	}
@@ -1939,11 +1651,6 @@ func (s *configStore) Reload() error {
 	if revision == view.Revision {
 		return nil
 	}
-	body, changed, err := normalizeExplicitEgressBindings(body)
-	if err != nil {
-		s.publishEngineLog("error", "configuration egress normalization failed: "+err.Error())
-		return err
-	}
 	cfg, err := decodeConfig(body)
 	if err != nil {
 		// Retain the last valid snapshot: an invalid document on disk must not
@@ -1951,11 +1658,9 @@ func (s *configStore) Reload() error {
 		s.publishEngineLog("error", "configuration reload rejected: "+err.Error())
 		return err
 	}
-	if changed {
-		if err := state.WriteFile(s.path, body); err != nil {
-			s.publishEngineLog("error", "configuration egress normalization failed: "+err.Error())
-			return err
-		}
+	if err := s.validateGuestCode(body, cfg); err != nil {
+		s.publishEngineLog("error", "configuration guest-code validation rejected: "+err.Error())
+		return err
 	}
 	revision = documentRevision(body)
 	s.generation++
@@ -1966,6 +1671,29 @@ func (s *configStore) Reload() error {
 	}
 	s.publishEngineLog("info", "configuration reloaded")
 	return nil
+}
+
+func (s *configStore) validateGuestCode(raw []byte, cfg Config) error {
+	if !configHasGuestCode(cfg) {
+		return nil
+	}
+	if s == nil || s.workers == nil {
+		return ErrHardIsolationUnavailable
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.workers.Validate(ctx, raw)
+}
+
+func configHasGuestCode(cfg Config) bool {
+	for _, module := range cfg.Modules {
+		for _, rule := range module.Scripts {
+			if rule.ScriptBody != "" || rule.JQProgram != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CommittedView returns the interception document and revision from one

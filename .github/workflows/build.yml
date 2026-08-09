@@ -1,540 +1,428 @@
 name: Build
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag version to release"
+        description: "5gpn mihomo release tag"
         required: true
-  push:
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - ".github/ISSUE_TEMPLATE/**"
-    branches:
-      - Alpha
-    tags:
-      - "v*"
-  pull_request:
-    branches:
-      - Alpha
+
 concurrency:
-  group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
-  
+  group: "${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref }}"
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 env:
-  REGISTRY: docker.io
+  DELIVERY_BRANCH: feat/5gpn-monolith
+  GO_VERSION: "1.26"
+
 jobs:
+  verify:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify release source
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/${DELIVERY_BRANCH}" ]]; then
+            echo "Releases must run from ${DELIVERY_BRANCH}, got ${GITHUB_REF}." >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-monolith\.[1-9][0-9]*$ ]]; then
+            echo "Invalid 5gpn mihomo release tag: ${RELEASE_VERSION}" >&2
+            exit 1
+          fi
+          git fetch origin \
+            "+refs/heads/${DELIVERY_BRANCH}:refs/remotes/origin/${DELIVERY_BRANCH}" \
+            "+refs/tags/*:refs/tags/*"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DELIVERY_BRANCH}"; then
+            echo "Release commit ${GITHUB_SHA} is not on ${DELIVERY_BRANCH}." >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_VERSION}"; then
+            tag_type="$(git cat-file -t "refs/tags/${RELEASE_VERSION}")"
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_VERSION}^{}")"
+            if [[ "${tag_type}" != "tag" || "${tag_commit}" != "${GITHUB_SHA}" ]]; then
+              echo "Existing tag is not the expected annotated tag for ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          fi
+          previous="$(git tag --merged "origin/${DELIVERY_BRANCH}" \
+            --list 'v*-monolith.*' --sort=-version:refname \
+            | grep -vxF "${RELEASE_VERSION}" | head -n 1 || true)"
+          if [[ -n "${previous}" ]]; then
+            newest="$(printf '%s\n%s\n' "${previous}" "${RELEASE_VERSION}" | sort -V | tail -n 1)"
+            if [[ "${newest}" != "${RELEASE_VERSION}" || "${previous}" == "${RELEASE_VERSION}" ]]; then
+              echo "Release ${RELEASE_VERSION} must be newer than ${previous}." >&2
+              exit 1
+            fi
+          fi
+          status="$(curl --silent --show-error --output /tmp/existing-release.json \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_VERSION}")"
+          case "${status}" in
+            404) ;;
+            200)
+              echo "GitHub release already exists: ${RELEASE_VERSION}" >&2
+              exit 1
+              ;;
+            *)
+              echo "Could not prove release absence; GitHub returned HTTP ${status}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Verify source and tests
+        env:
+          CGO_ENABLED: 0
+          GOTOOLCHAIN: local
+          SKIP_INTEROP_TEST: 1
+        run: |
+          set -euo pipefail
+          bash ./.github/scripts/verify-delivery-contract.sh
+          go mod verify
+          go vet ./5gpn/...
+          go test ./... -count=1
+          go test ./... -count=1 -tags "with_gvisor"
+          go build ./...
+
   build:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [verify]
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         jobs:
-          - { goos: linux, goarch: '386', go386: sse2, output: '386', debian: i386, rpm: i386}
-          - { goos: linux, goarch: '386', go386: softfloat, output: '386-softfloat' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-compatible} # old style file name will be removed in next released
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64, debian: amd64, rpm: x86_64, pacman: x86_64, tarball: tarball}
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1, debian: amd64, rpm: x86_64, pacman: x86_64, test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2, debian: amd64, rpm: x86_64, pacman: x86_64}
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3, debian: amd64, rpm: x86_64, pacman: x86_64}
-          - { goos: linux, goarch: arm64, output: arm64, debian: arm64, rpm: aarch64, pacman: aarch64}  
-          - { goos: linux, goarch: arm, goarm: '5', output: armv5 }
-          - { goos: linux, goarch: arm, goarm: '6', output: armv6, debian: armel, rpm: armv6hl} 
-          - { goos: linux, goarch: arm, goarm: '7', output: armv7, debian: armhf, rpm: armv7hl, pacman: armv7hl}
+          - { goos: linux, goarch: "386", go386: sse2, output: "386" }
+          - { goos: linux, goarch: "386", go386: softfloat, output: "386-softfloat" }
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-compatible }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64, tarball: true }
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1 }
+          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2 }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3 }
+          - { goos: linux, goarch: arm64, output: arm64 }
+          - { goos: linux, goarch: arm, goarm: "5", output: armv5 }
+          - { goos: linux, goarch: arm, goarm: "6", output: armv6 }
+          - { goos: linux, goarch: arm, goarm: "7", output: armv7 }
           - { goos: linux, goarch: mips, gomips: hardfloat, output: mips-hardfloat }
           - { goos: linux, goarch: mips, gomips: softfloat, output: mips-softfloat }
           - { goos: linux, goarch: mipsle, gomips: hardfloat, output: mipsle-hardfloat }
           - { goos: linux, goarch: mipsle, gomips: softfloat, output: mipsle-softfloat }
           - { goos: linux, goarch: mips64, output: mips64 }
-          - { goos: linux, goarch: mips64le, output: mips64le, debian: mips64el, rpm: mips64el }
-          - { goos: linux, goarch: loong64, output: loong64-abi1, abi: '1', debian: loongarch64, rpm: loongarch64, goversion: 'custom' }
-          - { goos: linux, goarch: loong64, output: loong64-abi2, abi: '2', debian: loong64, rpm: loong64 }
-          - { goos: linux, goarch: riscv64, output: riscv64, debian: riscv64, rpm: riscv64 }
-          - { goos: linux, goarch: s390x, output: s390x, debian: s390x, rpm: s390x }
-          - { goos: linux, goarch: ppc64le, output: ppc64le, debian: ppc64el, rpm: ppc64le }
-
-          # Go 1.26 with special patch can work on macOS 10.13 High Sierra
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.26/
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64 }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1 }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2 }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3 }
-          - { goos: darwin, goarch: arm64, output: arm64 }
-
-          # Go 1.26 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.26/
-          - { goos: windows, goarch: '386', output: '386' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
+          - { goos: linux, goarch: mips64le, output: mips64le }
+          - { goos: linux, goarch: loong64, output: loong64-abi1, toolchain: loong64-abi1 }
+          - { goos: linux, goarch: loong64, output: loong64-abi2 }
+          - { goos: linux, goarch: riscv64, output: riscv64 }
+          - { goos: linux, goarch: s390x, output: s390x }
+          - { goos: linux, goarch: ppc64le, output: ppc64le }
+          - { goos: windows, goarch: "386", output: "386" }
+          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-compatible }
           - { goos: windows, goarch: amd64, goamd64: v3, output: amd64 }
           - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1 }
           - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2 }
           - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3 }
           - { goos: windows, goarch: arm64, output: arm64 }
 
-          - { goos: freebsd, goarch: '386', output: '386' }
-          - { goos: freebsd, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
-          - { goos: freebsd, goarch: amd64, goamd64: v3, output: amd64 }
-          - { goos: freebsd, goarch: amd64, goamd64: v1, output: amd64-v1 }
-          - { goos: freebsd, goarch: amd64, goamd64: v2, output: amd64-v2 }
-          - { goos: freebsd, goarch: amd64, goamd64: v3, output: amd64-v3 }
-          - { goos: freebsd, goarch: arm64, output: arm64 }
-
-          - { goos: android, goarch: '386', ndk: i686-linux-android34, output: '386' }
-          - { goos: android, goarch: amd64, ndk: x86_64-linux-android34, output: amd64 }
-          - { goos: android, goarch: arm, ndk: armv7a-linux-androideabi34, output: armv7 }
-          - { goos: android, goarch: arm64, ndk: aarch64-linux-android34, output: arm64-v8 }
-
-          # Go 1.25 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.25/
-          - { goos: windows, goarch: '386', output: '386-go125', goversion: '1.25' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go125, goversion: '1.25' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go125, goversion: '1.25' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go125, goversion: '1.25' }
-
-          # Go 1.24 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.24/
-          - { goos: windows, goarch: '386', output: '386-go124', goversion: '1.24' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go124, goversion: '1.24' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go124, goversion: '1.24' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go124, goversion: '1.24' }
-
-          # Go 1.23 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.23/
-          - { goos: windows, goarch: '386', output: '386-go123', goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go123, goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go123, goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go123, goversion: '1.23' }
-
-          # Go 1.22 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.22/
-          - { goos: windows, goarch: '386', output: '386-go122', goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go122, goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go122, goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go122, goversion: '1.22' }
-
-          # Go 1.21 can revert commit `9e4385` to work on Windows 7
-          # https://github.com/golang/go/issues/64622#issuecomment-1847475161
-          # (OR we can just use golang1.21.4 which unneeded any patch)
-          - { goos: windows, goarch: '386', output: '386-go121', goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go121, goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go121, goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go121, goversion: '1.21' }
-
-          # Go 1.20 is the last release that will run on any release of Windows 7, 8, Server 2008 and Server 2012. Go 1.21 will require at least Windows 10 or Server 2016.
-          - { goos: windows, goarch: '386', output: '386-go120', goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
-
-          # Go 1.24 is the last release that will run on macOS 11 Big Sur. Go 1.25 will require macOS 12 Monterey or later.
-          - { goos: darwin, goarch: arm64, output: arm64-go124, goversion: '1.24' }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1-go124, goversion: '1.24' }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go124, goversion: '1.24' }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go124, goversion: '1.24' }
-
-          # Go 1.22 is the last release that will run on macOS 10.15 Catalina. Go 1.23 will require macOS 11 Big Sur or later.
-          - { goos: darwin, goarch: arm64, output: arm64-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go122, goversion: '1.22' }
-
-          # Go 1.20 is the last release that will run on macOS 10.13 High Sierra or 10.14 Mojave. Go 1.21 will require macOS 10.15 Catalina or later.
-          - { goos: darwin, goarch: arm64, output: arm64-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
-
-          # Go 1.23 is the last release that requires Linux kernel version 2.6.32 or later. Go 1.24 will require Linux kernel version 3.2 or later.
-          - { goos: linux, goarch: '386', output: '386-go123', goversion: '1.23' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1-go123, goversion: '1.23', test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2-go123, goversion: '1.23' }
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3-go123, goversion: '1.23' }
-
-          # only for test
-          - { goos: linux, goarch: '386', output: '386-go120', goversion: '1.20' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20', test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
-
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      if: ${{ matrix.jobs.goversion == '' }}
-      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
-      with:
-        go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
-        go-version: '1.26'
+      - name: Set up Go
+        if: ${{ matrix.jobs.toolchain != 'loong64-abi1' }}
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Set up Go
-      if: ${{ matrix.jobs.goversion != '' && matrix.jobs.goversion != 'custom' }}
-      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
-      with:
-        go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
-        go-version: ${{ matrix.jobs.goversion }}
+      - name: Set up Go for loong64 ABI1
+        if: ${{ matrix.jobs.toolchain == 'loong64-abi1' }}
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/loongarch64-golang/releases/download/1.26.0"
+          go-version: 1.26.0
 
-    - name: Set up Go1.26 loongarch abi1
-      if: ${{ matrix.jobs.goarch == 'loong64' && matrix.jobs.abi == '1' }}
-      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
-      with:
-        go-download-base-url: 'https://github.com/MetaCubeX/loongarch64-golang/releases/download/1.26.0'
-        go-version: 1.26.0
+      - name: Verify Go installation
+        run: go version
 
-    - name: Verify Go installation
-      run: go version
+      - name: Set variables
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME,,}-$(git rev-parse --short HEAD)"
+          VERSION="${VERSION//\//-}"
+          if [[ -n "${RELEASE_VERSION:-}" ]]; then
+            VERSION="${RELEASE_VERSION}"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "BUILDTIME=$(date -u --iso-8601=seconds)" >> "${GITHUB_ENV}"
+          echo "CGO_ENABLED=0" >> "${GITHUB_ENV}"
+          echo "BUILDTAG=-extldflags --static" >> "${GITHUB_ENV}"
+          echo "GOTOOLCHAIN=local" >> "${GITHUB_ENV}"
 
-    - name: Verify Go env
-      run: go env
+      - name: Update CA bundle
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
 
-    - name: Set variables
-      run: |
-        VERSION="${GITHUB_REF_NAME,,}-$(git rev-parse --short HEAD)"
-        VERSION="${VERSION//\//-}"
-        PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
-        if [ -n "${{ github.event.inputs.version }}" ]; then
-          VERSION=${{ github.event.inputs.version }}
-          PackageVersion="${VERSION#v}"
-        fi
-        echo "VERSION=${VERSION}" >> $GITHUB_ENV
-        echo "PackageVersion=${PackageVersion}" >> $GITHUB_ENV
-      
-        echo "BUILDTIME=$(date)" >> $GITHUB_ENV
-        echo "CGO_ENABLED=0" >> $GITHUB_ENV
-        echo "BUILDTAG=-extldflags --static" >> $GITHUB_ENV
-        echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+      - name: Build core
+        env:
+          GOOS: ${{ matrix.jobs.goos }}
+          GOARCH: ${{ matrix.jobs.goarch }}
+          GOAMD64: ${{ matrix.jobs.goamd64 }}
+          GO386: ${{ matrix.jobs.go386 }}
+          GOARM: ${{ matrix.jobs.goarm }}
+          GOMIPS: ${{ matrix.jobs.gomips }}
+        run: |
+          set -euo pipefail
+          go build -v -tags "with_gvisor" -trimpath \
+            -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+          if [[ "${{ matrix.jobs.goos }}" == "windows" ]]; then
+            cp mihomo.exe "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}.exe"
+            zip -r "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}-${VERSION}.zip" \
+              "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}.exe"
+          else
+            cp mihomo "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
+            gzip -c "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}" \
+              > "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}-${VERSION}.gz"
+            rm "mihomo-${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
+          fi
 
-    - name: Setup NDK
-      if: ${{ matrix.jobs.goos == 'android' }}
-      uses: nttld/setup-ndk@v1
-      id: setup-ndk
-      with:
-        ndk-version: r29-beta1
+      - name: Pack Go toolchain
+        if: ${{ matrix.jobs.tarball == true }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/toolchain/go"
+          cp -r "$(go env GOROOT)/." "${GITHUB_WORKSPACE}/toolchain/go/"
+          tar -C "${GITHUB_WORKSPACE}/toolchain" -czf "${GITHUB_WORKSPACE}/toolchain.tar.gz" .
+          rm -rf "${GITHUB_WORKSPACE}/toolchain"
 
-    - name: Set NDK path
-      if: ${{ matrix.jobs.goos == 'android' }}
-      run: |
-        echo "CC=${{steps.setup-ndk.outputs.ndk-path}}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{matrix.jobs.ndk}}-clang" >> $GITHUB_ENV
-        echo "CGO_ENABLED=1" >> $GITHUB_ENV
-        echo "BUILDTAG=" >> $GITHUB_ENV
+      - name: Pack Go module vendor tree
+        if: ${{ matrix.jobs.tarball == true }}
+        run: |
+          set -euo pipefail
+          go mod vendor
+          tar -czf "${GITHUB_WORKSPACE}/vendor.tar.gz" vendor
 
-    - name: Test
-      if: ${{ matrix.jobs.test == 'test' }}
-      run: |
-        export SKIP_CONCURRENT_TEST=1
-        export SKIP_INTEROP_TEST=1
-        go test ./...
-        echo "---test with_gvisor---"
-        go test ./... -tags "with_gvisor" -count=1
+      - name: Save version
+        run: echo "${VERSION}" > version.txt
 
-    - name: Update CA
-      run: |
-        sudo apt-get update && sudo apt-get install ca-certificates
-        sudo update-ca-certificates
-        cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
-
-    - name: Build core
-      env:
-        GOOS: ${{matrix.jobs.goos}}
-        GOARCH: ${{matrix.jobs.goarch}}
-        GOAMD64: ${{matrix.jobs.goamd64}}
-        GO386: ${{matrix.jobs.go386}}
-        GOARM: ${{matrix.jobs.goarm}}
-        GOMIPS: ${{matrix.jobs.gomips}}
-      run: |
-        go env
-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
-        if [ "${{matrix.jobs.goos}}" = "windows" ]; then
-          cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
-          zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
-        else
-          cp mihomo mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
-          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}} > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.gz
-          rm mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
-        fi
-
-    - name: Package DEB
-      if: matrix.jobs.debian != ''
-      run: |
-        set -xeuo pipefail
-        sudo gem install fpm
-        cp .github/release/.fpm_systemd .fpm
-
-        fpm -t deb \
-          -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.deb" \
-          --architecture ${{ matrix.jobs.debian }} \
-          mihomo=/usr/bin/mihomo
-
-    - name: Package RPM
-      if: matrix.jobs.rpm != ''
-      run: |
-        set -xeuo pipefail
-        sudo gem install fpm
-        cp .github/release/.fpm_systemd .fpm
-
-        fpm -t rpm \
-          -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.rpm" \
-          --architecture ${{ matrix.jobs.rpm }} \
-          mihomo=/usr/bin/mihomo
-
-    - name: Package Pacman
-      if: matrix.jobs.pacman != ''
-      run: |
-        set -xeuo pipefail
-        sudo gem install fpm
-        sudo apt-get update && sudo apt-get install -y libarchive-tools
-        cp .github/release/.fpm_systemd .fpm
-
-        fpm -t pacman \
-          -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.pkg.tar.zst" \
-          --architecture ${{ matrix.jobs.pacman }} \
-          mihomo=/usr/bin/mihomo
-
-    - name: Pack Golang Toolchain
-      if: ${{ matrix.jobs.goversion == '' && matrix.jobs.tarball == 'tarball' }}
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/toolchain/go
-        cp -r $(go env GOROOT)/* $GITHUB_WORKSPACE/toolchain/go/
-        cd $GITHUB_WORKSPACE/toolchain/
-        tar -czf $GITHUB_WORKSPACE/toolchain.tar.gz .
-        rm -rf $GITHUB_WORKSPACE/toolchain
-
-    - name: Pack GoMod Vendor
-      if: ${{ matrix.jobs.goversion == '' && matrix.jobs.tarball == 'tarball' }}
-      run: |
-        go mod vendor
-        tar -czf $GITHUB_WORKSPACE/vendor.tar.gz vendor
-
-    - name: Save version
-      run: |
-        echo ${VERSION} > version.txt
-      shell: bash
-
-    - name: Archive production artifacts
-      uses: actions/upload-artifact@v7
-      with:
-        name: "${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
-        path: |
-          mihomo*.gz
-          mihomo*.deb
-          mihomo*.rpm
-          mihomo*.pkg.tar.zst
-          mihomo*.zip
-          toolchain.tar.gz
-          vendor.tar.gz
-          version.txt
-          checksums.txt
-
-  Upload-Prerelease:
-    permissions: write-all
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-    - name: Download all workflow run artifacts
-      uses: actions/download-artifact@v8
-      with:
-        path: bin/
-        merge-multiple: true
-
-    - name: Calculate checksums
-      run: |
-        cd bin/
-        find . -type f -not -name "checksums.*" -not -name "version.txt" | sort | xargs sha256sum > checksums.txt
-        cat checksums.txt
-      shell: bash
-
-    - name: Delete current release assets
-      uses: 8Mi-Tech/delete-release-assets-action@main
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        tag: Prerelease-${{ github.ref_name }}
-        deleteOnlyFromDrafts: false
-    - name: Set Env
-      run: |
-        echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Tag Repo
-      uses: richardsimko/update-tag@v1
-      with:
-        tag_name: Prerelease-${{ github.ref_name }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-    - run: |
-        cat > release.txt << 'EOF'
-        Release created at  ${{ env.BUILDTIME }}
-        Synchronize ${{ github.ref_name }} branch code updates, keeping only the latest version
-        <br>
-        [我应该下载哪个文件? / Which file should I download?](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
-        [二进制文件筛选 / Binary file selector](https://metacubex.github.io/Meta-Docs/startup/#_1)
-        [查看文档 / Docs](https://metacubex.github.io/Meta-Docs/)
-        EOF
-
-    - name: Upload Prerelease
-      uses: softprops/action-gh-release@v3
-      if: ${{  success() }}
-      with:
-        tag_name: Prerelease-${{ github.ref_name }}
-        files: |
-          bin/*
-        prerelease: true
-        generate_release_notes: true
-        body_path: release.txt
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: "${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
+          path: |
+            mihomo*.gz
+            mihomo*.zip
+            toolchain.tar.gz
+            vendor.tar.gz
+            version.txt
 
   Upload-Release:
-    permissions: write-all
+    permissions:
+      contents: write
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Checkout release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: Meta
-          fetch-depth: '0'
-          fetch-tags: 'true'
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Get tags
-        run: |
-          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
-          git fetch --tags
-          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> $GITHUB_ENV
-
-      - name: Force push Alpha branch to Meta
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git fetch origin Alpha:Alpha
-          git push origin Alpha:Meta --force
+      - name: Revalidate immutable release inputs
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag the commit on Alpha
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          git checkout Alpha 
-          git tag ${{ github.event.inputs.version }}
-          git push origin ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/${DELIVERY_BRANCH}" ]]; then
+            echo "Releases must run from ${DELIVERY_BRANCH}, got ${GITHUB_REF}." >&2
+            exit 1
+          fi
+          if [[ ! "${CURRENT_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-monolith\.[1-9][0-9]*$ ]]; then
+            echo "Invalid 5gpn mihomo release tag: ${CURRENT_VERSION}" >&2
+            exit 1
+          fi
+          git fetch origin \
+            "+refs/heads/${DELIVERY_BRANCH}:refs/remotes/origin/${DELIVERY_BRANCH}" \
+            "+refs/tags/*:refs/tags/*"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DELIVERY_BRANCH}"; then
+            echo "Release commit ${GITHUB_SHA} is not on ${DELIVERY_BRANCH}." >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/${CURRENT_VERSION}"; then
+            tag_type="$(git cat-file -t "refs/tags/${CURRENT_VERSION}")"
+            tag_commit="$(git rev-parse "refs/tags/${CURRENT_VERSION}^{}")"
+            if [[ "${tag_type}" != "tag" || "${tag_commit}" != "${GITHUB_SHA}" ]]; then
+              echo "Existing tag is not the expected annotated tag for ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          fi
+          status="$(curl --silent --show-error --output /tmp/existing-release.json \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${CURRENT_VERSION}")"
+          if [[ "${status}" != "404" ]]; then
+            echo "Release absence check returned HTTP ${status}; refusing publication." >&2
+            exit 1
+          fi
+          previous="$(git tag --merged "origin/${DELIVERY_BRANCH}" \
+            --list 'v*-monolith.*' --sort=-version:refname \
+            | grep -vxF "${CURRENT_VERSION}" | head -n 1 || true)"
+          if [[ -n "${previous}" ]]; then
+            newest="$(printf '%s\n%s\n' "${previous}" "${CURRENT_VERSION}" | sort -V | tail -n 1)"
+            if [[ "${newest}" != "${CURRENT_VERSION}" || "${previous}" == "${CURRENT_VERSION}" ]]; then
+              echo "Release ${CURRENT_VERSION} must be newer than ${previous}." >&2
+              exit 1
+            fi
+          fi
+          echo "CURRENTVERSION=${CURRENT_VERSION}" >> "${GITHUB_ENV}"
+          echo "PREVERSION=${previous}" >> "${GITHUB_ENV}"
 
       - name: Generate release notes
         run: |
-            cp ./.github/genReleaseNote.sh ./
-            bash ./genReleaseNote.sh -v ${PREVERSION}...${CURRENTVERSION}
-            rm ./genReleaseNote.sh
-  
-      - uses: actions/download-artifact@v8
-        with:
-          path: bin/
-          merge-multiple: true
-  
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
-  
-      - name: Upload Release
-        uses: softprops/action-gh-release@v3
-        if: ${{ success() }}
-        with:
-          tag_name: ${{ github.event.inputs.version }}
-          files: bin/*
-          body_path: release.md
+          set -euo pipefail
+          if [[ -n "${PREVERSION}" ]]; then
+            bash ./.github/genReleaseNote.sh -v "${PREVERSION}...${CURRENTVERSION}"
+          else
+            printf '## Release %s\n' "${CURRENTVERSION}" > release.md
+          fi
 
-  Docker:
-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
-    permissions: write-all
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: bin/
           merge-multiple: true
 
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          version: latest
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        id: meta_alpha
-        uses: docker/metadata-action@v6
-        with:
-          images: '${{ env.REGISTRY }}/${{ github.repository }}'
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        id: meta_release
-        uses: docker/metadata-action@v6
-        with:
-          images: '${{ env.REGISTRY }}/${{ github.repository }}'
-          tags: |
-            ${{ github.event.inputs.version }}
-          flavor: |
-            latest=true
-          labels: org.opencontainers.image.version=${{ github.event.inputs.version }}
-      
-      - name: Show files
+      - name: Calculate checksums
         run: |
-          ls .
-          ls bin/
-      
-      - name: login to docker REGISTRY
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKER_HUB_USER }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          set -euo pipefail
+          cd bin/
+          find . -type f -not -name "checksums.*" -not -name "version.txt" -print0 \
+            | sort -z | xargs -0 sha256sum > checksums.txt
 
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm64
-            linux/arm/v7
-          tags: ${{ steps.meta_alpha.outputs.tags }}
-          labels: ${{ steps.meta_alpha.outputs.labels }}
-      
-      - name: Build and push Docker image
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm64
-            linux/arm/v7
-          tags: ${{ steps.meta_release.outputs.tags }}
-          labels: ${{ steps.meta_release.outputs.labels }}
+      - name: Create and verify immutable tag
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/${CURRENTVERSION}"; then
+            tag_type="$(git cat-file -t "refs/tags/${CURRENTVERSION}")"
+            local_commit="$(git rev-parse "refs/tags/${CURRENTVERSION}^{}")"
+            if [[ "${tag_type}" != "tag" || "${local_commit}" != "${GITHUB_SHA}" ]]; then
+              echo "Existing tag is not the expected annotated tag for ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          else
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git tag -a "${CURRENTVERSION}" -m "Release ${CURRENTVERSION}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${CURRENTVERSION}"
+          fi
+          local_commit="$(git rev-parse "refs/tags/${CURRENTVERSION}^{}")"
+          if [[ "${local_commit}" != "${GITHUB_SHA}" ]]; then
+            echo "Local tag resolves to ${local_commit}, expected ${GITHUB_SHA}." >&2
+            exit 1
+          fi
+          remote_commit="$(git ls-remote origin "refs/tags/${CURRENTVERSION}^{}" | awk '{print $1}')"
+          if [[ "${remote_commit}" != "${GITHUB_SHA}" ]]; then
+            echo "Remote tag resolves to ${remote_commit:-missing}, expected ${GITHUB_SHA}." >&2
+            exit 1
+          fi
+
+      - name: Publish stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${CURRENTVERSION}" bin/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${CURRENTVERSION}" \
+            --notes-file release.md \
+            --verify-tag \
+            --latest=false
+
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${CURRENTVERSION}" \
+            | jq -e --arg tag "${CURRENTVERSION}" \
+                '.tag_name == $tag and .draft == false and .prerelease == false and .immutable == true' >/dev/null
+          remote_commit="$(git ls-remote origin "refs/tags/${CURRENTVERSION}^{}" | awk '{print $1}')"
+          if [[ "${remote_commit}" != "${GITHUB_SHA}" ]]; then
+            echo "Published tag moved to ${remote_commit:-missing}." >&2
+            exit 1
+          fi
+
+  Reconcile-Latest:
+    permissions:
+      contents: write
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    needs: [Upload-Release]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: mihomo-monolith-reconcile-latest
+      cancel-in-progress: false
+    steps:
+      - name: Select and publish the highest monolith release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          best_tag=""
+          best_id=""
+          while IFS=$'\t' read -r tag release_id; do
+            if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-monolith\.[1-9][0-9]*$ ]]; then
+              continue
+            fi
+            if [[ -z "${best_tag}" ]]; then
+              best_tag="${tag}"
+              best_id="${release_id}"
+              continue
+            fi
+            newest="$(printf '%s\n%s\n' "${best_tag}" "${tag}" | sort -V | tail -n 1)"
+            if [[ "${newest}" == "${tag}" && "${tag}" != "${best_tag}" ]]; then
+              best_tag="${tag}"
+              best_id="${release_id}"
+            fi
+          done < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --slurp \
+              | jq -r '.[][] | select(.draft == false and .prerelease == false) | [.tag_name, (.id | tostring)] | @tsv'
+          )
+          if [[ -z "${best_tag}" || -z "${best_id}" ]]; then
+            echo "No published monolith release is eligible for latest." >&2
+            exit 1
+          fi
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${best_id}" \
+            -f make_latest=true >/dev/null
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [[ "${latest}" != "${best_tag}" ]]; then
+            echo "Latest release is ${latest}, expected ${best_tag}." >&2
+            exit 1
+          fi

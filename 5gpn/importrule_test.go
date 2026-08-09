@@ -2,10 +2,25 @@ package fivegpn_test
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
 )
+
+func TestWorkerDispatchPrecedesOrdinaryMainSetup(t *testing.T) {
+	body, err := os.ReadFile("../main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	dispatch := strings.Index(source, "os.Args[1] == fivegpn.ExtensionWorkerCommand()")
+	resolver := strings.Index(source, "net.DefaultResolver.PreferGo")
+	configuration := strings.Index(source, "hub.Parse(configBytes")
+	if dispatch < 0 || resolver < 0 || configuration < 0 || dispatch > resolver || dispatch > configuration {
+		t.Fatal("hidden worker dispatch no longer precedes ordinary resolver/configuration setup")
+	}
+}
 
 // The fork's real cost is not the size of 5gpn/ -- it is how many upstream-owned
 // files carry a 5gpn-shaped change, because those are the ones a rebase has to

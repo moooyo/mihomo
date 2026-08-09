@@ -6,23 +6,22 @@ import (
 )
 
 const (
-	// breakerThreshold is the consecutive-failure count that opens a group's
+	// breakerThreshold is the consecutive-failure count that opens a member's
 	// breaker; breakerCooldown is how long it stays open before a half-open
 	// probe is admitted.
 	breakerThreshold = 5
 	breakerCooldown  = 10 * time.Second
 )
 
-// breaker is a per-group circuit breaker. After breakerThreshold consecutive
-// exchange failures it opens for breakerCooldown, during which the group fails
-// fast without dialing -- so a blackholed upstream (RST, or worse, silently
-// dropped) stops adding a read timeout to every uncached query.
+// breaker is a per-member circuit breaker. After breakerThreshold consecutive
+// exchange failures it opens for breakerCooldown, during which that member is
+// skipped -- so a blackholed first upstream stops adding a read timeout while
+// later configured members remain available.
 //
 // It trips on a consecutive-failure COUNT, never on latency, and that
-// distinction is what keeps it out of the arbitration decision. Whenever the
-// china group is answering at all, its answer is honoured by chnroute
-// membership; the breaker only short-circuits a group that has already failed
-// repeatedly, where there is no answer to honour.
+// distinction is what keeps it out of the arbitration decision. It skips only
+// a member that has repeatedly failed; later members retain their configured
+// order and can continue serving the group.
 type breaker struct {
 	mu            sync.Mutex
 	failures      int
@@ -33,23 +32,32 @@ type breaker struct {
 
 func newBreaker() *breaker { return &breaker{now: time.Now} }
 
-// allow reports whether a call may proceed. Open and still within cooldown is
-// false; otherwise true, including the single half-open probe once the cooldown
-// has elapsed. A nil breaker always allows.
-func (b *breaker) allow() bool {
+// admit reports both whether work may proceed and whether this caller owns the
+// single half-open probe reservation. The latter lets a group release a probe
+// it selected for fair budgeting but never reached because an earlier member
+// succeeded.
+func (b *breaker) admit() (allowed, probe bool) {
 	if b == nil {
-		return true
+		return true, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.openUntil.IsZero() {
-		return true
+		return true, false
 	}
 	if b.clock().Before(b.openUntil) || b.probeInFlight {
-		return false
+		return false, false
 	}
 	b.probeInFlight = true
-	return true
+	return true, true
+}
+
+// allow reports whether a call may proceed. Open and still within cooldown is
+// false; otherwise true, including the single half-open probe once the cooldown
+// has elapsed. A nil breaker always allows.
+func (b *breaker) allow() bool {
+	allowed, _ := b.admit()
+	return allowed
 }
 
 // record folds one outcome in: a success closes the breaker, a failure counts

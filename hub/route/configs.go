@@ -1,6 +1,7 @@
 package route
 
 import (
+	"errors"
 	"net/netip"
 	"path/filepath"
 
@@ -324,6 +325,19 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, ErrBadRequest)
 		return
 	}
+	unlockConfigApply := lockConfigApply()
+	defer unlockConfigApply()
+	if general.LogLevel != nil {
+		if err := reconcileHotDebugRoute(*general.LogLevel == log.DEBUG); err != nil {
+			if errors.Is(err, ErrControllerRestartRequired) {
+				render.Status(r, http.StatusConflict)
+			} else {
+				render.Status(r, http.StatusBadRequest)
+			}
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+	}
 
 	if general.AllowLan != nil {
 		listener.SetAllowLan(*general.AllowLan)
@@ -435,7 +449,16 @@ func updateConfigs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	executor.ApplyConfig(cfg, force)
+	if err := applyHotConfig(cfg, force); err != nil {
+		if errors.Is(err, ErrControllerRestartRequired) {
+			render.Status(r, http.StatusConflict)
+		} else {
+			render.Status(r, http.StatusBadRequest)
+		}
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+
 	render.NoContent(w, r)
 }
 

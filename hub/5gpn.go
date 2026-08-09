@@ -6,6 +6,7 @@ import (
 	fivegpn "github.com/metacubex/mihomo/5gpn"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -19,6 +20,9 @@ import (
 var (
 	fivegpnOnce     sync.Once
 	fivegpnStartErr error
+	fivegpnFatal    = func(err error) {
+		log.Fatalln("[5GPN] fatal runtime failure: %v", err)
+	}
 )
 
 // startFiveGPN installs the 5gpn subsystems exactly once, before listeners accept.
@@ -34,13 +38,15 @@ var (
 // process-owner boundary; plugin, interception, and bot errors remain locally
 // isolated inside fivegpn.Start.
 func startFiveGPN() error {
+	// The controller is part of the same deliberate failure domain as DoT. The
+	// route package owns the listener, while hub owns the process, so the fatal
+	// action is injected here instead of calling os.Exit from a serving goroutine.
+	route.SetControllerFatalHandler(func(err error) { fivegpnFatal(err) })
 	fivegpnOnce.Do(func() {
 		// 5gpn publishes both core and Console through its digest-pinned installer.
 		// Upstream self-updaters cannot preserve the fork or its artifact pins.
 		updater.SetManagedDistribution(true)
-		fivegpnStartErr = fivegpn.Start(C.Path.HomeDir(), func(err error) {
-			log.Fatalln("[5GPN] fatal runtime failure: %v", err)
-		})
+		fivegpnStartErr = fivegpn.Start(C.Path.HomeDir(), func(err error) { fivegpnFatal(err) })
 	})
 	return fivegpnStartErr
 }

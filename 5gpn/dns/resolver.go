@@ -54,8 +54,6 @@ type CaptureLookup func(name string) (Capture, bool)
 type pool interface {
 	Exchanger
 	Specs() []string
-	SetECS(netip.Prefix)
-	ECS() netip.Prefix
 	Close()
 }
 
@@ -64,6 +62,34 @@ type pool interface {
 type upstreams struct {
 	china pool
 	trust pool
+}
+
+// runtimeTuning is the validated executable form of the document's tuning
+// section. It lives in the same immutable snapshot as policy and upstreams so
+// one query cannot use a new timeout with an old admission limit or TTL policy.
+type runtimeTuning struct {
+	timeout     time.Duration
+	ttlMin      time.Duration
+	ttlMax      time.Duration
+	cacheSize   int
+	maxInflight int
+}
+
+// runtimeSnapshot is every DNS-document input that can change the answer or
+// the work a query is allowed to consume. A query loads this pointer exactly
+// once and carries it through decision, upstream exchange, cache, and
+// rewriting. Capture is an engine-owned projection accessor; each query calls
+// it once, and the resulting action/resolver discriminator is carried in its
+// cache and flight keys across the engine's publish-then-notify handoff.
+type runtimeSnapshot struct {
+	generation uint64
+	policy     *compiledPolicy
+	ups        *upstreams
+	gateway    netip.Addr
+	localNames map[string]struct{}
+	capture    CaptureLookup
+	tuning     runtimeTuning
+	clientSem  chan struct{}
 }
 
 // Resolver is the 5gpn DNS decision engine.
@@ -80,22 +106,13 @@ type Resolver struct {
 	qlog  *queryLog
 	stats *counters
 
-	policy     atomic.Pointer[compiledPolicy]
-	ups        atomic.Pointer[upstreams]
-	gateway    atomic.Pointer[netip.Addr]
-	localNames atomic.Pointer[map[string]struct{}]
-	capture    atomic.Pointer[CaptureLookup]
-
-	timeout time.Duration
-	ttlMin  time.Duration
-	ttlMax  time.Duration
-
-	// sem bounds concurrent resolutions. A random-subdomain flood pins every
-	// query at the timeout, and without a ceiling the process accretes
-	// goroutines and sockets until it hits the descriptor limit or the OOM
-	// killer. Shedding with REFUSED is cheap and recoverable; neither of those
-	// is. nil disables shedding.
-	sem chan struct{}
+	runtime   atomic.Pointer[runtimeSnapshot]
+	runtimeMu sync.Mutex
+	// originSem is deliberately separate from the client budget. Origin
+	// lookups are made by the tunnel and by guarded subscription fetches; if
+	// they shared a saturated client budget, work already admitted on the
+	// client path could deadlock waiting for a slot held by itself.
+	originSem chan struct{}
 
 	flightMu    sync.Mutex
 	flights     map[flightKey]*flight
@@ -109,8 +126,12 @@ type Options struct {
 	TTLMax      time.Duration
 	CacheSize   int
 	MaxInflight int
-	FlightLimit int
-	QueryLog    int
+	// OriginMaxInflight bounds both the loopback origin listener and the
+	// in-process OriginResolve API. It is process integration rather than an
+	// operator tuning knob, so the service uses the safe default.
+	OriginMaxInflight int
+	FlightLimit       int
+	QueryLog          int
 }
 
 const (
@@ -118,7 +139,12 @@ const (
 	defaultTTLMin      = 60 * time.Second
 	defaultTTLMax      = 6 * time.Hour
 	defaultCacheSize   = 8192
-	defaultFlightLimit = 1024
+	defaultMaxInflight = 256
+	// Origin resolution is internal and normally much narrower than public
+	// DoT ingress. A separate smaller budget prevents tunnel/subscription work
+	// from exhausting the client budget while still allowing ordinary bursts.
+	defaultOriginMaxInflight = 64
+	defaultFlightLimit       = 1024
 )
 
 // NewResolver builds a resolver with an empty policy and no upstreams. Callers
@@ -139,48 +165,128 @@ func NewResolver(opt Options) *Resolver {
 	if opt.CacheSize <= 0 {
 		opt.CacheSize = defaultCacheSize
 	}
+	if opt.MaxInflight <= 0 {
+		opt.MaxInflight = defaultMaxInflight
+	}
+	if opt.OriginMaxInflight <= 0 {
+		opt.OriginMaxInflight = defaultOriginMaxInflight
+	}
 	if opt.FlightLimit <= 0 {
 		opt.FlightLimit = defaultFlightLimit
+	}
+	tuning := runtimeTuning{
+		timeout: opt.Timeout, ttlMin: opt.TTLMin, ttlMax: opt.TTLMax,
+		cacheSize: opt.CacheSize, maxInflight: opt.MaxInflight,
 	}
 	r := &Resolver{
 		cn:          NewCNSet(),
 		cache:       newCache(opt.CacheSize),
 		qlog:        newQueryLog(opt.QueryLog, 0),
 		stats:       newCounters(),
-		timeout:     opt.Timeout,
-		ttlMin:      opt.TTLMin,
-		ttlMax:      opt.TTLMax,
+		originSem:   make(chan struct{}, opt.OriginMaxInflight),
 		flights:     make(map[flightKey]*flight),
 		flightLimit: opt.FlightLimit,
 	}
-	if opt.MaxInflight > 0 {
-		r.sem = make(chan struct{}, opt.MaxInflight)
-	}
+	r.runtime.Store(&runtimeSnapshot{
+		generation: 1,
+		localNames: make(map[string]struct{}),
+		tuning:     tuning,
+		clientSem:  make(chan struct{}, tuning.maxInflight),
+	})
 	return r
+}
+
+func (r *Resolver) snapshot() *runtimeSnapshot {
+	if r == nil {
+		return nil
+	}
+	return r.runtime.Load()
+}
+
+// updateRuntime serializes all writers and makes the cache ready for the next
+// generation before publishing its single pointer. Readers can briefly finish
+// on the previous snapshot, but no reader can assemble fields from both.
+func (r *Resolver) updateRuntime(change func(*runtimeSnapshot) *runtimeSnapshot) {
+	r.runtimeMu.Lock()
+	current := r.runtime.Load()
+	next := change(current)
+	if next == nil {
+		r.runtimeMu.Unlock()
+		return
+	}
+	next.generation = current.generation + 1
+	if next.clientSem == nil || cap(next.clientSem) != next.tuning.maxInflight {
+		next.clientSem = make(chan struct{}, next.tuning.maxInflight)
+	}
+	// A new configuration is a hard boundary. Prepare its empty cache before
+	// making the runtime visible; old in-flight writes carry the old generation
+	// and are rejected.
+	r.cache.hardInvalidate(next.generation, next.tuning.cacheSize)
+	r.runtime.Store(next)
+	r.runtimeMu.Unlock()
+
+	if current.ups != nil && current.ups != next.ups {
+		retire(current.ups.china, 2*current.tuning.timeout)
+		retire(current.ups.trust, 2*current.tuning.timeout)
+	}
+}
+
+func cloneRuntime(current *runtimeSnapshot) *runtimeSnapshot {
+	if current == nil {
+		return &runtimeSnapshot{}
+	}
+	next := *current
+	return &next
+}
+
+// applyDocumentRuntime publishes one fully prepared DNS document projection.
+// Capture is owned by the interception transaction and is retained, while all
+// document-owned fields move together in this one generation.
+func (r *Resolver) applyDocumentRuntime(policy *compiledPolicy, ups *upstreams, localNames map[string]struct{}, gateway netip.Addr, tuning runtimeTuning) {
+	gateway = gateway.Unmap()
+	if !usableGateway(gateway) {
+		gateway = netip.Addr{}
+	}
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		clientSem := current.clientSem
+		if current.tuning.maxInflight != tuning.maxInflight {
+			clientSem = nil
+		}
+		return &runtimeSnapshot{
+			policy: policy, ups: ups, gateway: gateway, localNames: localNames,
+			capture: current.capture, tuning: tuning, clientSem: clientSem,
+		}
+	})
 }
 
 // SetCaptureLookup installs the interception engine's capture table, or removes
 // it with nil.
 func (r *Resolver) SetCaptureLookup(fn CaptureLookup) {
-	if fn == nil {
-		r.capture.Store(nil)
-		return
-	}
-	r.capture.Store(&fn)
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		next := cloneRuntime(current)
+		next.capture = fn
+		return next
+	})
 }
 
 // SetGateway publishes the address proxied names resolve to. An invalid address
 // means none is configured.
 func (r *Resolver) SetGateway(addr netip.Addr) {
 	addr = addr.Unmap()
-	r.gateway.Store(&addr)
-	r.cache.Flush()
+	if !usableGateway(addr) {
+		addr = netip.Addr{}
+	}
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		next := cloneRuntime(current)
+		next.gateway = addr
+		return next
+	})
 }
 
 // Gateway reports the configured gateway address.
 func (r *Resolver) Gateway() netip.Addr {
-	if a := r.gateway.Load(); a != nil {
-		return *a
+	if current := r.snapshot(); current != nil {
+		return current.gateway
 	}
 	return netip.Addr{}
 }
@@ -199,8 +305,11 @@ func (r *Resolver) SetLocalNames(names []string) {
 			set[n] = struct{}{}
 		}
 	}
-	r.localNames.Store(&set)
-	r.cache.Flush()
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		next := cloneRuntime(current)
+		next.localNames = set
+		return next
+	})
 }
 
 // SetPolicy publishes a compiled policy snapshot and flushes the cache.
@@ -219,33 +328,28 @@ func (r *Resolver) SetPolicy(p Policy, cacheDir string) error {
 }
 
 func (r *Resolver) setCompiledPolicy(compiled *compiledPolicy) {
-	r.policy.Store(compiled)
-	r.cache.Flush()
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		next := cloneRuntime(current)
+		next.policy = compiled
+		return next
+	})
 }
 
 // SetUpstreams rebuilds both groups and retires the previous pair.
 func (r *Resolver) SetUpstreams(china, trust []MemberSpec, ecs netip.Prefix) {
-	next := &upstreams{china: newGroup("china", china), trust: newGroup("trust", trust)}
+	chinaGroup := newGroup("china", china)
 	// Only china carries a client subnet -- see the note in ecs.go.
-	next.china.SetECS(ecs)
+	chinaGroup.SetECS(ecs)
+	next := &upstreams{china: chinaGroup, trust: newGroup("trust", trust)}
 	r.swapUpstreams(next)
 }
 
 func (r *Resolver) swapUpstreams(next *upstreams) {
-	previous := r.ups.Swap(next)
-	r.cache.Flush()
-	if previous != nil {
-		retire(previous.china, 2*r.timeout)
-		retire(previous.trust, 2*r.timeout)
-	}
-}
-
-// SetECS updates the china group's client subnet in place.
-func (r *Resolver) SetECS(p netip.Prefix) {
-	if u := r.ups.Load(); u != nil {
-		u.china.SetECS(p)
-	}
-	r.cache.Flush()
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		runtime := cloneRuntime(current)
+		runtime.ups = next
+		return runtime
+	})
 }
 
 // Stats reports counters, cache size, and the CN set's range count -- a set
@@ -265,14 +369,19 @@ func (r *Resolver) QueryLog(q string, limit int) []QueryLogEntry {
 
 // Upstreams reports the configured member specs of both groups.
 func (r *Resolver) Upstreams() (china, trust []string) {
-	if u := r.ups.Load(); u != nil {
+	if current := r.snapshot(); current != nil && current.ups != nil {
+		u := current.ups
 		return u.china.Specs(), u.trust.Specs()
 	}
 	return nil, nil
 }
 
 // FlushCache drops every cached answer.
-func (r *Resolver) FlushCache() { r.cache.Flush() }
+func (r *Resolver) FlushCache() {
+	r.updateRuntime(func(current *runtimeSnapshot) *runtimeSnapshot {
+		return cloneRuntime(current)
+	})
+}
 
 // ServeDNS implements D.Handler for the client-facing listeners.
 //
@@ -293,24 +402,21 @@ func (r *Resolver) serve(parent context.Context, w D.ResponseWriter, req *D.Msg)
 		return
 	}
 
-	if r.sem != nil {
-		select {
-		case r.sem <- struct{}{}:
-			defer func() { <-r.sem }()
-		default:
-			r.stats.bump(&r.stats.refused)
-			_ = w.WriteMsg(rcode(req, D.RcodeRefused))
-			return
-		}
+	runtime := r.snapshot()
+	if runtime == nil || !tryAcquire(runtime.clientSem) {
+		r.stats.bump(&r.stats.refused)
+		_ = w.WriteMsg(rcode(req, D.RcodeRefused))
+		return
 	}
+	defer releaseAdmission(runtime.clientSem)
 
-	ctx, cancel := context.WithTimeout(parent, r.timeout)
+	ctx, cancel := context.WithTimeout(parent, runtime.tuning.timeout)
 	defer cancel()
 
 	q := req.Question[0]
 	start := time.Now()
 	var trace trace
-	resp := r.resolve(ctx, q, req, &trace)
+	resp := r.resolveRuntime(ctx, q, req, &trace, runtime)
 
 	r.qlog.add(QueryLogEntry{
 		Time:       start,
@@ -378,6 +484,12 @@ const (
 // no remediation the upstream's rcode would inform.
 var errOriginLookup = errors.New("5gpn/dns: origin lookup failed")
 
+// errOriginAdmission distinguishes load shedding from an upstream lookup
+// failure for in-process callers. Both are recoverable operation failures, but
+// only the former tells a caller that retrying later may make progress without
+// changing DNS configuration.
+var errOriginAdmission = errors.New("5gpn/dns: origin lookup admission full")
+
 // Decision is what the name-only stage concluded, with the attribution a
 // diagnostic needs.
 type Decision struct {
@@ -401,11 +513,18 @@ type Decision struct {
 // conclusion as live resolution by running the same code, not by reimplementing
 // the precedence and drifting from it.
 func (r *Resolver) Decide(name string) Decision {
+	return r.decide(r.snapshot(), name)
+}
+
+func (r *Resolver) decide(runtime *runtimeSnapshot, name string) Decision {
 	name = normalizeDomain(name)
+	if runtime == nil || runtime.policy == nil {
+		return Decision{}
+	}
 
 	var capture *Capture
-	if lookup := r.capture.Load(); lookup != nil {
-		if c, ok := (*lookup)(name); ok {
+	if runtime.capture != nil {
+		if c, ok := runtime.capture(name); ok {
 			capture = &c
 		}
 	}
@@ -419,12 +538,12 @@ func (r *Resolver) Decide(name string) Decision {
 		return Decision{
 			Verdict: Verdict{Verdict: "proxy", Reason: "force-proxy"},
 			action:  actionGateway,
-			policy:  r.policy.Load(),
+			policy:  runtime.policy,
 			Capture: capture,
 		}
 	}
 
-	policy := r.policy.Load()
+	policy := runtime.policy
 	verdict, rule := policy.classify(name)
 	decision := Decision{Verdict: verdict, policy: policy, Capture: capture, Rule: rule}
 
@@ -470,38 +589,44 @@ func (r *Resolver) Decide(name string) Decision {
 // Every other query type is forwarded to trust with the steering-bypass records
 // stripped from all three sections.
 func (r *Resolver) resolve(ctx context.Context, q D.Question, req *D.Msg, t *trace) *D.Msg {
+	return r.resolveRuntime(ctx, q, req, t, r.snapshot())
+}
+
+func (r *Resolver) resolveRuntime(ctx context.Context, q D.Question, req *D.Msg, t *trace, runtime *runtimeSnapshot) *D.Msg {
+	return r.resolveRuntimeDecision(ctx, q, req, t, runtime, nil)
+}
+
+func (r *Resolver) resolveRuntimeDecision(ctx context.Context, q D.Question, req *D.Msg, t *trace, runtime *runtimeSnapshot, preset *Decision) *D.Msg {
+	if runtime == nil || runtime.policy == nil || runtime.ups == nil {
+		return rcode(req, D.RcodeServerFailure)
+	}
 	name := q.Name
 	r.stats.bump(&r.stats.total)
 
 	// Before any upstream: these names do not exist in public DNS.
-	if r.isLocalName(name) {
+	if isLocalName(runtime, name) {
 		if q.Qtype == D.TypeA {
 			t.note(Verdict{Verdict: "direct", Reason: "local-name"})
-			return GatewayReply(req, r.Gateway())
+			return tunedGatewayReply(req, runtime.gateway, runtime.tuning)
 		}
 		t.note(Verdict{Reason: "local-name"})
-		return SyntheticNODATA(req)
+		return tunedSyntheticNODATA(req, runtime.tuning)
 	}
 
-	// Capture the cache epoch BEFORE any runtime snapshot. If a swap lands
-	// anywhere between here and the write, the epoch mismatch discards it.
-	// Loading a snapshot first would let one query combine pre-swap state with
-	// a post-flush epoch and repopulate the new generation with a stale answer.
-	epoch := r.cache.Epoch()
-
-	up := r.ups.Load()
-	if up == nil {
-		// No upstreams published yet. Fail rather than answer from nothing.
-		return rcode(req, D.RcodeServerFailure)
-	}
+	up := runtime.ups
 
 	if WithholdsType(q.Qtype) {
 		t.note(Verdict{Reason: withheldReason(q.Qtype)})
-		return SyntheticNODATA(req)
+		return tunedSyntheticNODATA(req, runtime.tuning)
 	}
 
-	decision := r.Decide(name)
-	scope := flightScope{epoch: epoch, policy: decision.policy, ups: up, action: decision.action}
+	decision := Decision{}
+	if preset != nil {
+		decision = *preset
+	} else {
+		decision = r.decide(runtime, name)
+	}
+	scope := flightScope{runtime: runtime, action: decision.action}
 
 	if decision.action == actionBlock {
 		r.stats.bumpReason(decision.Verdict.Reason)
@@ -515,7 +640,7 @@ func (r *Resolver) resolve(ctx context.Context, q D.Question, req *D.Msg, t *tra
 		t.note(decision.Verdict)
 		if isA {
 			r.stats.bumpReason(decision.Verdict.Reason)
-			return GatewayReply(req, r.Gateway())
+			return tunedGatewayReply(req, runtime.gateway, runtime.tuning)
 		}
 		// Steering is an A-record mechanism; every other type still needs a
 		// real answer.
@@ -533,7 +658,8 @@ func (r *Resolver) resolve(ctx context.Context, q D.Question, req *D.Msg, t *tra
 	}
 
 	key := cacheKeyOf(name, q.Qtype, req)
-	if cached, meta, ok := r.cacheGet(key, req); ok {
+	key.action = decision.action
+	if cached, meta, ok := r.cacheGet(key, req, runtime.generation); ok {
 		if meta.Reason != "" {
 			t.note(Verdict{Verdict: meta.Verdict, Reason: meta.Reason})
 			t.noteUpstream(meta.Upstream)
@@ -551,19 +677,19 @@ func (r *Resolver) resolve(ctx context.Context, q D.Question, req *D.Msg, t *tra
 	resp, info, ok := r.coalesce(ctx, q, req, scope, *t, func(runCtx context.Context, flightReq *D.Msg, ft *trace) *D.Msg {
 		resolved, src, err := arbitrate(runCtx, flightReq, up.china, up.trust, r.cn, r.stats)
 		if err != nil || resolved == nil {
-			return r.staleOrFail(flightReq, key, ft)
+			return r.staleOrFail(flightReq, key, runtime.generation, ft)
 		}
 		ft.noteUpstream(src)
 		resolved = filterSteeringBypass(resolved)
 
 		verdict := declared
 		if rewrite {
-			resolved = r.rewriteA(resolved, flightReq)
-			verdict = r.arbitratedVerdict(resolved)
+			resolved = r.rewriteA(resolved, flightReq, runtime)
+			verdict = r.arbitratedVerdict(resolved, runtime)
 			ft.note(verdict)
 			r.stats.bumpReason(verdict.Reason)
 		}
-		r.cachePut(key, resolved, scope.epoch, cacheMeta{
+		r.cachePut(key, resolved, runtime, cacheMeta{
 			Verdict: verdict.Verdict, Reason: verdict.Reason, Upstream: src,
 		})
 		return resolved
@@ -589,7 +715,11 @@ func (r *Resolver) forwardTrust(ctx context.Context, trust Exchanger, q D.Questi
 		t.reason = "forward-trust"
 	}
 	key := cacheKeyOf(q.Name, q.Qtype, req)
-	if cached, meta, ok := r.cacheGet(key, req); ok {
+	key.action = scope.action
+	if cached, meta, ok := r.cacheGet(key, req, scope.runtime.generation); ok {
+		if scope.action == actionGateway || scope.action == actionArbitrate {
+			cached = filterGatewayAddressDisclosure(cached)
+		}
 		if meta.Reason != "" {
 			t.note(Verdict{Verdict: meta.Verdict, Reason: meta.Reason})
 			t.noteUpstream(meta.Upstream)
@@ -612,11 +742,19 @@ func (r *Resolver) forwardTrust(ctx context.Context, trust Exchanger, q D.Questi
 		}
 		r.stats.bumpTrust(err == nil)
 		if err != nil || resolved == nil {
-			return r.staleOrFail(flightReq, key, ft)
+			return r.staleOrFail(flightReq, key, scope.runtime.generation, ft)
 		}
 		ft.noteUpstream("trust")
-		resolved = filterSteeringBypass(resolved)
-		r.cachePut(key, resolved, scope.epoch, cacheMeta{
+		if scope.action == actionGateway || scope.action == actionArbitrate {
+			// A non-A question can still carry usable origin addresses in ANY
+			// answers or MX/NS/SRV glue. A gateway decision must not disclose
+			// them, and an auto decision must force a separate A lookup so it can
+			// arbitrate the address before returning it.
+			resolved = filterGatewayAddressDisclosure(resolved)
+		} else {
+			resolved = filterSteeringBypass(resolved)
+		}
+		r.cachePut(key, resolved, scope.runtime, cacheMeta{
 			Upstream: "trust", Verdict: ft.verdict, Reason: ft.reason,
 		})
 		return resolved
@@ -630,11 +768,11 @@ func (r *Resolver) forwardTrust(ctx context.Context, trust Exchanger, q D.Questi
 
 // arbitratedVerdict classifies a rewritten answer the way the counters and the
 // query log report it.
-func (r *Resolver) arbitratedVerdict(resp *D.Msg) Verdict {
+func (r *Resolver) arbitratedVerdict(resp *D.Msg, runtime *runtimeSnapshot) Verdict {
 	if resp == nil {
 		return Verdict{}
 	}
-	gateway := r.Gateway()
+	gateway := runtime.gateway
 	seenA := false
 	for _, rr := range resp.Answer {
 		a, ok := rr.(*D.A)
@@ -658,7 +796,7 @@ func (r *Resolver) arbitratedVerdict(resp *D.Msg) Verdict {
 // alternative routes to the same origin, and the gateway is a single
 // destination, so emitting it repeatedly would only make a client retry the
 // same socket.
-func (r *Resolver) rewriteA(resp *D.Msg, req *D.Msg) *D.Msg {
+func (r *Resolver) rewriteA(resp *D.Msg, req *D.Msg, runtime *runtimeSnapshot) *D.Msg {
 	out := new(D.Msg)
 	out.SetReply(req)
 	out.RecursionAvailable = true
@@ -669,7 +807,7 @@ func (r *Resolver) rewriteA(resp *D.Msg, req *D.Msg) *D.Msg {
 	// it were authoritative.
 	out.Rcode = resp.Rcode
 
-	gateway := r.Gateway()
+	gateway := runtime.gateway
 	// With no gateway configured there is nowhere to steer foreign traffic, so
 	// keep every address as-is and degrade to plain split resolution. The
 	// alternative -- substituting an unspecified address for every foreign name
@@ -691,7 +829,7 @@ func (r *Resolver) rewriteA(resp *D.Msg, req *D.Msg) *D.Msg {
 		}
 		if !added {
 			gw := &D.A{Hdr: a.Hdr, A: net.IP(gateway.AsSlice())}
-			gw.Hdr.Ttl = clampTTL(a.Hdr.Ttl, r.ttlMin, r.ttlMax)
+			gw.Hdr.Ttl = clampTTL(a.Hdr.Ttl, runtime.tuning.ttlMin, runtime.tuning.ttlMax)
 			rewritten = append(rewritten, gw)
 			added = true
 		}
@@ -710,21 +848,21 @@ func (r *Resolver) rewriteA(resp *D.Msg, req *D.Msg) *D.Msg {
 		// rewritten keep their signatures.
 		out.Answer = stripDNSSEC(out.Answer)
 		out.Ns = stripDNSSEC(out.Ns)
+		out.AuthenticatedData = false
 	}
 	return out
 }
 
-func (r *Resolver) isLocalName(name string) bool {
-	set := r.localNames.Load()
-	if set == nil || len(*set) == 0 {
+func isLocalName(runtime *runtimeSnapshot, name string) bool {
+	if runtime == nil || len(runtime.localNames) == 0 {
 		return false
 	}
-	_, ok := (*set)[normalizeDomain(name)]
+	_, ok := runtime.localNames[normalizeDomain(name)]
 	return ok
 }
 
-func (r *Resolver) cacheGet(k cacheKey, req *D.Msg) (*D.Msg, cacheMeta, bool) {
-	msg, meta, ok := r.cache.get(k)
+func (r *Resolver) cacheGet(k cacheKey, req *D.Msg, generation uint64) (*D.Msg, cacheMeta, bool) {
+	msg, meta, ok := r.cache.getGeneration(k, generation)
 	if ok {
 		r.stats.bump(&r.stats.cacheHits)
 		adoptRequest(msg, req)
@@ -735,8 +873,8 @@ func (r *Resolver) cacheGet(k cacheKey, req *D.Msg) (*D.Msg, cacheMeta, bool) {
 }
 
 // staleOrFail serves a stale entry when every upstream failed, else SERVFAIL.
-func (r *Resolver) staleOrFail(req *D.Msg, k cacheKey, t *trace) *D.Msg {
-	if stale, meta, ok := r.cache.getStale(k); ok {
+func (r *Resolver) staleOrFail(req *D.Msg, k cacheKey, generation uint64, t *trace) *D.Msg {
+	if stale, meta, ok := r.cache.getStaleGeneration(k, generation); ok {
 		adoptRequest(stale, req)
 		if meta.Reason != "" {
 			t.note(Verdict{Verdict: meta.Verdict, Reason: meta.Reason})
@@ -749,17 +887,23 @@ func (r *Resolver) staleOrFail(req *D.Msg, k cacheKey, t *trace) *D.Msg {
 }
 
 // cachePut stores a successful answer with its TTL clamped.
-func (r *Resolver) cachePut(k cacheKey, resp *D.Msg, epoch uint64, meta cacheMeta) {
-	if resp == nil || resp.Rcode != D.RcodeSuccess {
-		// A failure is not an answer. Caching one turns a transient upstream
-		// problem into a sticky one.
+func (r *Resolver) cachePut(k cacheKey, resp *D.Msg, runtime *runtimeSnapshot, meta cacheMeta) {
+	if resp == nil {
 		return
 	}
-	ttl := r.ttlMin
-	if len(resp.Answer) > 0 {
-		ttl = minAnswerTTL(resp, r.ttlMin, r.ttlMax)
+	// Clamp the first reply as well as its cache lifetime. Otherwise the first
+	// client observes the upstream's original TTL and may not return until long
+	// after TTLMax, while only later cache hits see the configured value. Signed
+	// or AD-authenticated data is never extended beyond the upstream's remaining
+	// validity; raising an authenticated TTL would manufacture freshness.
+	ttl := normalizeResponseTTLs(resp, runtime.tuning.ttlMin, runtime.tuning.ttlMax)
+	if resp.Rcode != D.RcodeSuccess || ttl <= 0 {
+		// A failure is not a cache entry. Caching one turns a transient upstream
+		// problem into a sticky one; normalization above still keeps the first
+		// returned response inside the configured TTL boundary.
+		return
 	}
-	r.cache.put(k, resp, ttl, epoch, meta)
+	r.cache.put(k, resp, ttl, runtime.generation, meta)
 }
 
 // --- single flight -------------------------------------------------------
@@ -773,17 +917,15 @@ type flightKey struct {
 	qclass           uint16
 	dnssecOK         bool
 	checkingDisabled bool
-	epoch            uint64
-	policy           *compiledPolicy
-	ups              *upstreams
+	runtime          *runtimeSnapshot
 	action           action
+	originResolver   string
 }
 
 type flightScope struct {
-	epoch  uint64
-	policy *compiledPolicy
-	ups    *upstreams
-	action action
+	runtime        *runtimeSnapshot
+	action         action
+	originResolver string
 }
 
 type flight struct {
@@ -796,9 +938,9 @@ type flight struct {
 //
 // The shared resolution is detached and carries its own deadline, so a caller
 // that gives up stops waiting without cancelling the work the others are still
-// waiting on. When the map is at capacity the caller resolves independently:
-// capacity pressure must not block unrelated names, and a random-subdomain
-// flood must not turn coalescing into an unbounded map.
+// waiting on. When the map is at capacity a new key fails immediately. Running
+// it independently would turn the bounded map into unbounded upstream work,
+// exactly when a random-subdomain flood has already exhausted the guard.
 func (r *Resolver) coalesce(
 	ctx context.Context,
 	q D.Question,
@@ -818,15 +960,18 @@ func (r *Resolver) coalesce(
 		template.Question = []D.Question{q}
 	}
 
+	runtime := scope.runtime
+	if runtime == nil {
+		runtime = r.snapshot()
+	}
 	key := flightKey{
-		name:     strings.ToLower(D.Fqdn(q.Name)),
-		qtype:    q.Qtype,
-		qclass:   q.Qclass,
-		epoch:    scope.epoch,
-		policy:   scope.policy,
-		ups:      scope.ups,
-		action:   scope.action,
-		dnssecOK: cacheKeyOf(q.Name, q.Qtype, template).dnssecOK,
+		name:           strings.ToLower(D.Fqdn(q.Name)),
+		qtype:          q.Qtype,
+		qclass:         q.Qclass,
+		runtime:        runtime,
+		action:         scope.action,
+		originResolver: scope.originResolver,
+		dnssecOK:       cacheKeyOf(q.Name, q.Qtype, template).dnssecOK,
 	}
 	key.checkingDisabled = template.CheckingDisabled
 
@@ -841,14 +986,16 @@ func (r *Resolver) coalesce(
 	r.flightMu.Unlock()
 
 	if f == nil {
-		info := initial
-		msg := run(ctx, template, &info)
-		return replyFor(msg, req), info, true
+		return nil, initial, false
 	}
 
 	if leader {
 		go func() {
-			runCtx, cancel := context.WithTimeout(context.Background(), r.timeout)
+			timeout := defaultTimeout
+			if runtime != nil {
+				timeout = runtime.tuning.timeout
+			}
+			runCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
 			info := initial
@@ -871,6 +1018,20 @@ func (r *Resolver) coalesce(
 		return nil, initial, false
 	}
 }
+
+func tryAcquire(sem chan struct{}) bool {
+	if sem == nil {
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseAdmission(sem chan struct{}) { <-sem }
 
 func replyFor(msg, req *D.Msg) *D.Msg {
 	if msg == nil {
@@ -927,20 +1088,72 @@ func udpBudget(req *D.Msg) int {
 	return D.MinMsgSize
 }
 
-func minAnswerTTL(m *D.Msg, lo, hi time.Duration) time.Duration {
-	smallest := hi
-	for _, rr := range m.Answer {
-		if t := time.Duration(rr.Header().Ttl) * time.Second; t < smallest {
-			smallest = t
+func normalizeResponseTTLs(m *D.Msg, lo, hi time.Duration) time.Duration {
+	if m == nil {
+		return 0
+	}
+	mayRaise := !m.AuthenticatedData && !containsRRSIG(m)
+	found := false
+	smallest := uint32(0)
+	visit := func(rr D.RR) {
+		if _, ok := rr.(*D.OPT); ok {
+			return
+		}
+		ttl := rr.Header().Ttl
+		if mayRaise {
+			ttl = clampTTL(ttl, lo, hi)
+		} else if maximum := uint32(hi / time.Second); ttl > maximum {
+			ttl = maximum
+		}
+		rr.Header().Ttl = ttl
+		if !found || ttl < smallest {
+			smallest, found = ttl, true
+		}
+		if soa, ok := rr.(*D.SOA); ok {
+			minimum := soa.Minttl
+			if mayRaise {
+				minimum = clampTTL(minimum, lo, hi)
+				soa.Minttl = minimum
+			}
+			if minimum < smallest {
+				smallest = minimum
+			}
 		}
 	}
-	if smallest < lo {
-		return lo
+	for _, section := range [][]D.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range section {
+			visit(rr)
+		}
 	}
-	if smallest > hi {
-		return hi
+	if !found {
+		if !mayRaise {
+			return 0
+		}
+		smallest = uint32(lo / time.Second)
 	}
-	return smallest
+	for _, section := range [][]D.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range section {
+			if _, ok := rr.(*D.OPT); ok {
+				continue
+			}
+			rr.Header().Ttl = smallest
+			if soa, ok := rr.(*D.SOA); ok && mayRaise {
+				soa.Minttl = smallest
+			}
+		}
+	}
+	return time.Duration(smallest) * time.Second
+}
+
+func containsRRSIG(m *D.Msg) bool {
+	for _, section := range [][]D.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range section {
+			if _, ok := rr.(*D.RRSIG); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func clampTTL(v uint32, lo, hi time.Duration) uint32 {

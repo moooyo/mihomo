@@ -61,13 +61,18 @@ func newTestEngine(t *testing.T, document string) *Engine {
 	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := newConfigStore(path)
+	workers, err := newWorkerController()
+	if err != nil {
+		t.Fatalf("newWorkerController: %v", err)
+	}
+	t.Cleanup(func() { _ = workers.Close() })
+	store, err := newConfigStore(path, workers)
 	if err != nil {
 		t.Fatalf("newConfigStore: %v", err)
 	}
 	// Only the store is under test here. Assembling the proxy buys nothing:
 	// every method below reads and writes the document and nothing else.
-	return &Engine{config: store}
+	return &Engine{config: store, workers: workers}
 }
 
 func TestCaptureOwnershipFollowsExecutionOrder(t *testing.T) {
@@ -103,27 +108,14 @@ func TestCaptureOwnershipFollowsExecutionOrder(t *testing.T) {
 	}
 }
 
-func TestOldEmptyEgressBindingsArePersistedAsDirect(t *testing.T) {
-	legacy := strings.ReplaceAll(twoExtensionDocument, ",\n      \"egress_group\": \"DIRECT\"", "")
-	e := newTestEngine(t, legacy)
-	snapshot, err := e.Snapshot()
-	if err != nil {
+func TestStartupRejectsMissingCurrentEgressBindings(t *testing.T) {
+	invalid := strings.ReplaceAll(twoExtensionDocument, ",\n      \"egress_group\": \"DIRECT\"", "")
+	path := filepath.Join(t.TempDir(), "intercept.json")
+	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, module := range snapshot.Modules {
-		if module.EgressGroup != defaultExtensionEgressGroup {
-			t.Fatalf("module %q egress = %q, want DIRECT", module.ID, module.EgressGroup)
-		}
-	}
-	body, err := os.ReadFile(e.config.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(string(body), `"egress_group": "DIRECT"`); got != len(snapshot.Modules) {
-		t.Fatalf("persisted DIRECT bindings = %d, want %d; body=%s", got, len(snapshot.Modules), body)
-	}
-	if e.Revision() != documentRevision(body) {
-		t.Fatalf("revision %q does not name normalized bytes", e.Revision())
+	if _, err := newConfigStore(path); err == nil || !strings.Contains(err.Error(), "egress_group") {
+		t.Fatalf("startup with missing egress bindings returned %v", err)
 	}
 }
 

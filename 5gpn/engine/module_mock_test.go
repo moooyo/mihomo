@@ -217,8 +217,9 @@ func TestModuleBodyReservationsIncludeExactMockBodySize(t *testing.T) {
 				t.Fatalf("request reservation = %d, want %d", got, tc.want)
 			}
 			response := &M.Response{ContentLength: 1}
-			if got := moduleResponseBodyReservation(response, rules); got != tc.want {
-				t.Fatalf("response reservation = %d, want %d", got, tc.want)
+			responseWant := int64(1) + maxModuleHTTPBody + tc.want
+			if got := moduleResponseBodyReservation(response, rules); got != responseWant {
+				t.Fatalf("response reservation = %d, want %d", got, responseWant)
 			}
 			if allocations := testing.AllocsPerRun(100, func() {
 				_ = moduleBodyReservation(request, rules)

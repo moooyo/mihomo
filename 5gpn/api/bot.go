@@ -1,8 +1,6 @@
 package api
 
 import (
-	"encoding/json"
-
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
 	"github.com/metacubex/http"
@@ -52,8 +50,8 @@ func getBot(w http.ResponseWriter, r *http.Request) {
 		unavailable(w, r, "the Telegram bot is not installed")
 		return
 	}
-	_, revision := s.Document()
-	render.JSON(w, r, render.M{"bot": s.View(), "revision": revision})
+	view, revision := s.Snapshot()
+	render.JSON(w, r, render.M{"bot": view, "revision": revision})
 }
 
 type botRequest struct {
@@ -76,7 +74,7 @@ func putBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body botRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+	if err := decodeRequestJSON(r, 64<<10, &body); err != nil {
 		badRequest(w, r, "malformed request body: "+err.Error())
 		return
 	}

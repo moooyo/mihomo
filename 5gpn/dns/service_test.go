@@ -3,6 +3,7 @@ package dns
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -101,6 +102,29 @@ func askOverWire(t *testing.T, addr, name string, qtype uint16) *D.Msg {
 func startService(t *testing.T, upstream string) (*Service, string, string) {
 	t.Helper()
 	dir := t.TempDir()
+	debugAddr := freePort(t)
+	originAddr := freePort(t)
+	seed := DefaultDocument()
+	seed.Listen.DoT = ""
+	seed.Listen.Debug = debugAddr
+	seed.Listen.Origin = originAddr
+	seed.Gateway = "198.51.100.1"
+	seed.Upstreams.China = []string{upstream}
+	seed.Upstreams.Trust = []string{upstream}
+	seed.Policy = Policy{
+		Fallback: FallbackAuto,
+		Rules: []Rule{
+			{ID: "steer", Kind: KindDomainSuffix, Value: "corp.example", Intent: IntentProxy, Enabled: true},
+			{ID: "deny", Kind: KindDomainSuffix, Value: "ads.example", Intent: IntentBlock, Enabled: true},
+		},
+	}
+	raw, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dns.json"), raw, 0o600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
 
 	svc, err := Open(dir)
 	if err != nil {
@@ -112,29 +136,6 @@ func startService(t *testing.T, upstream string) (*Service, string, string) {
 		svc.Shutdown(ctx)
 	})
 
-	debugAddr := freePort(t)
-	originAddr := freePort(t)
-
-	_, revision := svc.Document()
-	_, _, err = svc.Update(revision, func(d Document) (Document, error) {
-		d.Listen.DoT = ""
-		d.Listen.Debug = debugAddr
-		d.Listen.Origin = originAddr
-		d.Gateway = "198.51.100.1"
-		d.Upstreams.China = []string{upstream}
-		d.Upstreams.Trust = []string{upstream}
-		d.Policy = Policy{
-			Fallback: FallbackAuto,
-			Rules: []Rule{
-				{ID: "steer", Kind: KindDomainSuffix, Value: "corp.example", Intent: IntentProxy, Enabled: true},
-				{ID: "deny", Kind: KindDomainSuffix, Value: "ads.example", Intent: IntentBlock, Enabled: true},
-			},
-		}
-		return d, nil
-	})
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
 	if err := svc.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

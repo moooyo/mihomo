@@ -21,6 +21,7 @@ import (
 	"github.com/metacubex/mihomo/5gpn/dns"
 	"github.com/metacubex/mihomo/5gpn/engine"
 	"github.com/metacubex/mihomo/5gpn/location"
+	"github.com/metacubex/mihomo/5gpn/netguard"
 	"github.com/metacubex/mihomo/5gpn/state"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -41,9 +42,9 @@ const (
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
 
-	// Version 5 retains the version-4 reviewed-source and snapshot contract and
-	// adds the authenticated same-origin location search projection.
-	capabilityInterceptionVersion = 5
+	// Version 6 retains the version-5 location-search surface and adds the
+	// stream_id/seq cursor contract for authenticated plugin logs.
+	capabilityInterceptionVersion = 6
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.
@@ -58,13 +59,21 @@ func Start(home string, onFatal func(error)) error {
 	if onFatal == nil {
 		return errors.New("5gpn: a fatal error handler is required")
 	}
+	// A successful rename followed by a failed directory fsync leaves disk and
+	// the immutable in-memory revision unable to agree on what crash recovery
+	// will retain. That is an unrecoverable monolith invariant, so state reports
+	// it at the same process-owner boundary as a critical listener ending.
+	state.SetCommitAmbiguousHandler(onFatal)
 	dir, err := state.Dir(home)
 	if err != nil {
 		return err
 	}
 	stateDir.Store(&dir)
+	// The upstream tunnel cannot import product subpackages. Publish the one
+	// audited address-scope predicate before any engine egress seam is wired.
+	tunnel.SetExtensionEgressAddressPolicy(netguard.IsPubliclyRoutable)
 
-	// The engine cannot open a socket of its own. Both seams are pointed at
+	// The engine cannot open a socket of its own. Its egress seam is pointed at
 	// mihomo's own inner dialer so an intercepted upstream obeys exactly the
 	// rules an ordinary connection would, and shows up in the same connection
 	// table.
@@ -74,10 +83,6 @@ func Start(home string, onFatal func(error)) error {
 	engine.SetUpstreamDialer(func(ctx context.Context, host string, port int, owner string, ownerOnly bool) (net.Conn, error) {
 		return dial.TCP(ctx, host, port, owner, ownerOnly)
 	})
-	engine.SetUpstreamPacketDialer(func(ctx context.Context, host string, port int, owner string, ownerOnly bool) (net.PacketConn, error) {
-		return dial.UDP(ctx, host, port, owner, ownerOnly)
-	})
-
 	api.Advertise(capabilityCoreKey, api.Feature{Version: 1})
 	api.SetLocationSearcher(location.New(func(ctx context.Context, host string, port int) (net.Conn, error) {
 		return dial.SystemTCP(ctx, host, port)
@@ -296,7 +301,10 @@ func StartInterception(configPath string, onFatal func(error)) error {
 	// as "no extensions enabled".
 	advertiseInterceptionCapability(false)
 	api.SetInterceptionEngine(nil)
-	engineRef.Store(nil)
+	previousEngine := engineRef.Swap(nil)
+	if previousEngine != nil {
+		_ = previousEngine.Close()
+	}
 	tunnel.SetTrafficPolicy(nil)
 	tunnel.SetInterceptor(nil)
 	dial.SetTrafficPolicy(nil, nil)
@@ -362,3 +370,12 @@ func Engine() *engine.Engine { return engineRef.Load() }
 // nil. Exported here rather than letting callers reach tunnel directly so the
 // façade stays the single seam.
 func SetInterceptor(i C.Interceptor) { tunnel.SetInterceptor(i) }
+
+// ExtensionWorkerMain enters the hidden one-shot extension worker. The root
+// facade is the only product package main.go imports, preserving the fork's
+// import boundary.
+func ExtensionWorkerMain(args []string) int { return engine.ExtensionWorkerMain(args) }
+
+// ExtensionWorkerCommand returns the exact hidden argv[1] marker. It is a
+// function rather than a duplicated literal so parent and child cannot drift.
+func ExtensionWorkerCommand() string { return engine.ExtensionWorkerCommand }

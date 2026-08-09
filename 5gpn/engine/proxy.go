@@ -6,8 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/metacubex/http"
-	"github.com/metacubex/tls"
 	"io"
 	"log"
 	"net"
@@ -18,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/http"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/quic-go"
-	"github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/tls"
 )
 
 type interceptProxy struct {
@@ -42,14 +40,6 @@ type interceptProxy struct {
 
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
-	http3Slots  chan struct{}
-
-	// The shared QUIC capture listener, started on the first captured datagram
-	// association and kept for the process. See quiccapture.go for why there is
-	// one rather than one per association.
-	quicMu     sync.Mutex
-	quicBridge *quicBridge
-	quicServer *http3.Server
 
 	// The client-facing TLS leg's shared session ticket keys. Every connection
 	// clones a config from these rather than building its own, which is what
@@ -95,7 +85,6 @@ const (
 const (
 	maxIdleUpstreamHTTPConnections        = 64
 	maxIdleUpstreamHTTPConnectionsPerHost = 8
-	maxUpstreamHTTP3Connections           = 64
 	upstreamHTTPIdleTimeout               = 90 * time.Second
 	// The in-process inner dial and the subsequent TLS handshake each use this
 	// ceiling, matching net/http's own DefaultTransport.
@@ -111,6 +100,11 @@ const (
 	// progressing transfer is never truncated.
 	interceptTransferStallTimeout = 90 * time.Second
 	interceptTransferWriteChunk   = 32 << 10
+	// Bound the number of handler goroutines and request/response projections one
+	// client connection can create. Process-wide action and body admission still
+	// apply across connections; this closes the HTTP/2 per-connection multiplier
+	// before those global limits are reached.
+	maxInterceptHTTP2Streams = 32
 	// A reservation is held until its request finishes, so a saturated pool does
 	// not clear inside this window. What the wait buys is the burst that clears in
 	// milliseconds; waiting longer would only pin this request's connection, and
@@ -121,7 +115,6 @@ const (
 	// enough that a retired generation's cache is trivial to drop.
 	upstreamSessionCacheEntries = 64
 
-	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
 	interceptCertificateTrustLogInterval = time.Minute
 	interceptCertificateTrustMessage     = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
 )
@@ -130,21 +123,14 @@ type upstreamTransportGeneration struct {
 	generation uint64
 	projection upstreamTransportProjection
 
-	mu              sync.Mutex
-	httpTransports  map[string]*http.Transport
-	http3Transports map[http3TransportKey]*http3.Transport
-	http3Versions   map[string]quic.Version
-	closed          bool
-	closeOnce       sync.Once
+	mu             sync.Mutex
+	httpTransports map[string]*http.Transport
+	closed         bool
+	closeOnce      sync.Once
 
 	// refs and retired are protected by interceptProxy.transportMu.
 	refs    int
 	retired bool
-}
-
-type http3TransportKey struct {
-	owner   string
-	version quic.Version
 }
 
 type tlsHandshakeErrorReporter struct {
@@ -213,11 +199,11 @@ func (r *tlsHandshakeErrorReporter) report(target, message string) {
 // the selected state directory owns the complete storage path.
 const interceptStoreFile = "store.json"
 
-func newInterceptProxy(config *configStore, certificates *certificateStore, stateDir string) *interceptProxy {
-	scripts := newScriptRuntime(filepath.Join(stateDir, interceptStoreFile))
+func newInterceptProxy(config *configStore, certificates *certificateStore, workers *workerController, stateDir string) *interceptProxy {
+	scripts := newScriptRuntimeWithWorker(workers, nil, filepath.Join(stateDir, interceptStoreFile))
 	return &interceptProxy{
 		config: config, certificates: certificates, scripts: scripts, tlsErrors: newTLSHandshakeErrorReporter(),
-		bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),
+		bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes),
 	}
 }
 
@@ -234,6 +220,7 @@ func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: maxInterceptHTTP2Streams},
 	}
 	err := server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
@@ -260,6 +247,7 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
 		TLSConfig:         tlsConfig,
+		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: maxInterceptHTTP2Streams},
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
 			return context.WithValue(ctx, tlsConnectionPlanContextKey{}, connectionPlan)
 		},
@@ -402,36 +390,6 @@ func mitmTLSNextProtos(http2 bool) []string {
 	return []string{"http/1.1"}
 }
 
-func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn net.PacketConn) error {
-	controlClosed := make(chan struct{})
-	go func() {
-		var one [1]byte
-		_, _ = control.Read(one[:])
-		close(controlClosed)
-	}()
-	discardErr := make(chan error, 1)
-	go func() {
-		buffer := make([]byte, 64<<10)
-		for {
-			if _, _, err := packetConn.ReadFrom(buffer); err != nil {
-				discardErr <- err
-				return
-			}
-		}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil
-	case <-controlClosed:
-		return nil
-	case err := <-discardErr:
-		if errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return err
-	}
-}
-
 func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := canonicalHost(r.Host)
 	cfg, err := p.config.Current()
@@ -501,9 +459,7 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The reservation was taken before the length was known, so an
 		// undeclared-length request reserved everything it was allowed to read.
 		// Now the buffer exists: hold what it actually costs for the round trip
-		// rather than the worst case it might have been. Every HTTP/3 request is
-		// undeclared -- quic-go reports ContentLength -1 unconditionally -- so
-		// without this a plain H3 GET pinned the whole budget end to end.
+		// rather than the worst case it might have been.
 		p.releaseBodySlot(bodyReserved - prepared.bodyBufferBytes)
 		bodyReserved = prepared.bodyBufferBytes
 	}
@@ -696,16 +652,8 @@ func requestHasBodySection(request *http.Request) bool {
 
 func (p *interceptProxy) roundTrip(request *http.Request, cfg Config, owner string) (*http.Response, func(), error) {
 	generation, cleanup := p.acquireUpstreamTransportGeneration(cfg)
-	network := C.TCP
-	if request.ProtoMajor == 3 {
-		network = C.UDP
-	}
-	if err := authorizeProjectedRequest(network, request, generation.projection, owner); err != nil {
+	if err := authorizeProjectedRequest(request, generation.projection, owner); err != nil {
 		return nil, cleanup, err
-	}
-	if request.ProtoMajor == 3 {
-		response, err := p.roundTripHTTP3(request, generation, owner)
-		return response, cleanup, err
 	}
 	transport, err := generation.getHTTPTransport(p, owner)
 	if err != nil {
@@ -715,7 +663,7 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config, owner stri
 	return response, cleanup, err
 }
 
-func authorizeProjectedRequest(network C.NetWork, request *http.Request, projection upstreamTransportProjection, owner string) error {
+func authorizeProjectedRequest(request *http.Request, projection upstreamTransportProjection, owner string) error {
 	if request == nil || request.URL == nil {
 		return errors.New("upstream request target is missing")
 	}
@@ -731,18 +679,16 @@ func authorizeProjectedRequest(network C.NetWork, request *http.Request, project
 	if !permitted {
 		return errors.New("upstream target is outside the active extension allowlist")
 	}
-	_, err := authorizeUpstream(network, target)
+	_, err := authorizeUpstream(C.TCP, target)
 	return err
 }
 
 func newUpstreamTransportGeneration(cfg Config) *upstreamTransportGeneration {
 	projection := newUpstreamTransportProjection(cfg)
 	return &upstreamTransportGeneration{
-		generation:      projection.generation,
-		projection:      projection,
-		httpTransports:  make(map[string]*http.Transport),
-		http3Transports: make(map[http3TransportKey]*http3.Transport, 2),
-		http3Versions:   make(map[string]quic.Version),
+		generation:     projection.generation,
+		projection:     projection,
+		httpTransports: make(map[string]*http.Transport),
 	}
 }
 
@@ -847,36 +793,6 @@ func (generation *upstreamTransportGeneration) getHTTPTransport(p *interceptProx
 	return transport, nil
 }
 
-func (generation *upstreamTransportGeneration) getHTTP3Transport(p *interceptProxy, version quic.Version, owner string) (*http3.Transport, error) {
-	generation.mu.Lock()
-	defer generation.mu.Unlock()
-	if generation.closed {
-		return nil, errors.New("upstream transport generation is closed")
-	}
-	key := http3TransportKey{owner: owner, version: version}
-	if transport := generation.http3Transports[key]; transport != nil {
-		return transport, nil
-	}
-	transport := p.newHTTP3Transport(generation, version, owner)
-	generation.http3Transports[key] = transport
-	return transport, nil
-}
-
-func (generation *upstreamTransportGeneration) preferredHTTP3Version(authority string) quic.Version {
-	generation.mu.Lock()
-	defer generation.mu.Unlock()
-	if version := generation.http3Versions[authority]; version != 0 {
-		return version
-	}
-	return quic.Version1
-}
-
-func (generation *upstreamTransportGeneration) preferHTTP3Version2(authority string) {
-	generation.mu.Lock()
-	generation.http3Versions[authority] = quic.Version2
-	generation.mu.Unlock()
-}
-
 func (generation *upstreamTransportGeneration) closeIdleConnections() {
 	generation.mu.Lock()
 	if generation.closed {
@@ -894,65 +810,6 @@ func (generation *upstreamTransportGeneration) closeIdleConnections() {
 	}
 }
 
-func (generation *upstreamTransportGeneration) closeIdleHTTP3Connections() {
-	generation.mu.Lock()
-	if generation.closed {
-		generation.mu.Unlock()
-		return
-	}
-	transports := make([]*http3.Transport, 0, len(generation.http3Transports))
-	for _, transport := range generation.http3Transports {
-		transports = append(transports, transport)
-	}
-	generation.mu.Unlock()
-	for _, transport := range transports {
-		transport.CloseIdleConnections()
-	}
-}
-
-func (p *interceptProxy) acquireHTTP3ConnectionSlot(ctx context.Context, generation *upstreamTransportGeneration) (chan struct{}, error) {
-	p.transportMu.Lock()
-	if p.http3Slots == nil {
-		p.http3Slots = make(chan struct{}, maxUpstreamHTTP3Connections)
-	}
-	slots := p.http3Slots
-	p.transportMu.Unlock()
-	select {
-	case slots <- struct{}{}:
-		return slots, nil
-	default:
-	}
-
-	// The HTTP/3 transport keeps authority connections alive. Under capacity
-	// pressure, recycle them only when this is the generation's sole request;
-	// otherwise an apparently idle client may still own a streaming body.
-	//
-	// Decide under the lock, act outside it -- the shape acquireUpstreamTransport-
-	// Generation and closeUpstreamTransports already use. closeIdleHTTP3Connections
-	// takes generation.mu itself and snapshots the transports before releasing it,
-	// so it never needed transportMu; holding that process-wide lock across up to
-	// maxUpstreamHTTP3Connections blocking CloseWithError calls stalled every
-	// other request's refcount bump behind a pile of QUIC teardowns.
-	p.transportMu.Lock()
-	soleRequest := generation.refs == 1
-	p.transportMu.Unlock()
-	if !soleRequest {
-		return nil, errors.New("upstream HTTP/3 connection capacity is busy")
-	}
-	generation.closeIdleHTTP3Connections()
-
-	timer := time.NewTimer(upstreamHTTP3RecycleTimeout)
-	defer timer.Stop()
-	select {
-	case slots <- struct{}{}:
-		return slots, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-timer.C:
-		return nil, errors.New("upstream HTTP/3 connection capacity is busy")
-	}
-}
-
 func (generation *upstreamTransportGeneration) close() {
 	generation.closeOnce.Do(func() {
 		generation.mu.Lock()
@@ -961,19 +818,11 @@ func (generation *upstreamTransportGeneration) close() {
 		for _, transport := range generation.httpTransports {
 			httpTransports = append(httpTransports, transport)
 		}
-		http3Transports := make([]*http3.Transport, 0, len(generation.http3Transports))
-		for _, transport := range generation.http3Transports {
-			http3Transports = append(http3Transports, transport)
-		}
 		generation.httpTransports = nil
-		generation.http3Transports = nil
 		generation.mu.Unlock()
 
 		for _, transport := range httpTransports {
 			transport.CloseIdleConnections()
-		}
-		for _, transport := range http3Transports {
-			_ = transport.Close()
 		}
 	})
 }
@@ -1022,142 +871,6 @@ func (p *interceptProxy) newHTTPTransportForProjectionOwner(projection upstreamT
 			return dialUpstream(dialCtx, target)
 		},
 	}
-}
-
-func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGeneration, version quic.Version, owner string) *http3.Transport {
-	return &http3.Transport{
-		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS13,
-			RootCAs:            p.upstreamRoots,
-			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
-		},
-		QUICConfig: &quic.Config{
-			Versions: []quic.Version{version},
-			// No KeepAlivePeriod. A keepalive shorter than MaxIdleTimeout makes
-			// the idle timeout dead code -- the connection is never idle, so it
-			// never closes, so the slot acquireHTTP3ConnectionSlot took is never
-			// released and the 64-connection budget only ever shrinks. The two
-			// settings arrived together in the initial HTTP/3 commit and cancel
-			// each other out.
-			//
-			// Letting the idle timeout govern makes HTTP/3 behave like the
-			// HTTP/1 and HTTP/2 pool, which reclaims on the same 90 seconds
-			// through IdleConnTimeout. The cost is a fresh handshake for an
-			// origin untouched for 90 seconds, which is what the other two
-			// protocols already pay.
-			MaxIdleTimeout: upstreamHTTPIdleTimeout,
-		},
-		Dial: func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
-			host, portText, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
-			}
-			target, permitted := generation.projection.targets.upstreamTarget(host, portText, owner)
-			if !permitted {
-				return nil, errors.New("upstream QUIC target is outside the active extension allowlist")
-			}
-			slots, err := p.acquireHTTP3ConnectionSlot(ctx, generation)
-			if err != nil {
-				return nil, err
-			}
-			releaseSlot := func() { <-slots }
-			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
-			defer cancel()
-			packetConn, err := listenPacketUpstream(dialCtx, target)
-			if err != nil {
-				releaseSlot()
-				return nil, err
-			}
-			quicTransport := &quic.Transport{Conn: packetConn}
-			connection, err := quicTransport.Dial(ctx, target, tlsConfig, quicConfig)
-			if err != nil {
-				_ = quicTransport.Close()
-				_ = packetConn.Close()
-				releaseSlot()
-				return nil, err
-			}
-			go func() {
-				<-connection.Context().Done()
-				_ = quicTransport.Close()
-				_ = packetConn.Close()
-				releaseSlot()
-			}()
-			return connection, nil
-		},
-	}
-}
-
-func (p *interceptProxy) roundTripHTTP3(request *http.Request, generation *upstreamTransportGeneration, owner string) (*http.Response, error) {
-	authority, err := canonicalHTTP3Authority(request)
-	if err != nil {
-		return nil, err
-	}
-	version := generation.preferredHTTP3Version(authority)
-	transport, err := generation.getHTTP3Transport(p, version, owner)
-	if err != nil {
-		return nil, err
-	}
-	response, err := transport.RoundTrip(request)
-	if err == nil || version == quic.Version2 {
-		return response, err
-	}
-	var versionError *quic.VersionNegotiationError
-	if !errors.As(err, &versionError) || !containsQUICVersion(versionError.Theirs, quic.Version2) {
-		return nil, err
-	}
-	if bodyErr := resetHTTP3RequestBodyForReplay(request); bodyErr != nil {
-		return nil, bodyErr
-	}
-	transport, transportErr := generation.getHTTP3Transport(p, quic.Version2, owner)
-	if transportErr != nil {
-		return nil, transportErr
-	}
-	response, err = transport.RoundTrip(request)
-	if err == nil {
-		generation.preferHTTP3Version2(authority)
-	}
-	return response, err
-}
-
-func resetHTTP3RequestBodyForReplay(request *http.Request) error {
-	if !requestHasBodySection(request) {
-		request.Body = nil
-		return nil
-	}
-	if request.GetBody == nil {
-		return errors.New("upstream HTTP/3 request body is not replayable")
-	}
-	body, err := request.GetBody()
-	if err != nil {
-		return err
-	}
-	request.Body = body
-	return nil
-}
-
-func canonicalHTTP3Authority(request *http.Request) (string, error) {
-	if request == nil || request.URL == nil {
-		return "", errors.New("upstream QUIC request URL is missing")
-	}
-	host := canonicalHost(request.URL.Hostname())
-	if host == "" {
-		return "", errors.New("upstream QUIC target is outside the active extension allowlist")
-	}
-	portText := request.URL.Port()
-	if portText == "" {
-		portText = "443"
-	}
-	return net.JoinHostPort(host, portText), nil
-}
-
-func containsQUICVersion(versions []quic.Version, want quic.Version) bool {
-	for _, version := range versions {
-		if version == want {
-			return true
-		}
-	}
-	return false
 }
 
 func readBounded(reader io.Reader, limit int64) ([]byte, error) {
@@ -1362,9 +1075,9 @@ func responseTrailerValues(trailers http.Header, name string) []string {
 	return values
 }
 
-// Neither the HTTP/2 nor the HTTP/3 response writer implements io.ReaderFrom, and
-// no upstream body implements io.WriterTo, so io.Copy would allocate a fresh
-// 32 KiB buffer for every streamed response on those legs. io.CopyBuffer consults
+// The HTTP/2 response writer does not implement io.ReaderFrom, and no upstream
+// body implements io.WriterTo, so io.Copy would allocate a fresh 32 KiB buffer
+// for every streamed response on that leg. io.CopyBuffer consults
 // both interfaces before it looks at the buffer, so the HTTP/1 writer keeps its
 // own ReadFrom fast path and never reaches this pool.
 //

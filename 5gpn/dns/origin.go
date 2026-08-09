@@ -49,12 +49,23 @@ func (o origin) ServeDNS(w D.ResponseWriter, req *D.Msg) {
 		_ = w.WriteMsg(rcode(req, D.RcodeNotImplemented))
 		return
 	}
+	if !tryAcquire(r.originSem) {
+		r.stats.bump(&r.stats.refused)
+		_ = w.WriteMsg(rcode(req, D.RcodeRefused))
+		return
+	}
+	defer releaseAdmission(r.originSem)
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	runtime := r.snapshot()
+	if runtime == nil {
+		_ = w.WriteMsg(rcode(req, D.RcodeServerFailure))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runtime.tuning.timeout)
 	defer cancel()
 
 	q := req.Question[0]
-	resp := r.resolveOrigin(ctx, q, req)
+	resp := r.resolveOriginRuntime(ctx, q, req, runtime)
 	if isUDP(w) {
 		resp.Truncate(udpBudget(req))
 	}
@@ -63,35 +74,50 @@ func (o origin) ServeDNS(w D.ResponseWriter, req *D.Msg) {
 
 // resolveOrigin answers one origin lookup.
 func (r *Resolver) resolveOrigin(ctx context.Context, q D.Question, req *D.Msg) *D.Msg {
+	return r.resolveOriginRuntime(ctx, q, req, r.snapshot())
+}
+
+func (r *Resolver) resolveOriginRuntime(ctx context.Context, q D.Question, req *D.Msg, runtime *runtimeSnapshot) *D.Msg {
+	var capture *Capture
+	if runtime != nil && runtime.capture != nil {
+		if current, ok := runtime.capture(normalizeDomain(q.Name)); ok {
+			capture = &current
+		}
+	}
+	return r.resolveOriginRuntimeCapture(ctx, q, req, runtime, capture)
+}
+
+func (r *Resolver) resolveOriginRuntimeCapture(ctx context.Context, q D.Question, req *D.Msg, runtime *runtimeSnapshot, capture *Capture) *D.Msg {
 	if WithholdsType(q.Qtype) {
+		if runtime != nil {
+			return tunedSyntheticNODATA(req, runtime.tuning)
+		}
 		return SyntheticNODATA(req)
 	}
 
-	epoch := r.cache.Epoch()
-	up := r.ups.Load()
-	if up == nil {
+	if runtime == nil || runtime.ups == nil {
 		return rcode(req, D.RcodeServerFailure)
 	}
+	up := runtime.ups
 
-	name := normalizeDomain(q.Name)
 	// The binding is per capture host and defaults to trust, for every name and
 	// for every extension that did not choose otherwise.
 	upstream := up.trust
 	label := "trust"
-	if lookup := r.capture.Load(); lookup != nil {
-		if c, ok := (*lookup)(name); ok && c.Resolver == "china" {
-			upstream, label = up.china, "china"
-		}
+	if capture != nil && capture.Resolver == "china" {
+		upstream, label = up.china, "china"
 	}
 
 	key := cacheKeyOf(q.Name, q.Qtype, req)
 	key.origin = true
-	if cached, _, ok := r.cache.get(key); ok {
+	key.action = actionOrigin
+	key.originResolver = label
+	if cached, _, ok := r.cache.getGeneration(key, runtime.generation); ok {
 		adoptRequest(cached, req)
 		return cached
 	}
 
-	scope := flightScope{epoch: epoch, policy: r.policy.Load(), ups: up, action: actionOrigin}
+	scope := flightScope{runtime: runtime, action: actionOrigin, originResolver: label}
 	resp, _, ok := r.coalesce(ctx, q, req, scope, trace{}, func(runCtx context.Context, flightReq *D.Msg, ft *trace) *D.Msg {
 		start := time.Now()
 		resolved, err := upstream.Exchange(runCtx, flightReq)
@@ -108,13 +134,13 @@ func (r *Resolver) resolveOrigin(ctx context.Context, q D.Question, req *D.Msg) 
 			r.stats.bumpTrust(err == nil)
 		}
 		if err != nil || resolved == nil {
-			return r.staleOrFail(flightReq, key, ft)
+			return r.staleOrFail(flightReq, key, runtime.generation, ft)
 		}
 		// The same filter as the client path. mihomo consumes this answer to
 		// choose a dial target, so an AAAA arriving as glue is exactly as
 		// effective at putting egress on IPv6 as one in the answer section.
 		resolved = filterSteeringBypass(resolved)
-		r.cachePut(key, resolved, scope.epoch, cacheMeta{Upstream: label})
+		r.cachePut(key, resolved, runtime, cacheMeta{Upstream: label})
 		return resolved
 	})
 	if !ok || resp == nil {
@@ -126,9 +152,19 @@ func (r *Resolver) resolveOrigin(ctx context.Context, q D.Question, req *D.Msg) 
 // OriginResolve is the in-process form of the same lookup, for callers inside
 // this program that hold a hostname and need its addresses.
 func (r *Resolver) OriginResolve(ctx context.Context, host string) ([]string, error) {
+	if !tryAcquire(r.originSem) {
+		r.stats.bump(&r.stats.refused)
+		return nil, errOriginAdmission
+	}
+	defer releaseAdmission(r.originSem)
+	runtime := r.snapshot()
+	if runtime == nil {
+		return nil, errOriginLookup
+	}
+
 	req := new(D.Msg)
 	req.SetQuestion(D.Fqdn(strings.TrimSpace(host)), D.TypeA)
-	resp := r.resolveOrigin(ctx, req.Question[0], req)
+	resp := r.resolveOriginRuntime(ctx, req.Question[0], req, runtime)
 	if resp == nil || resp.Rcode != D.RcodeSuccess {
 		return nil, errOriginLookup
 	}

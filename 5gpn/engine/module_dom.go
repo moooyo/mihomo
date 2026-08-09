@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,8 +25,11 @@ import (
 const (
 	maxDOMDocumentBytes = 8 << 20
 	maxDOMNodes         = 200000
+	maxDOMTreeDepth     = 512
 	maxDOMSelectorBytes = 1024
 )
+
+var errDOMOutputLimit = fmt.Errorf("document output exceeds %d bytes", maxDOMDocumentBytes)
 
 // domDocument owns one parsed tree. Element wrappers are memoized so that
 // identity holds: a script that removes a node it selected earlier, or compares
@@ -82,21 +86,94 @@ func newDOMDocument(vm *goja.Runtime, source string) (*goja.Object, error) {
 		wrapped: make(map[*html.Node]*goja.Object),
 		nodes:   make(map[*goja.Object]*html.Node),
 	}
-	if count := countDOMNodes(root); count > maxDOMNodes {
-		return nil, fmt.Errorf("document has %d nodes, exceeding %d", count, maxDOMNodes)
+	if _, err := inspectDOMTree(root, nil); err != nil {
+		return nil, err
 	}
 	return document.documentObject(), nil
 }
 
-func countDOMNodes(node *html.Node) int {
-	total := 1
-	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		total += countDOMNodes(child)
-		if total > maxDOMNodes {
-			return total
+type domTreeStats struct {
+	nodes int
+	depth int
+}
+
+// inspectDOMTree is the admission boundary for every operation that delegates
+// to a recursive tree walker. The public DOM surface cannot write Node links
+// directly, but guarding here keeps an invalid graph from reaching cascadia or
+// x/net/html even if a later mutation method gets that invariant wrong.
+func inspectDOMTree(root *html.Node, visit func(*html.Node) error) (domTreeStats, error) {
+	if root == nil {
+		return domTreeStats{}, errors.New("document tree has a nil root")
+	}
+	path := make(map[*html.Node]struct{})
+	stats := domTreeStats{}
+	var walk func(*html.Node, int) error
+	walk = func(node *html.Node, depth int) error {
+		if depth > maxDOMTreeDepth {
+			return fmt.Errorf("document tree exceeds %d levels", maxDOMTreeDepth)
+		}
+		if _, exists := path[node]; exists {
+			return errors.New("document tree contains a cycle")
+		}
+		path[node] = struct{}{}
+		defer delete(path, node)
+		stats.nodes++
+		if stats.nodes > maxDOMNodes {
+			return fmt.Errorf("document has more than %d nodes", maxDOMNodes)
+		}
+		if depth > stats.depth {
+			stats.depth = depth
+		}
+		if visit != nil {
+			if err := visit(node); err != nil {
+				return err
+			}
+		}
+		if hasDOMSiblingCycle(node.FirstChild) {
+			return errors.New("document tree contains a sibling cycle")
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if child.Parent != node {
+				return errors.New("document tree contains an invalid parent link")
+			}
+			if err := walk(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(root, 1); err != nil {
+		return domTreeStats{}, err
+	}
+	return stats, nil
+}
+
+func hasDOMSiblingCycle(first *html.Node) bool {
+	slow, fast := first, first
+	for fast != nil && fast.NextSibling != nil {
+		slow = slow.NextSibling
+		fast = fast.NextSibling.NextSibling
+		if slow == fast {
+			return true
 		}
 	}
-	return total
+	return false
+}
+
+func inspectDOMParentChain(node *html.Node) (int, error) {
+	seen := make(map[*html.Node]struct{})
+	depth := 0
+	for current := node; current != nil; current = current.Parent {
+		if _, exists := seen[current]; exists {
+			return 0, errors.New("document parent chain contains a cycle")
+		}
+		seen[current] = struct{}{}
+		depth++
+		if depth > maxDOMTreeDepth {
+			return 0, fmt.Errorf("document parent chain exceeds %d levels", maxDOMTreeDepth)
+		}
+	}
+	return depth, nil
 }
 
 func (d *domDocument) documentObject() *goja.Object {
@@ -116,6 +193,9 @@ func (d *domDocument) documentObject() *goja.Object {
 		// subtree, allocated a goja object for every match and then returned the
 		// first, so probing for one optional node cost as much as collecting every
 		// node that matched.
+		if _, err := inspectDOMTree(d.root, nil); err != nil {
+			panic(d.vm.NewGoError(err))
+		}
 		match := cascadia.Query(d.root, d.compileSelector(call.Argument(0)))
 		if match == nil {
 			return goja.Null()
@@ -139,20 +219,17 @@ func (d *domDocument) documentObject() *goja.Object {
 
 func (d *domDocument) firstElement(tag string) goja.Value {
 	var found *html.Node
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if found != nil {
-			return
-		}
+	stop := errors.New("element found")
+	_, err := inspectDOMTree(d.root, func(node *html.Node) error {
 		if node.Type == html.ElementNode && node.Data == tag {
 			found = node
-			return
+			return stop
 		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
-		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, stop) {
+		panic(d.vm.NewGoError(err))
 	}
-	walk(d.root)
 	if found == nil {
 		return goja.Null()
 	}
@@ -172,6 +249,12 @@ func (d *domDocument) compileSelector(selector goja.Value) cascadia.Selector {
 }
 
 func (d *domDocument) selectAll(scope *html.Node, selector goja.Value) []goja.Value {
+	if _, err := inspectDOMTree(scope, nil); err != nil {
+		panic(d.vm.NewGoError(err))
+	}
+	if _, err := inspectDOMParentChain(scope); err != nil {
+		panic(d.vm.NewGoError(err))
+	}
 	compiled := d.compileSelector(selector)
 	matched := make([]goja.Value, 0)
 	for _, node := range cascadia.QueryAll(scope, compiled) {
@@ -191,10 +274,9 @@ func (d *domDocument) wrap(node *html.Node) *goja.Object {
 
 	_ = object.Set("appendChild", func(call goja.FunctionCall) goja.Value {
 		child := d.nodeOf(call.Argument(0))
-		if child.Parent != nil {
-			child.Parent.RemoveChild(child)
+		if err := appendDOMChild(node, child); err != nil {
+			panic(d.vm.NewTypeError(err.Error()))
 		}
-		node.AppendChild(child)
 		return d.wrap(child)
 	})
 	_ = object.Set("removeChild", func(call goja.FunctionCall) goja.Value {
@@ -242,12 +324,26 @@ func (d *domDocument) wrap(node *html.Node) *goja.Object {
 			return d.wrap(node.Parent)
 		}), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = object.DefineAccessorProperty("textContent",
-		d.vm.ToValue(func(goja.FunctionCall) goja.Value { return d.vm.ToValue(domTextContent(node)) }),
+		d.vm.ToValue(func(goja.FunctionCall) goja.Value {
+			text, err := domTextContent(node)
+			if err != nil {
+				panic(d.vm.NewGoError(err))
+			}
+			return d.vm.ToValue(text)
+		}),
 		d.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+			text := call.Argument(0).String()
+			if len(text) > maxDOMDocumentBytes {
+				panic(d.vm.NewTypeError("textContent exceeds %d bytes", maxDOMDocumentBytes))
+			}
+			textNode := &html.Node{Type: html.TextNode, Data: text}
+			if err := validateDOMAppend(node, textNode); err != nil {
+				panic(d.vm.NewTypeError(err.Error()))
+			}
 			for node.FirstChild != nil {
 				node.RemoveChild(node.FirstChild)
 			}
-			node.AppendChild(&html.Node{Type: html.TextNode, Data: call.Argument(0).String()})
+			node.AppendChild(textNode)
 			return goja.Undefined()
 		}), goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = object.DefineAccessorProperty("outerHTML",
@@ -260,15 +356,11 @@ func (d *domDocument) wrap(node *html.Node) *goja.Object {
 		}), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = object.DefineAccessorProperty("innerHTML",
 		d.vm.ToValue(func(goja.FunctionCall) goja.Value {
-			var builder strings.Builder
-			for child := node.FirstChild; child != nil; child = child.NextSibling {
-				rendered, err := domRender(child)
-				if err != nil {
-					panic(d.vm.NewGoError(err))
-				}
-				builder.WriteString(rendered)
+			rendered, err := domRenderChildren(node)
+			if err != nil {
+				panic(d.vm.NewGoError(err))
 			}
-			return d.vm.ToValue(builder.String())
+			return d.vm.ToValue(rendered)
 		}), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	return object
 }
@@ -288,18 +380,118 @@ func (d *domDocument) nodeOf(value goja.Value) *html.Node {
 	return node
 }
 
-func domTextContent(node *html.Node) string {
-	if node.Type == html.TextNode {
-		return node.Data
+func appendDOMChild(parent, child *html.Node) error {
+	if err := validateDOMAppend(parent, child); err != nil {
+		return err
 	}
-	var builder strings.Builder
-	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		builder.WriteString(domTextContent(child))
+	if child.Parent != nil {
+		child.Parent.RemoveChild(child)
 	}
-	return builder.String()
+	parent.AppendChild(child)
+	return nil
+}
+
+func validateDOMAppend(parent, child *html.Node) error {
+	if parent == child {
+		return errors.New("appendChild cannot append a node to itself")
+	}
+	seen := make(map[*html.Node]struct{})
+	parentDepth := 0
+	for ancestor := parent; ancestor != nil; ancestor = ancestor.Parent {
+		if _, exists := seen[ancestor]; exists {
+			return errors.New("appendChild parent chain contains a cycle")
+		}
+		seen[ancestor] = struct{}{}
+		parentDepth++
+		if parentDepth > maxDOMTreeDepth {
+			return fmt.Errorf("appendChild parent exceeds %d levels", maxDOMTreeDepth)
+		}
+		if ancestor == child {
+			return errors.New("appendChild cannot append an ancestor beneath its descendant")
+		}
+	}
+	childStats, err := inspectDOMTree(child, nil)
+	if err != nil {
+		return fmt.Errorf("appendChild target is invalid: %w", err)
+	}
+	if parentDepth+childStats.depth > maxDOMTreeDepth {
+		return fmt.Errorf("appendChild result would exceed %d levels", maxDOMTreeDepth)
+	}
+	return nil
+}
+
+type domOutput struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (o *domOutput) Write(body []byte) (int, error) {
+	if len(body) > o.limit-o.buffer.Len() {
+		return 0, errDOMOutputLimit
+	}
+	return o.buffer.Write(body)
+}
+
+func (o *domOutput) WriteString(text string) (int, error) {
+	if len(text) > o.limit-o.buffer.Len() {
+		return 0, errDOMOutputLimit
+	}
+	return o.buffer.WriteString(text)
+}
+
+func (o *domOutput) WriteByte(value byte) error {
+	if o.buffer.Len() == o.limit {
+		return errDOMOutputLimit
+	}
+	return o.buffer.WriteByte(value)
+}
+
+func (o *domOutput) String() string {
+	return o.buffer.String()
+}
+
+func domTextContent(node *html.Node) (string, error) {
+	output := domOutput{limit: maxDOMDocumentBytes}
+	if _, err := inspectDOMTree(node, func(current *html.Node) error {
+		if current.Type == html.TextNode {
+			_, err := output.WriteString(current.Data)
+			return err
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return output.String(), nil
 }
 
 func domRender(node *html.Node) (string, error) {
+	if _, err := inspectDOMTree(node, nil); err != nil {
+		return "", err
+	}
+	output := domOutput{limit: maxDOMDocumentBytes}
+	if err := renderDOMNode(&output, node); err != nil {
+		return "", err
+	}
+	return output.String(), nil
+}
+
+func domRenderChildren(node *html.Node) (string, error) {
+	if _, err := inspectDOMTree(node, nil); err != nil {
+		return "", err
+	}
+	output := domOutput{limit: maxDOMDocumentBytes}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if err := renderDOMNode(&output, child); err != nil {
+			return "", err
+		}
+	}
+	return output.String(), nil
+}
+
+func renderDOMNode(output *domOutput, node *html.Node) error {
+	if _, err := inspectDOMParentChain(node); err != nil {
+		return err
+	}
 	if node.Parent != nil && node.Type == html.ElementNode {
 		// html.Render walks siblings for a detached node, so render through a
 		// copy that has none.
@@ -307,9 +499,11 @@ func domRender(node *html.Node) (string, error) {
 		clone.Parent, clone.PrevSibling, clone.NextSibling = nil, nil, nil
 		node = &clone
 	}
-	var builder strings.Builder
-	if err := html.Render(&builder, node); err != nil {
-		return "", errors.New("document could not be serialized")
+	if err := html.Render(output, node); err != nil {
+		if errors.Is(err, errDOMOutputLimit) {
+			return errDOMOutputLimit
+		}
+		return errors.New("document could not be serialized")
 	}
-	return builder.String(), nil
+	return nil
 }

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -150,6 +151,109 @@ func TestNewRefusesAnUnreadableDocument(t *testing.T) {
 	}
 	if _, err := New(path, doc{}); err == nil {
 		t.Fatal("New accepted an unparseable document")
+	}
+}
+
+func TestStrictJSONRejectsAmbiguousInputs(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "unknown field", raw: []byte(`{"hosts":[],"count":0,"coutn":1}`)},
+		{name: "duplicate field", raw: []byte(`{"hosts":[],"count":0,"Count":1}`)},
+		{name: "trailing value", raw: []byte(`{"hosts":[],"count":0} {}`)},
+		{name: "invalid UTF-8", raw: append([]byte(`{"hosts":["`), 0xff, '"', ']', ',', '"', 'c', 'o', 'u', 'n', 't', '"', ':', '0', '}')},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var decoded doc
+			if err := DecodeJSON(bytes.NewReader(test.raw), MaxDocumentBytes, &decoded); err == nil {
+				t.Fatalf("DecodeJSON accepted %q", test.raw)
+			}
+
+			path := filepath.Join(t.TempDir(), "modules.json")
+			if err := os.WriteFile(path, test.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(path, doc{}); err == nil {
+				t.Fatalf("New accepted %q", test.raw)
+			}
+		})
+	}
+}
+
+func TestNewBoundsExistingDocumentSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "modules.json")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(MaxDocumentBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path, doc{}); err == nil {
+		t.Fatal("New accepted an oversized document")
+	}
+}
+
+func TestNewRefusesSymlinkDocument(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{"hosts":[],"count":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "modules.json")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := New(path, doc{}); err == nil {
+		t.Fatal("New followed a symlink document")
+	}
+}
+
+func TestNewRefusesHardLinkedDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "modules.json")
+	if err := os.WriteFile(path, []byte(`{"hosts":[],"count":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(path, filepath.Join(dir, "second-name.json")); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if _, err := New(path, doc{}); err == nil {
+		t.Fatal("New accepted a document with multiple hard links")
+	}
+}
+
+func TestRenameThenDirectorySyncFailureIsCommitAmbiguous(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "doc.json")
+	syncErr := errors.New("directory sync failed")
+	reported := make(chan error, 1)
+	SetCommitAmbiguousHandler(func(err error) { reported <- err })
+	t.Cleanup(func() { SetCommitAmbiguousHandler(nil) })
+
+	err := writeFile(path, []byte(`{"count":1}`), func(string) error { return syncErr })
+	if !errors.Is(err, ErrCommitAmbiguous) || !errors.Is(err, syncErr) {
+		t.Fatalf("writeFile error = %v, want typed commit ambiguity wrapping %v", err, syncErr)
+	}
+	select {
+	case fatalErr := <-reported:
+		if !errors.Is(fatalErr, ErrCommitAmbiguous) {
+			t.Fatalf("fatal report = %v, want ErrCommitAmbiguous", fatalErr)
+		}
+	default:
+		t.Fatal("commit ambiguity did not reach the process-owner handler")
+	}
+	raw, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got, want := string(raw), `{"count":1}`; got != want {
+		t.Fatalf("renamed bytes = %q, want %q", got, want)
 	}
 }
 

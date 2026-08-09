@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -65,13 +66,36 @@ func (b *catalogReviewBarrier) RoundTrip(request *http.Request) (*http.Response,
 	return b.served.RoundTrip(request)
 }
 
-func stubImporter(t *testing.T, served stubFetch) *Importer {
+type catalogRedirectTransport struct {
+	served stubFetch
+	from   string
+	to     string
+}
+
+func (t catalogRedirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.String() != t.from {
+		return t.served.RoundTrip(request)
+	}
+	return &http.Response{
+		StatusCode: http.StatusFound,
+		Body:       io.NopCloser(strings.NewReader("redirect")),
+		Header:     http.Header{"Location": []string{t.to}},
+		Request:    request,
+	}, nil
+}
+
+func stubImporterTransport(t *testing.T, transport http.RoundTripper) *Importer {
 	t.Helper()
-	imp := &Importer{client: &http.Client{Transport: served}, now: time.Now}
+	imp := &Importer{client: &http.Client{Transport: transport, CheckRedirect: redirectPolicy}, now: time.Now}
 	previous := importerRef.Load()
 	SetImporter(imp)
 	t.Cleanup(func() { importerRef.Store(previous) })
 	return imp
+}
+
+func stubImporter(t *testing.T, served stubFetch) *Importer {
+	t.Helper()
+	return stubImporterTransport(t, served)
 }
 
 const catalogIndexURL = "https://catalog.example.com/index.json"
@@ -96,8 +120,7 @@ func catalogIndexJSON(t *testing.T, capabilities string, digest string) string {
       "tags": ["testing"],
       "license": {"spdx": "MIT"},
       "manifest": {"url": %q, "sha256": %q, "size": 1234},
-      "resources": [],
-      "policy": {"clientRules": 4, "policyRules": 0, "captureRules": 4, "digest": "beef"},
+      "futurePublisherMetadata": {"reviewHint": "newer-core-only"},
       "capabilities": %s
     }
   ]
@@ -116,10 +139,9 @@ const honestCapabilities = `{
         "routingRuleCount": 1
       }`
 
-// The published index carries fields this build does not use -- a `policy`
-// projection of the retired overlay compiler. Rejecting unknown fields is what made the
-// previous implementation refuse whole catalogs whenever a publisher added
-// something for a newer core, so the decode ignores them.
+// A publisher may add metadata for a newer core. Rejecting that generic field
+// would hide every otherwise usable entry from older gateways, so catalog
+// decoding remains lenient while review trusts only the fields it understands.
 func TestACatalogWithFieldsThisBuildDoesNotUseStillDecodes(t *testing.T) {
 	imp := stubImporter(t, stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")})
 
@@ -138,32 +160,25 @@ func TestACatalogWithFieldsThisBuildDoesNotUseStillDecodes(t *testing.T) {
 	}
 }
 
-// One malformed listing must not hide every other extension a publisher offers,
-// so a bad entry is dropped rather than failing the catalog.
-func TestUnusableEntriesAreDroppedRatherThanFailingTheCatalog(t *testing.T) {
+// A partially usable response is not a complete snapshot. Publishing only the
+// good prefix would make a malformed entry look deleted, so the whole fetch is
+// rejected and the cache layer can retain its prior complete index.
+func TestAPartialCatalogIsRejectedRatherThanPublished(t *testing.T) {
 	index := `{
   "apiVersion": "5gpn.io/marketplace/v1",
   "kind": "ExtensionMarketplace",
   "metadata": {"id": "io.5gpn.official"},
   "entries": [
-    {"id": "Bad Id", "manifest": {"url": "https://catalog.example.com/a.yaml", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-    {"id": "insecure.plugin", "manifest": {"url": "http://catalog.example.com/b.yaml", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
-    {"id": "short-digest.plugin", "manifest": {"url": "https://catalog.example.com/short.yaml", "sha256": "cc"}},
     {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/c.yaml", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
-    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/d.yaml", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
+    {"id": "bad.plugin", "manifest": {"url": "https://catalog.example.com/b.yaml", "sha256": "short"}}
   ]
 }`
 	imp := stubImporter(t, stubFetch{catalogIndexURL: index})
 
-	decoded, err := imp.catalog(context.Background(), catalogIndexURL)
-	if err != nil {
-		t.Fatalf("catalog: %v", err)
-	}
-	if len(decoded.Entries) != 1 || decoded.Entries[0].ID != "good.plugin" {
-		t.Fatalf("kept %+v, want only good.plugin", decoded.Entries)
-	}
-	if decoded.Entries[0].Manifest.URL != "https://catalog.example.com/c.yaml" {
-		t.Errorf("the duplicate replaced the first entry: %q", decoded.Entries[0].Manifest.URL)
+	if _, err := imp.catalog(context.Background(), catalogIndexURL); err == nil {
+		t.Fatal("a partially valid catalog replaced the complete snapshot")
+	} else if !strings.Contains(err.Error(), "bad.plugin") {
+		t.Fatalf("partial-catalog error did not identify the bad entry: %v", err)
 	}
 }
 
@@ -345,9 +360,8 @@ func TestAnEntryWhoseDigestDoesNotMatchIsRefused(t *testing.T) {
 	}
 }
 
-func TestCatalogReviewDoesNotAuditExternalScriptResources(t *testing.T) {
+func TestCatalogReviewTreatsExternalScriptsAsLiveSnapshotDependencies(t *testing.T) {
 	const scriptURL = "https://scripts.example.com/action.js"
-	const scriptBody = "function transform(context) { return {}; }"
 	externalManifest := strings.Replace(
 		validManifest,
 		`inline: "function transform(context) { return {}; }"`,
@@ -358,17 +372,28 @@ func TestCatalogReviewDoesNotAuditExternalScriptResources(t *testing.T) {
 		t.Fatal("the fixture did not replace the inline script")
 	}
 	index := catalogIndexJSON(t, honestCapabilities, digestText(externalManifest))
-	index = strings.Replace(index, `"resources": []`,
-		`"resources": [{"path":"action.js","url":"https://scripts.example.com/action.js","sha256":"deadbeef","size":1}]`, 1)
-	stubImporter(t, stubFetch{
+	served := stubFetch{
 		catalogIndexURL:    index,
 		catalogManifestURL: externalManifest,
-		scriptURL:          scriptBody,
-	})
+		scriptURL:          "function transform(context) { return {}; }",
+	}
+	stubImporter(t, served)
 	e := catalogTestEngine(t)
 
-	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err != nil {
-		t.Fatalf("live external script bytes were audited against catalog resources: %v", err)
+	first, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	if err != nil {
+		t.Fatalf("first live script review: %v", err)
+	}
+	served[scriptURL] = "function transform(context) { return {headers: {set: {\"X-Live\": \"changed\"}}}; }"
+	second, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	if err != nil {
+		t.Fatalf("second live script review: %v", err)
+	}
+	if first.Detail.SourceDigest != second.Detail.SourceDigest {
+		t.Fatal("unchanged manifest bytes produced different manifest digests")
+	}
+	if first.Digest == second.Digest {
+		t.Fatal("changed live script bytes did not change the complete snapshot digest")
 	}
 }
 
@@ -453,6 +478,121 @@ func TestAnUnreachableCatalogIsReportedRatherThanFailingTheList(t *testing.T) {
 	if len(view.Sources) != 1 || view.Sources[0].Error == "" {
 		t.Fatalf("the unreachable source was not reported: %+v", view.Sources)
 	}
+	if view.Sources[0].FetchedAt != "" || len(view.Sources[0].Entries) != 0 {
+		t.Fatalf("a source that never succeeded invented a snapshot: %+v", view.Sources[0])
+	}
+}
+
+func TestFailedCatalogRefreshRetainsTheLastCompleteSnapshot(t *testing.T) {
+	partial := `{
+  "apiVersion": "5gpn.io/marketplace/v1",
+  "kind": "ExtensionMarketplace",
+  "metadata": {"id": "io.5gpn.official", "name": "Broken replacement"},
+  "entries": [
+    {"id": "good.plugin", "manifest": {"url": "https://catalog.example.com/good.yaml", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"id": "bad.plugin", "manifest": {"url": "https://catalog.example.com/bad.yaml", "sha256": "short"}}
+  ]
+}`
+	for name, breakFetch := range map[string]func(stubFetch){
+		"network failure": func(served stubFetch) { delete(served, catalogIndexURL) },
+		"JSON failure":    func(served stubFetch) { served[catalogIndexURL] = `{"apiVersion":` },
+		"duplicate field": func(served stubFetch) {
+			served[catalogIndexURL] = strings.Replace(
+				served[catalogIndexURL],
+				`"kind": "ExtensionMarketplace"`,
+				`"kind": "ExtensionMarketplace", "kind": "ExtensionMarketplace"`,
+				1,
+			)
+		},
+		"missing entries": func(served stubFetch) {
+			served[catalogIndexURL] = `{"apiVersion":"5gpn.io/marketplace/v1","kind":"ExtensionMarketplace","metadata":{}}`
+		},
+		"partial index": func(served stubFetch) { served[catalogIndexURL] = partial },
+	} {
+		t.Run(name, func(t *testing.T) {
+			served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+			stubImporter(t, served)
+			e := catalogTestEngine(t)
+
+			before, err := e.Catalog(context.Background(), false)
+			if err != nil {
+				t.Fatalf("initial catalog: %v", err)
+			}
+			if len(before.Sources) != 1 || len(before.Sources[0].Entries) != 1 || before.Sources[0].Error != "" {
+				t.Fatalf("initial complete snapshot = %+v", before.Sources)
+			}
+			breakFetch(served)
+
+			after, err := e.Catalog(context.Background(), true)
+			if err != nil {
+				t.Fatalf("failed refresh broke the complete listing: %v", err)
+			}
+			if len(after.Sources) != 1 || after.Sources[0].Error == "" {
+				t.Fatalf("failed refresh did not report its source error: %+v", after.Sources)
+			}
+			got := after.Sources[0]
+			want := before.Sources[0]
+			if got.FetchedAt != want.FetchedAt || got.Metadata != want.Metadata || len(got.Entries) != 1 || got.Entries[0].ID != want.Entries[0].ID {
+				t.Fatalf("failed refresh replaced prior snapshot:\n got %+v\nwant %+v plus error", got, want)
+			}
+		})
+	}
+}
+
+func TestExpiredCatalogSurvivesARefreshFailure(t *testing.T) {
+	served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+	stubImporter(t, served)
+	e := catalogTestEngine(t)
+	if _, err := e.Catalog(context.Background(), false); err != nil {
+		t.Fatalf("initial catalog: %v", err)
+	}
+
+	e.catalogs.mu.Lock()
+	retained := e.catalogs.entries[catalogIndexURL]
+	retained.fetchedAt = time.Now().Add(-catalogCacheTTL - time.Minute)
+	wantFetchedAt := retained.fetchedAt.UTC().Format(time.RFC3339)
+	e.catalogs.entries[catalogIndexURL] = retained
+	e.catalogs.mu.Unlock()
+	delete(served, catalogIndexURL)
+
+	view, err := e.Catalog(context.Background(), false)
+	if err != nil {
+		t.Fatalf("expired refresh failure broke the listing: %v", err)
+	}
+	if len(view.Sources) != 1 || view.Sources[0].Error == "" || len(view.Sources[0].Entries) != 1 || view.Sources[0].Entries[0].ID != "example.plugin" {
+		t.Fatalf("expired snapshot was treated as deleted: %+v", view.Sources)
+	}
+	if view.Sources[0].FetchedAt != wantFetchedAt {
+		t.Fatalf("expired snapshot fetched_at = %q, want retained %q", view.Sources[0].FetchedAt, wantFetchedAt)
+	}
+}
+
+func TestSuccessfulCatalogRefreshAtomicallyReplacesTheSnapshot(t *testing.T) {
+	served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+	stubImporter(t, served)
+	e := catalogTestEngine(t)
+	if _, err := e.Catalog(context.Background(), false); err != nil {
+		t.Fatalf("initial catalog: %v", err)
+	}
+	served[catalogIndexURL] = strings.Replace(
+		catalogIndexJSON(t, honestCapabilities, ""),
+		`"id": "example.plugin"`, `"id": "next.plugin"`, 1,
+	)
+
+	refreshed, err := e.Catalog(context.Background(), true)
+	if err != nil {
+		t.Fatalf("successful refresh: %v", err)
+	}
+	if len(refreshed.Sources) != 1 || refreshed.Sources[0].Error != "" || len(refreshed.Sources[0].Entries) != 1 || refreshed.Sources[0].Entries[0].ID != "next.plugin" {
+		t.Fatalf("successful refresh did not replace the complete snapshot: %+v", refreshed.Sources)
+	}
+	cached, err := e.Catalog(context.Background(), false)
+	if err != nil {
+		t.Fatalf("read refreshed cache: %v", err)
+	}
+	if len(cached.Sources[0].Entries) != 1 || cached.Sources[0].Entries[0].ID != "next.plugin" {
+		t.Fatalf("cache retained the superseded snapshot: %+v", cached.Sources)
+	}
 }
 
 func TestCatalogSourcesAreValidatedBeforeTheyAreStored(t *testing.T) {
@@ -477,31 +617,46 @@ func TestCatalogSourcesAreValidatedBeforeTheyAreStored(t *testing.T) {
 	}
 }
 
-// The seeded document has to survive its own decode, catalog included.
-func TestTheSeededCatalogValidates(t *testing.T) {
-	if err := validateCatalogs(DefaultDocument().Catalogs); err != nil {
-		t.Fatalf("the seeded catalog does not validate: %v", err)
+// A fresh gateway must not contact a marketplace the operator did not choose.
+// The non-nil empty slice is also part of the wire contract: Console iterates
+// it directly and must receive `[]`, not `null`.
+func TestFreshDocumentHasNoCatalogSources(t *testing.T) {
+	document := DefaultDocument()
+	if document.Catalogs == nil || len(document.Catalogs) != 0 {
+		t.Fatalf("fresh catalogs = %#v, want a non-nil empty list", document.Catalogs)
+	}
+	cloned := cloneConfig(document)
+	if cloned.Catalogs == nil || len(cloned.Catalogs) != 0 {
+		t.Fatalf("cloned fresh catalogs = %#v, want a non-nil empty list", cloned.Catalogs)
+	}
+	if err := validateCatalogs(document.Catalogs); err != nil {
+		t.Fatalf("the empty catalog list does not validate: %v", err)
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"catalogs":[]`) {
+		t.Fatalf("fresh document did not publish an empty catalog list: %s", raw)
 	}
 }
 
-// The fixture is the first-party index as published, fetched from the URL the
-// seeded document names.
-//
-// Every other test here decodes a shape this file also wrote, which proves the
-// decoder agrees with itself. This one proves it agrees with the catalog the
-// gateway will actually fetch on its first day -- including the two fields the
-// publisher emits and this build ignores, `resources` and the retired `policy`
-// projection. Refresh it from officialCatalogURL when the published shape moves.
-func TestTheFirstPartyIndexAsPublishedDecodes(t *testing.T) {
+// The wire-shaped fixture contains generic metadata this build does not
+// consume. It proves forward-compatible fields do not hide the manifest and
+// capability claims this core does verify.
+func TestAForwardCompatibleIndexDecodes(t *testing.T) {
 	published, err := os.ReadFile(filepath.Join("testdata", "marketplace-index.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	imp := stubImporter(t, stubFetch{officialCatalogURL: string(published)})
+	if !bytes.Contains(published, []byte(`"futurePublisherMetadata"`)) {
+		t.Fatal("the fixture no longer exercises a generic unknown field")
+	}
+	imp := stubImporter(t, stubFetch{catalogIndexURL: string(published)})
 
-	index, err := imp.catalog(context.Background(), officialCatalogURL)
+	index, err := imp.catalog(context.Background(), catalogIndexURL)
 	if err != nil {
-		t.Fatalf("the published first-party index did not decode: %v", err)
+		t.Fatalf("the forward-compatible index did not decode: %v", err)
 	}
 	if index.Metadata.ID == "" || len(index.Entries) == 0 {
 		t.Fatalf("decoded an empty catalog: %+v", index.Metadata)
@@ -525,48 +680,7 @@ func TestTheFirstPartyIndexAsPublishedDecodes(t *testing.T) {
 	}
 }
 
-// A document written by the build before HTTP/3 capture still opens.
-//
-// Renaming quic_fallback_protection to http3 made DisallowUnknownFields refuse
-// every deployed gateway's intercept.json at once -- and refusing it is a
-// warning, not a fatal, so the gateway came up resolving and forwarding with
-// interception silently absent. That is the worst shape a failure can have.
-//
-// The strictness is not relaxed. A typo in a hand-edited document must still be
-// refused; a key this program itself retired is not a typo.
-func TestADocumentFromBeforeTheHTTP3RenameStillOpens(t *testing.T) {
-	body := []byte(`{
-  "version": 6,
-  "execution_order": [],
-  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
-  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": true, "http2": true, "quic_fallback_protection": true}
-}`)
-	cfg, err := decodeConfig(body)
-	if err != nil {
-		t.Fatalf("a pre-rename document was refused: %v", err)
-	}
-	if !cfg.MITM.Enabled || !cfg.MITM.HTTP2 {
-		t.Errorf("the operator's settings did not survive: %+v", cfg.MITM)
-	}
-	// Dropped, never mapped: an operator who had "fallback protection" on has
-	// not thereby asked for QUIC to be terminated here.
-	if cfg.MITM.HTTP3 {
-		t.Error("the retired flag was mapped onto http3 instead of being dropped")
-	}
-	// And it does not come back on the next write.
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "quic_fallback_protection") {
-		t.Errorf("the retired key was re-emitted: %s", raw)
-	}
-}
-
-// The strictness that made the rename dangerous is what catches a typo, so it
-// has to survive the fix.
-func TestAnUnknownFieldThatIsNotRetiredIsStillRefused(t *testing.T) {
+func TestAnUnknownFieldIsRefused(t *testing.T) {
 	body := []byte(`{
   "version": 6,
   "execution_order": [],
@@ -579,23 +693,22 @@ func TestAnUnknownFieldThatIsNotRetiredIsStillRefused(t *testing.T) {
 	}
 }
 
-// A document with nothing retired in it must be passed through untouched, or
-// every gateway's revision would move for no reason on first read.
-func TestAnOrdinaryDocumentIsNotRewritten(t *testing.T) {
-	body := []byte(`{"mitm": {"enabled": true}}`)
-	out, err := dropRetiredFields(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(out) != string(body) {
-		t.Errorf("an ordinary document was rewritten:\n got %s\nwant %s", out, body)
+func TestRetiredQUICFallbackProtectionIsRefused(t *testing.T) {
+	body := []byte(`{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": true, "http2": true, "quic_fallback_protection": true}
+}`)
+	if _, err := decodeConfig(body); err == nil {
+		t.Fatal("retired quic_fallback_protection key was accepted")
 	}
 }
 
-// A document written before catalogs existed has no key at all. Seeding the
-// default there is what stops extension discovery from shipping dark on every
-// gateway that was already installed.
-func TestADocumentWithNoCatalogKeySeedsTheDefault(t *testing.T) {
+// A missing key authorizes no implicit publisher. It is normalized to a
+// non-nil empty list so the next write persists the current contract.
+func TestADocumentWithNoCatalogKeyStaysOffline(t *testing.T) {
 	body := []byte(`{
   "version": 6,
   "execution_order": [],
@@ -607,14 +720,21 @@ func TestADocumentWithNoCatalogKeySeedsTheDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Catalogs) != 1 || cfg.Catalogs[0].ID != officialCatalogID {
-		t.Fatalf("an upgraded document did not get the default catalog: %+v", cfg.Catalogs)
+	if cfg.Catalogs == nil || len(cfg.Catalogs) != 0 {
+		t.Fatalf("an absent catalog key authorized a source: %#v", cfg.Catalogs)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"catalogs":[]`) {
+		t.Fatalf("an absent catalog key did not normalize to an empty list: %s", raw)
 	}
 }
 
 // An operator who removed every catalog decided something, and that decision
-// has to survive a restart. It is why the field is not omitempty: `[]` must
-// round-trip as distinct from an absent key.
+// has to survive a restart. The field is not omitempty because `[]` must remain
+// the explicit current wire shape.
 func TestAnExplicitlyEmptyCatalogListIsNotReseeded(t *testing.T) {
 	body := []byte(`{
   "version": 6,
@@ -637,6 +757,31 @@ func TestAnExplicitlyEmptyCatalogListIsNotReseeded(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"catalogs":[]`) {
 		t.Errorf("an empty list did not survive the write: %s", raw)
+	}
+}
+
+func TestAnEmptyCatalogListSurvivesAManagementWrite(t *testing.T) {
+	e := newTestEngine(t, `{
+  "version": 6,
+  "execution_order": [],
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "mitm": {"enabled": false, "http2": true, "http3": false},
+  "catalogs": []
+}`)
+	if _, _, err := e.SetCatalogSources(e.Revision(), []CatalogSource{}); err != nil {
+		t.Fatalf("SetCatalogSources: %v", err)
+	}
+	document, _ := e.ReadDocument()
+	if document.Catalogs == nil || len(document.Catalogs) != 0 {
+		t.Fatalf("management write collapsed catalogs to %#v", document.Catalogs)
+	}
+	raw, err := os.ReadFile(e.config.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"catalogs": []`)) {
+		t.Fatalf("management write persisted catalogs in a non-array shape: %s", raw)
 	}
 }
 
@@ -732,6 +877,52 @@ func TestACatalogUpdateBindsTheReviewedManifestURL(t *testing.T) {
 	after, afterRevision := e.ReadDocument()
 	if afterRevision != revision || after.Modules[0].Source.URL != oldURL {
 		t.Fatalf("stale review changed revision/source to %q/%q", afterRevision, after.Modules[0].Source.URL)
+	}
+}
+
+func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
+	const (
+		oldURL   = "https://elsewhere.example.com/example.yaml"
+		finalURL = "https://cdn.example.com/example.yaml"
+	)
+	served := stubFetch{
+		catalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		finalURL:        validManifest,
+		oldURL:          validManifest,
+	}
+	stubImporterTransport(t, catalogRedirectTransport{
+		served: served,
+		from:   catalogManifestURL,
+		to:     finalURL,
+	})
+	e := catalogTestEngine(t)
+	revision := installFromCatalog(t, e, oldURL)
+	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
+		context.Background(), "io.5gpn.official", "example.plugin",
+	)
+	if err != nil {
+		t.Fatalf("ReviewCatalogEntryView: %v", err)
+	}
+	if reviewedURL != catalogManifestURL {
+		t.Fatalf("reviewed URL = %q, want selected entry URL %q", reviewedURL, catalogManifestURL)
+	}
+	if candidate.Detail.SourceURL != finalURL {
+		t.Fatalf("candidate source URL = %q, want redirect target %q", candidate.Detail.SourceURL, finalURL)
+	}
+	if _, _, err := e.ApplyCatalogUpdate(
+		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin",
+		candidate.Detail.SourceURL, candidate.Digest,
+	); !errors.Is(err, ErrReviewConflict) {
+		t.Fatalf("redirect target apply error = %v, want review conflict", err)
+	}
+	if current := e.Revision(); current != revision {
+		t.Fatalf("wrong reviewed URL changed revision to %q, want %q", current, revision)
+	}
+	if _, _, err := e.ApplyCatalogUpdate(
+		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin",
+		reviewedURL, candidate.Digest,
+	); err != nil {
+		t.Fatalf("apply with reviewed entry URL: %v", err)
 	}
 }
 

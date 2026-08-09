@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -93,7 +92,7 @@ func putDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body dnsWriteRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil {
+	if err := decodeRequestJSON(r, 4<<20, &body); err != nil {
 		badRequest(w, r, "malformed request body: "+err.Error())
 		return
 	}

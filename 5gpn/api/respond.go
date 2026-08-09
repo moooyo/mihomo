@@ -6,6 +6,7 @@ import (
 
 	"github.com/metacubex/chi/render"
 	"github.com/metacubex/http"
+	"github.com/metacubex/mihomo/5gpn/state"
 )
 
 // Small shared response shapes, so every route says the same thing the same way
@@ -14,6 +15,13 @@ import (
 func badRequest(w http.ResponseWriter, r *http.Request, message string) {
 	render.Status(r, http.StatusBadRequest)
 	render.JSON(w, r, render.M{"message": message})
+}
+
+// decodeRequestJSON gives every controller write the same bounded, strict JSON
+// semantics as a durable state document: one UTF-8 value, no duplicate or
+// unknown fields, and no trailing payload.
+func decodeRequestJSON(r *http.Request, maxBytes int64, dst any) error {
+	return state.DecodeJSON(r.Body, maxBytes, dst)
 }
 
 // unavailable is for a subsystem that is not installed, which is deliberately

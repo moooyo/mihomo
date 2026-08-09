@@ -28,9 +28,9 @@ const (
 // it is off, and those must not be the same thing — one is a gateway to
 // investigate and the other is a gateway working as configured.
 //
-// The first-party catalog is seeded because discovery has to work before an
-// operator knows a URL to type; it is a default they can disable or remove, and
-// it grants nothing on its own.
+// No marketplace is seeded. Fetching one is an outbound trust decision, so an
+// authenticated operator explicitly adds every catalog source through the
+// Console before discovery performs any network request.
 func DefaultDocument() Config {
 	return Config{
 		Version:        configVersion,

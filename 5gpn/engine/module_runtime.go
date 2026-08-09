@@ -21,13 +21,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
 )
-
-func init() {
-	regexp2.DefaultMatchTimeout = 250 * time.Millisecond
-}
 
 type scriptRuntime struct {
 	persistent        atomic.Pointer[persistentSnapshot]
@@ -36,7 +31,13 @@ type scriptRuntime struct {
 	persistPersistent func(*persistentSnapshot) error
 	statePath         string
 	networkSlots      chan struct{}
+	actionAdmission   *moduleActionAdmission
 	logs              engineLogPublisher
+	worker            *workerController
+	// workerClient is non-nil only in the hidden one-shot child. It owns the
+	// bounded callback channel back to the parent; no production parent runtime
+	// ever executes guest code through this field.
+	workerClient *workerRPCClient
 }
 
 // persistentSnapshot and every map reachable from it are immutable after
@@ -99,16 +100,98 @@ const (
 	// that rewrites an identical value, a delete of a missing key and a clear of
 	// an empty bucket all short-circuit before any I/O and cost nothing.
 	maxPersistentCommitsPerAction = 32
+
+	// A fresh VM is required for every script action. The global limit bounds the
+	// process-wide VM and action working set, while the lower per-extension limit
+	// leaves capacity for other extensions when one capture host receives a burst.
+	// Admission never queues: an HTTP/2 peer must not turn the action timeout into
+	// an unbounded collection of waiting handler goroutines.
+	maxConcurrentModuleActions             = int(workerMaximumProcesses)
+	maxConcurrentModuleActionsPerExtension = 1
 )
+
+var errModuleActionCapacity = ErrWorkerCapacity
+
+// moduleActionAdmission atomically enforces the process and extension limits.
+// A mutex, rather than two independent channel semaphores, makes acquisition
+// all-or-nothing: a request rejected by the global limit never strands one of
+// its extension's slots, and vice versa.
+type moduleActionAdmission struct {
+	mu             sync.Mutex
+	globalLimit    int
+	perModuleLimit int
+	globalUsed     int
+	perModuleUsed  map[string]int
+}
+
+type moduleActionLease struct {
+	admission *moduleActionAdmission
+	moduleID  string
+	once      sync.Once
+}
+
+func newModuleActionAdmission(globalLimit, perModuleLimit int) *moduleActionAdmission {
+	return &moduleActionAdmission{
+		globalLimit:    globalLimit,
+		perModuleLimit: perModuleLimit,
+		perModuleUsed:  make(map[string]int),
+	}
+}
+
+func (a *moduleActionAdmission) acquire(ctx context.Context, moduleID string) (*moduleActionLease, error) {
+	if a == nil {
+		return &moduleActionLease{}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if a.globalLimit <= 0 || a.perModuleLimit <= 0 ||
+		a.globalUsed >= a.globalLimit || a.perModuleUsed[moduleID] >= a.perModuleLimit {
+		return nil, errModuleActionCapacity
+	}
+	a.globalUsed++
+	a.perModuleUsed[moduleID]++
+	return &moduleActionLease{admission: a, moduleID: moduleID}, nil
+}
+
+func (l *moduleActionLease) release() {
+	if l == nil || l.admission == nil {
+		return
+	}
+	l.once.Do(func() {
+		a := l.admission
+		a.mu.Lock()
+		if a.globalUsed > 0 {
+			a.globalUsed--
+		}
+		if used := a.perModuleUsed[l.moduleID]; used <= 1 {
+			delete(a.perModuleUsed, l.moduleID)
+		} else {
+			a.perModuleUsed[l.moduleID] = used - 1
+		}
+		a.mu.Unlock()
+	})
+}
 
 func newScriptRuntime(statePath ...string) *scriptRuntime {
 	return newScriptRuntimeWithLogs(nil, statePath...)
 }
 
 func newScriptRuntimeWithLogs(logs engineLogPublisher, statePath ...string) *scriptRuntime {
+	return newScriptRuntimeWithWorker(nil, logs, statePath...)
+}
+
+func newScriptRuntimeWithWorker(worker *workerController, logs engineLogPublisher, statePath ...string) *scriptRuntime {
 	runtime := &scriptRuntime{
-		networkSlots: make(chan struct{}, maxConcurrentModuleNetworkCalls),
-		logs:         logs,
+		networkSlots:    make(chan struct{}, maxConcurrentModuleNetworkCalls),
+		actionAdmission: newModuleActionAdmission(maxConcurrentModuleActions, maxConcurrentModuleActionsPerExtension),
+		logs:            logs,
+		worker:          worker,
 	}
 	runtime.persistent.Store(newPersistentSnapshot())
 	runtime.persistPersistent = runtime.savePersistent
@@ -149,6 +232,9 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 			case errors.Is(ctx.Err(), context.Canceled):
 				event.Level = "warn"
 				event.Message = "action canceled"
+			case errors.Is(err, ErrWorkerCapacity):
+				event.Level = "warn"
+				event.Message = "action skipped: extension action capacity is busy"
 			default:
 				event.Message = "action failed: " + err.Error()
 			}
@@ -184,7 +270,7 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 			panic(recovered)
 		}
 	}()
-	// Six declarative kinds, none of which reaches the JavaScript runtime: no
+	// Five bounded declarative kinds, none of which reaches a guest runtime: no
 	// VM, no event loop, no proxy-client globals. Dispatch happens before the
 	// script is compiled, because a declarative action carries none.
 	switch {
@@ -198,117 +284,21 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		return executeRewrite(rule, module, request)
 	case rule.ReplaceBody != nil:
 		return executeBodyReplace(rule, module, request, response)
-	case rule.JQProgram != "":
-		return r.executeJQ(actionCtx, module, rule, request, response)
 	}
-	program, err := scriptProgram(module, rule)
-	if err != nil {
-		return scriptResult{}, err
+	lease, admissionErr := r.actionAdmission.acquire(actionCtx, module.ID)
+	if admissionErr != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, admissionErr)
 	}
-	settings, err := scriptSettingValues(module, rule)
-	if err != nil {
-		return scriptResult{}, err
+	defer lease.release()
+	if r.worker == nil {
+		return scriptResult{}, ErrHardIsolationUnavailable
 	}
-	vm := goja.New()
-	loop := newAsyncLoop()
-	defer loop.close()
-	if err := loop.installTimerAPI(vm); err != nil {
-		return scriptResult{}, err
-	}
-	if rule.Entry == scriptEntryProxyCompat {
-		// Published bundles assume a browser-ish global set. Native scripts keep
-		// the smaller surface they were reviewed against.
-		if err := installWebAPI(vm); err != nil {
-			return scriptResult{}, err
-		}
-		if err := installDOMAPI(vm); err != nil {
-			return scriptResult{}, err
-		}
-	}
-	installConsoleAPI(vm, r.logs, EngineLog{
-		Source: "script", Extension: module.ID, Action: rule.ID, Phase: rule.Phase,
-		URL: request.URL, ScriptDigest: rule.ScriptDigest,
-	})
-	requestBodyMode := "none"
-	if response == nil {
-		requestBodyMode = rule.BodyMode
-	}
-	requestObject, err := scriptMessageObject(vm, request, requestBodyMode)
-	if err != nil {
-		return scriptResult{}, err
-	}
-	contextObject := map[string]any{
-		"phase":    rule.Phase,
-		"request":  requestObject,
-		"settings": settings,
-	}
-	if response != nil {
-		responseObject, objectErr := scriptMessageObject(vm, *response, rule.BodyMode)
-		if objectErr != nil {
-			return scriptResult{}, objectErr
-		}
-		contextObject["response"] = responseObject
-	}
-	if module.PersistentStorage {
-		contextObject["storage"] = r.storageObject(vm, module.ID)
-	}
-	var requester *moduleNetworkRequester
-	if module.Network {
-		// One requester, and one surface chosen from rule.Entry.
-		//
-		// Both used to be built on every granted action: newModuleNetworkAPI
-		// makes its own requester, and a second bare one was made beside it.
-		// Only ever one of them was reachable. Under the native entry the bare
-		// requester has no consumer at all -- executeProxyCompat is the only
-		// one, and it is not called; under proxy-compat, contextObject is never
-		// handed to the VM (installProxyCompatAPI sets $-prefixed globals
-		// instead), so contextObject["network"] was unreachable JavaScript.
-		// Two requesters means two transport maps and two deferred Closes, and
-		// a reader with no way to tell which one is live.
-		requester = newModuleNetworkRequester(actionCtx, roots, r.networkSlots, module.ID)
-		defer requester.Close()
-		if rule.Entry != scriptEntryProxyCompat {
-			contextObject["network"] = requester.newAPI(vm, loop)
-		}
-	}
-
-	stopInterrupt := context.AfterFunc(actionCtx, func() {
-		vm.Interrupt("script execution canceled or timed out")
-	})
-	defer func() {
-		stopInterrupt()
-		vm.ClearInterrupt()
-	}()
-
-	if rule.Entry == scriptEntryProxyCompat {
-		return r.executeProxyCompat(actionCtx, vm, loop, program, module, rule, settings, requestObject, contextObject, requester, response != nil)
-	}
-
-	_, runErr := vm.RunProgram(program)
-	if runErr != nil {
-		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, runErr)
-	}
-	transform, ok := goja.AssertFunction(vm.Get("transform"))
-	if !ok {
-		return scriptResult{}, fmt.Errorf("extension %s action %s must define function transform(context)", module.ID, rule.ID)
-	}
-	value, callErr := transform(goja.Undefined(), vm.ToValue(contextObject))
-	if callErr != nil {
-		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, callErr)
-	}
-	settled, settleErr := settlePromise(actionCtx, vm, loop, value)
-	if settleErr != nil {
-		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, settleErr)
-	}
-	return parseNativeScriptResult(settled, response != nil)
+	return r.worker.Execute(actionCtx, r, cfg, roots, module, rule, request, response)
 }
 
 func scriptProgram(module Module, rule ScriptRule) (*goja.Program, error) {
-	if rule.program != nil {
-		return rule.program, nil
-	}
 	filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
-	program, err := goja.Compile(filename, rule.ScriptBody, false)
+	program, err := compileModuleScript(filename, rule.ScriptBody)
 	if err != nil {
 		return nil, fmt.Errorf("compile action %s: %w", rule.ID, err)
 	}
@@ -496,6 +486,9 @@ func applyNativePatch(result *scriptResult, raw any, response bool) error {
 }
 
 func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.Object {
+	if r.workerClient != nil {
+		return r.workerClient.StorageObject(vm)
+	}
 	// Per-action, because storageObject is built once per execute (the context
 	// construction at the top of this file). goja runs one VM on one goroutine,
 	// so a plain counter is enough -- the same shape module_network.go uses for
@@ -1274,10 +1267,10 @@ func (m *compiledHostMatcher) matchCanonical(host string) bool {
 	return false
 }
 
-// compiledScriptConfig belongs to one validated Config snapshot. ConfigStore
-// replaces the pointer on a successful reload, so JavaScript and regexp
-// programs, decoded settings, and ordered module lookup state are bounded by
-// config lifetime rather than a global cache.
+// compiledScriptConfig belongs to one validated Config snapshot. It contains
+// only trusted parent-side projections: matchers, decoded settings, and ordered
+// lookup state. Guest programs are compiled and discarded inside one-shot
+// workers.
 type compiledScriptConfig struct {
 	modules        []compiledScriptModule
 	moduleHosts    map[string]*compiledHostMatcher
@@ -1287,10 +1280,6 @@ type compiledScriptConfig struct {
 }
 
 func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
-	return compileScriptConfigWithPrograms(cfg, nil)
-}
-
-func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*goja.Program) (*compiledScriptConfig, error) {
 	byID := make(map[string]Module, len(cfg.Modules))
 	for _, module := range cfg.Modules {
 		byID[module.ID] = module
@@ -1342,26 +1331,6 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 			path, err := regexp.Compile(rule.Match.PathRegex)
 			if err != nil {
 				return nil, fmt.Errorf("extension %s action %s path_regex: %w", module.ID, rule.ID, err)
-			}
-			program := programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}]
-			if program == nil {
-				program, err = scriptProgram(module, rule)
-				if err != nil {
-					return nil, err
-				}
-			}
-			rule.program = program
-			// The jq artifact belongs to this generation for the same reason the
-			// goja one does. Compiling here rather than threading a second map
-			// out of validate is deliberate: the whole shipped corpus is under
-			// 1.5 ms of jq compilation, and a generation is only built when the
-			// document digest actually changed.
-			if rule.JQProgram != "" {
-				code, jqErr := compileJQProgram(rule.JQProgram)
-				if jqErr != nil {
-					return nil, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, jqErr)
-				}
-				rule.jq = code
 			}
 			rule.settings = settings
 			entry.rules = append(entry.rules, compiledScriptRule{

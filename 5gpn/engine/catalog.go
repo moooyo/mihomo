@@ -48,12 +48,6 @@ import (
 // without being asked".
 
 const (
-	// The first-party catalog, seeded into every new document. An operator who
-	// does not want it can disable or remove it; it is a default, not a
-	// built-in.
-	officialCatalogID  = "io.5gpn.official"
-	officialCatalogURL = "https://moooyo.github.io/5gpn-extensions/marketplace/v2/index.json"
-
 	maxCatalogSources    = 16
 	maxCatalogEntries    = 512
 	maxCatalogIndexBytes = 2 << 20
@@ -90,7 +84,9 @@ type CatalogMetadata struct {
 	Homepage    string `json:"homepage,omitempty"`
 }
 
-// CatalogResource is a fetchable artefact with its digest.
+// CatalogResource is the entry's manifest reference and digest. External
+// scripts remain live snapshot dependencies and are not a parallel catalog
+// resource list.
 type CatalogResource struct {
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`
@@ -148,13 +144,11 @@ type CatalogEntry struct {
 // catalogIndex is the wire shape. It is decoded leniently -- unknown fields are
 // ignored rather than rejected.
 //
-// The previous implementation rejected them, and the comment it left behind is
-// the argument against doing so again: the index is a contract with every
-// deployed gateway, so a field added for newer cores made older ones refuse the
-// whole document, and a catalog nobody can read is worse than one carrying a
-// field this build does not use. The published index carries exactly such a
-// field today -- a `policy` projection of the retired overlay compiler, which
-// means nothing to a monolith gateway and is ignored here.
+// The index is a contract with every deployed gateway. A publisher may add
+// metadata for a newer core, and an older core must keep the fields it
+// understands available rather than refusing the complete discovery source.
+// Unknown fields therefore remain generic forward-compatible metadata; they
+// never become runtime authority.
 type catalogIndex struct {
 	APIVersion string          `json:"apiVersion"`
 	Kind       string          `json:"kind"`
@@ -165,9 +159,10 @@ type catalogIndex struct {
 // CatalogSourceView is one source as the console renders it: the operator's
 // configuration, plus whatever the last fetch produced.
 //
-// Error and Entries are alternatives. A source that failed still appears, with
-// the reason, because the page it would otherwise break is the only place it
-// can be corrected or removed.
+// Error may accompany Entries from the last complete successful fetch. A
+// source that has never succeeded appears with an empty list and the reason;
+// one whose refresh fails keeps its prior snapshot visible so a transient
+// failure cannot masquerade as the publisher deleting every extension.
 type CatalogSourceView struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name,omitempty"`
@@ -220,11 +215,17 @@ func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (Catalog
 			view.Sources = append(view.Sources, rendered)
 			continue
 		}
-		index, fetchedAt, err := e.catalogIndexFor(ctx, source.URL, refresh)
+		index, fetchedAt, available, err := e.catalogIndexFor(ctx, source.URL, refresh)
 		if err != nil {
 			rendered.Error = err.Error()
-			view.Sources = append(view.Sources, rendered)
-			continue
+			// A refresh attempt is advisory, not a transaction that deletes the
+			// last complete discovery snapshot. catalogIndexFor returns that
+			// retained index with the fetch error when one exists, so the Console
+			// can keep rendering known entries while making the failure visible.
+			if !available {
+				view.Sources = append(view.Sources, rendered)
+				continue
+			}
 		}
 		rendered.Metadata = index.Metadata
 		rendered.FetchedAt = fetchedAt.UTC().Format(time.RFC3339)
@@ -273,8 +274,10 @@ func (e *Engine) ReviewCatalogEntry(ctx context.Context, sourceID, entryID strin
 	return candidate, err
 }
 
-// ReviewCatalogEntryView returns the exact manifest URL and committed revision
-// used by the review, so an API never reconstructs either through a second read.
+// ReviewCatalogEntryView returns the exact URL named by the selected entry and
+// the committed revision used by the review. The URL is an opaque review token:
+// a redirect may make Candidate.Detail.SourceURL different, and a client must
+// still quote this selected-entry URL rather than reconstructing it.
 func (e *Engine) ReviewCatalogEntryView(ctx context.Context, sourceID, entryID string) (Candidate, string, string, error) {
 	reviewView, err := e.CommittedView()
 	if err != nil {
@@ -390,7 +393,7 @@ func (e *Engine) catalogEntryForConfig(ctx context.Context, cfg Config, sourceID
 		if !source.Enabled {
 			return CatalogEntry{}, fmt.Errorf("%w: catalog %q is disabled", ErrInvalidRequest, sourceID)
 		}
-		index, _, err := e.catalogIndexFor(ctx, source.URL, false)
+		index, _, _, err := e.catalogIndexFor(ctx, source.URL, false)
 		if err != nil {
 			return CatalogEntry{}, err
 		}
@@ -456,24 +459,32 @@ func (e *Engine) verifyAgainstEntry(entry CatalogEntry, candidate Candidate) err
 	return nil
 }
 
-// catalogIndexFor fetches an index, or reuses one fetched recently.
-func (e *Engine) catalogIndexFor(ctx context.Context, rawURL string, refresh bool) (catalogIndex, time.Time, error) {
+// catalogIndexFor fetches an index, or reuses one fetched recently. available
+// distinguishes a retained complete snapshot from the zero value when a fetch
+// fails; callers that only authorize reviews still treat any error as fatal.
+func (e *Engine) catalogIndexFor(ctx context.Context, rawURL string, refresh bool) (catalogIndex, time.Time, bool, error) {
 	if !refresh {
-		if cached, at, ok := e.catalogs.get(rawURL); ok {
-			return cached, at, nil
+		if cached, cachedAt, ok := e.catalogs.get(rawURL); ok {
+			return cached, cachedAt, true, nil
 		}
 	}
 	imp, err := currentImporter()
 	if err != nil {
-		return catalogIndex{}, time.Time{}, err
+		if retained, retainedAt, retainedOK := e.catalogs.retained(rawURL); retainedOK {
+			return retained, retainedAt, true, err
+		}
+		return catalogIndex{}, time.Time{}, false, err
 	}
 	index, err := imp.catalog(ctx, rawURL)
 	if err != nil {
-		return catalogIndex{}, time.Time{}, err
+		if retained, retainedAt, retainedOK := e.catalogs.retained(rawURL); retainedOK {
+			return retained, retainedAt, true, err
+		}
+		return catalogIndex{}, time.Time{}, false, err
 	}
 	at := imp.clock().UTC()
 	e.catalogs.put(rawURL, index, at)
-	return index, at, nil
+	return index, at, true, nil
 }
 
 // catalog fetches and decodes one index through the guarded client.
@@ -481,6 +492,9 @@ func (imp *Importer) catalog(ctx context.Context, rawURL string) (catalogIndex, 
 	body, _, err := imp.fetch(ctx, rawURL, maxCatalogIndexBytes)
 	if err != nil {
 		return catalogIndex{}, fmt.Errorf("fetch catalog: %w", err)
+	}
+	if err := state.ValidateJSONBytes(body, maxCatalogIndexBytes); err != nil {
+		return catalogIndex{}, fmt.Errorf("%w: the catalog is not valid JSON: %v", ErrInvalidRequest, err)
 	}
 	var index catalogIndex
 	if err := json.Unmarshal(body, &index); err != nil {
@@ -490,37 +504,41 @@ func (imp *Importer) catalog(ctx context.Context, rawURL string) (catalogIndex, 
 		return catalogIndex{}, fmt.Errorf("%w: not an extension catalog (apiVersion %q, kind %q)",
 			ErrInvalidRequest, index.APIVersion, index.Kind)
 	}
+	if index.Entries == nil {
+		return catalogIndex{}, fmt.Errorf("%w: catalog entries must be an array", ErrInvalidRequest)
+	}
 	if len(index.Entries) > maxCatalogEntries {
 		return catalogIndex{}, fmt.Errorf("%w: the catalog lists more than %d extensions", ErrInvalidRequest, maxCatalogEntries)
 	}
-	kept := make([]CatalogEntry, 0, len(index.Entries))
 	seen := make(map[string]struct{}, len(index.Entries))
-	for _, entry := range index.Entries {
-		// A malformed entry is dropped rather than failing the catalog: one bad
-		// listing must not hide every other extension a publisher offers.
+	for position := range index.Entries {
+		entry := &index.Entries[position]
+		// A partial parse must never replace a complete cached index. Reject the
+		// candidate document as one transaction; catalogIndexFor retains the last
+		// successful snapshot and exposes this error beside it.
 		if !validModuleID(entry.ID) {
-			continue
+			return catalogIndex{}, fmt.Errorf("%w: catalog entry %d has invalid id %q", ErrInvalidRequest, position+1, entry.ID)
 		}
 		if _, duplicate := seen[entry.ID]; duplicate {
-			continue
+			return catalogIndex{}, fmt.Errorf("%w: catalog lists extension %q more than once", ErrInvalidRequest, entry.ID)
 		}
 		if err := checkResourceURL(entry.Manifest.URL); err != nil {
-			continue
+			return catalogIndex{}, fmt.Errorf("%w: catalog entry %q manifest URL: %v", ErrInvalidRequest, entry.ID, err)
 		}
 		entry.Manifest.SHA256 = strings.ToLower(strings.TrimSpace(entry.Manifest.SHA256))
 		if !validLowerHex(entry.Manifest.SHA256, 64) {
-			continue
+			return catalogIndex{}, fmt.Errorf("%w: catalog entry %q has invalid manifest digest", ErrInvalidRequest, entry.ID)
 		}
 		seen[entry.ID] = struct{}{}
-		kept = append(kept, entry)
 	}
-	index.Entries = kept
 	return index, nil
 }
 
-// catalogCache holds fetched indexes for catalogCacheTTL. Nothing here is
-// persisted: an index is refetchable by definition, and writing one to disk
-// would make a stale listing outlive the process that fetched it.
+// catalogCache holds the last complete successful index for each source.
+// catalogCacheTTL controls when normal reads attempt another fetch; an older
+// entry remains the failure fallback until a complete successor replaces it.
+// Nothing here is persisted: an index is refetchable by definition, and
+// writing one to disk would make stale discovery state survive a process start.
 type catalogCache struct {
 	mu      sync.Mutex
 	entries map[string]catalogCacheEntry
@@ -541,6 +559,19 @@ func (c *catalogCache) get(rawURL string) (catalogIndex, time.Time, bool) {
 	return cached.index, cached.fetchedAt, true
 }
 
+// retained returns the last complete successful fetch regardless of age. TTL
+// decides when to attempt a refresh; it is not permission to erase discovery
+// state when that attempt fails.
+func (c *catalogCache) retained(rawURL string) (catalogIndex, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cached, ok := c.entries[rawURL]
+	if !ok {
+		return catalogIndex{}, time.Time{}, false
+	}
+	return cached.index, cached.fetchedAt, true
+}
+
 func (c *catalogCache) put(rawURL string, index catalogIndex, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -549,7 +580,7 @@ func (c *catalogCache) put(rawURL string, index catalogIndex, at time.Time) {
 	}
 	// Bounded by the source limit, and a source that is removed leaves at most
 	// one stale entry behind until the process restarts.
-	if len(c.entries) > maxCatalogSources {
+	if _, exists := c.entries[rawURL]; !exists && len(c.entries) >= maxCatalogSources {
 		c.entries = make(map[string]catalogCacheEntry, 4)
 	}
 	c.entries[rawURL] = catalogCacheEntry{index: index, fetchedAt: at}
@@ -598,14 +629,11 @@ func validateCatalogs(sources []CatalogSource) error {
 	return nil
 }
 
-// defaultCatalogSources is what a new document is seeded with.
+// defaultCatalogSources is deliberately empty. A catalog fetch is outbound
+// traffic to a publisher the operator chose to trust, so a fresh gateway does
+// not contact any marketplace until an authenticated Console write adds one.
 func defaultCatalogSources() []CatalogSource {
-	return []CatalogSource{{
-		ID:      officialCatalogID,
-		Name:    "5gpn Official Extensions",
-		URL:     officialCatalogURL,
-		Enabled: true,
-	}}
+	return []CatalogSource{}
 }
 
 // catalogHost is used only in messages, to name the host an operator would have

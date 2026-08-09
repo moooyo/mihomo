@@ -58,11 +58,11 @@ type Snapshot[T any] struct {
 // New opens the document at path, creating it with zero if absent.
 func New[T any](path string, zero T) (*Doc[T], error) {
 	d := &Doc[T]{path: path}
-	raw, err := os.ReadFile(path)
+	raw, err := ReadPrivateFile(path, MaxDocumentBytes)
 	switch {
 	case err == nil:
 		var value T
-		if err := json.Unmarshal(raw, &value); err != nil {
+		if err := DecodeJSONBytes(raw, MaxDocumentBytes, &value); err != nil {
 			// Refuse rather than silently reset. A document that fails to parse
 			// is either a bug or a partial write nothing else can explain, and
 			// replacing it with defaults would discard the operator's
@@ -174,6 +174,10 @@ func (d *Doc[T]) write(value T) error {
 // the old inode -- or the temp file that was then removed. A caller who was told
 // the write succeeded would be wrong in a way nothing reports.
 func WriteFile(path string, data []byte) error {
+	return writeFile(path, data, syncDir)
+}
+
+func writeFile(path string, data []byte, syncDirectory func(string) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -199,7 +203,16 @@ func WriteFile(path string, data []byte) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("5gpn/state: rename onto %s: %w", path, err)
 	}
-	return syncDir(dir)
+	if err := syncDirectory(dir); err != nil {
+		// The rename has happened, but a crash may still lose the directory
+		// entry. Continuing would leave the in-memory revision intentionally on
+		// the old value while the live pathname already contains the new one.
+		// That is a process-fatal invariant, not an ordinary retryable write
+		// failure. The process owner installs the fatal handler; one-shot tools
+		// still receive a typed error and terminate their operation.
+		return reportCommitAmbiguous(path, err)
+	}
+	return nil
 }
 
 func syncDir(dir string) error {

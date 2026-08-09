@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/metacubex/chi"
@@ -120,6 +121,20 @@ func TestManagedDistributionUIIsNeverCached(t *testing.T) {
 		if cacheControl := response.Header().Get("Cache-Control"); cacheControl != "no-store" {
 			t.Fatalf("%s Cache-Control %q, want no-store", method, cacheControl)
 		}
+		if csp := response.Header().Get("Content-Security-Policy"); csp != uiContentSecurityPolicy {
+			t.Fatalf("%s Content-Security-Policy %q, want %q", method, csp, uiContentSecurityPolicy)
+		} else if !strings.Contains(csp, "img-src 'self' data: blob: http: https:") {
+			t.Fatalf("%s CSP does not permit operator HTTP(S) backgrounds: %q", method, csp)
+		}
+		if value := response.Header().Get("X-Content-Type-Options"); value != "nosniff" {
+			t.Fatalf("%s X-Content-Type-Options %q, want nosniff", method, value)
+		}
+		if value := response.Header().Get("Referrer-Policy"); value != "no-referrer" {
+			t.Fatalf("%s Referrer-Policy %q, want no-referrer", method, value)
+		}
+		if value := response.Header().Get("Permissions-Policy"); value == "" {
+			t.Fatalf("%s omitted Permissions-Policy", method)
+		}
 	}
 }
 
@@ -194,6 +209,9 @@ func TestUIRootRedirectAndAuthenticationBoundary(t *testing.T) {
 	response = requestRoute(handler, http.MethodGet, "/configs", "")
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated API status %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if csp := response.Header().Get("Content-Security-Policy"); csp != "" {
+		t.Fatalf("API response inherited UI CSP %q", csp)
 	}
 }
 

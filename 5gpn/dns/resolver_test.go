@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +20,6 @@ type fakePool struct {
 	reply func(*D.Msg) (*D.Msg, error)
 	delay time.Duration
 	sent  []*D.Msg
-	ecs   netip.Prefix
 }
 
 func (f *fakePool) Exchange(ctx context.Context, q *D.Msg) (*D.Msg, error) {
@@ -38,10 +38,8 @@ func (f *fakePool) Exchange(ctx context.Context, q *D.Msg) (*D.Msg, error) {
 	return reply(q)
 }
 
-func (f *fakePool) Specs() []string       { return nil }
-func (f *fakePool) SetECS(p netip.Prefix) { f.ecs = p }
-func (f *fakePool) ECS() netip.Prefix     { return f.ecs }
-func (f *fakePool) Close()                {}
+func (f *fakePool) Specs() []string { return nil }
+func (f *fakePool) Close()          {}
 func (f *fakePool) lastSent() *D.Msg {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -257,12 +255,14 @@ func TestWithheldTypesAnswerSyntheticNODATA(t *testing.T) {
 }
 
 // An address is exactly as usable to a client from the additional section as it
-// is from the answer, so an MX reply's AAAA glue defeats steering just as
-// effectively as an AAAA question would.
+// is from the answer. Auto cannot classify A glue without running the A
+// arbitration, so both address families are withheld and the client performs a
+// separate A lookup through the normal decision path.
 func TestGlueAddressesAreStrippedFromEverySection(t *testing.T) {
 	trust := &fakePool{reply: func(q *D.Msg) (*D.Msg, error) {
 		m := new(D.Msg)
 		m.SetReply(q)
+		m.AuthenticatedData = true
 		m.Answer = []D.RR{&D.MX{
 			Hdr: D.RR_Header{Name: q.Question[0].Name, Rrtype: D.TypeMX, Class: D.ClassINET, Ttl: 300},
 			Mx:  "mail.example.com.", Preference: 10,
@@ -277,21 +277,14 @@ func TestGlueAddressesAreStrippedFromEverySection(t *testing.T) {
 	policyWith(t, r, FallbackAuto)
 
 	msg := ask(t, r, "example.com", D.TypeMX)
+	if msg.AuthenticatedData {
+		t.Fatal("a filtered response retained the upstream AD bit")
+	}
 	for _, rr := range append(append([]D.RR{}, msg.Answer...), append(msg.Ns, msg.Extra...)...) {
-		if _, ok := rr.(*D.AAAA); ok {
-			t.Fatal("an AAAA survived in the reply")
+		switch rr.(type) {
+		case *D.A, *D.AAAA:
+			t.Fatalf("auto response disclosed unclassified address %T", rr)
 		}
-	}
-	// The A glue is legitimate and must survive, or the client loses the
-	// address it actually can use.
-	found := false
-	for _, rr := range msg.Extra {
-		if _, ok := rr.(*D.A); ok {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("the A glue was stripped along with the AAAA")
 	}
 }
 
@@ -398,6 +391,27 @@ func TestFlushDuringFlightDiscardsTheWrite(t *testing.T) {
 	}
 }
 
+func TestCacheSkipsOversizedResponses(t *testing.T) {
+	cache := newCache(16)
+	message := new(D.Msg)
+	message.SetQuestion("large.example.", D.TypeTXT)
+	chunks := make([]string, 70)
+	for i := range chunks {
+		chunks[i] = strings.Repeat("x", 255)
+	}
+	message.Answer = []D.RR{&D.TXT{
+		Hdr: D.RR_Header{Name: "large.example.", Rrtype: D.TypeTXT, Class: D.ClassINET, Ttl: 60},
+		Txt: chunks,
+	}}
+	if message.Len() <= maxCacheableResponseBytes {
+		t.Fatalf("fixture length = %d, want more than %d", message.Len(), maxCacheableResponseBytes)
+	}
+	cache.put(cacheKey{name: "large.example.", qtype: D.TypeTXT}, message, time.Minute, cache.Epoch(), cacheMeta{})
+	if cache.Len() != 0 {
+		t.Fatal("oversized response was retained in the cache")
+	}
+}
+
 func TestBreakerOpensAndCancellationDoesNot(t *testing.T) {
 	b := newBreaker()
 	for i := 0; i < breakerThreshold; i++ {
@@ -485,8 +499,8 @@ func TestECSReplacesTheClientSubnetAndStripsTheEcho(t *testing.T) {
 
 	sent := req.Copy()
 	stripECS(sent)
-	if p := g.ecs.Load(); p != nil {
-		setECS(sent, *p)
+	if g.ecs.IsValid() {
+		setECS(sent, g.ecs)
 	}
 
 	opt := sent.IsEdns0()
@@ -564,6 +578,50 @@ func TestGroupRollsPastADeadMember(t *testing.T) {
 	}
 	if got := answerAddrs(reply); !equalStrings(got, []string{"203.0.113.77"}) {
 		t.Errorf("answers %v, want the live member's", got)
+	}
+}
+
+func TestGroupBreakerIsolatesOnlyTheFailingMember(t *testing.T) {
+	var badCalls atomic.Int32
+	var goodCalls atomic.Int32
+	bad := member{
+		breaker: newBreaker(),
+		exchangeFn: func(context.Context, *D.Msg) (*D.Msg, error) {
+			badCalls.Add(1)
+			return nil, context.DeadlineExceeded
+		},
+	}
+	good := member{
+		breaker: newBreaker(),
+		exchangeFn: func(_ context.Context, query *D.Msg) (*D.Msg, error) {
+			goodCalls.Add(1)
+			message := new(D.Msg)
+			message.SetReply(query)
+			message.Answer = []D.RR{&D.A{
+				Hdr: D.RR_Header{Name: query.Question[0].Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60},
+				A:   net.ParseIP("203.0.113.88"),
+			}}
+			return message, nil
+		},
+	}
+	group := &group{label: "trust", members: []member{bad, good}}
+	query := new(D.Msg)
+	query.SetQuestion("example.com.", D.TypeA)
+
+	for i := 0; i < breakerThreshold+3; i++ {
+		response, err := group.Exchange(context.Background(), query)
+		if err != nil {
+			t.Fatalf("exchange %d: %v", i, err)
+		}
+		if got := answerAddrs(response); !equalStrings(got, []string{"203.0.113.88"}) {
+			t.Fatalf("exchange %d answers %v", i, got)
+		}
+	}
+	if got := badCalls.Load(); got != breakerThreshold {
+		t.Fatalf("failing first member attempts = %d, want %d before isolation", got, breakerThreshold)
+	}
+	if got := goodCalls.Load(); got != breakerThreshold+3 {
+		t.Fatalf("healthy second member attempts = %d, want %d", got, breakerThreshold+3)
 	}
 }
 
@@ -781,6 +839,13 @@ func TestDocumentValidation(t *testing.T) {
 	if err := d.Validate(); err == nil {
 		t.Error("an IPv6 gateway was accepted on an IPv4-only data plane")
 	}
+	for _, gateway := range []string{"0.0.0.0", "127.0.0.1", "169.254.1.1", "224.0.0.1"} {
+		d = DefaultDocument()
+		d.Gateway = gateway
+		if err := d.Validate(); err == nil {
+			t.Errorf("unusable gateway %q was accepted", gateway)
+		}
+	}
 }
 
 func TestECSParsing(t *testing.T) {
@@ -829,13 +894,16 @@ func TestClashMarkersAreStripped(t *testing.T) {
 	}
 }
 
-func TestSubscriptionFetchRefusesPrivateAddresses(t *testing.T) {
-	for _, addr := range []string{"127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.0.0.0", "224.0.0.1"} {
+func TestSubscriptionFetchRefusesNonPublicAddresses(t *testing.T) {
+	for _, addr := range []string{
+		"127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.0.0.0", "224.0.0.1",
+		"192.0.2.1", "198.18.0.1", "203.0.113.1", "100::1", "2001:db8::1", "3fff::1",
+	} {
 		if isPublicUnicast(netip.MustParseAddr(addr)) {
 			t.Errorf("isPublicUnicast(%s) accepted it", addr)
 		}
 	}
-	for _, addr := range []string{"8.8.8.8", "1.1.1.1", "2001:db8::1"} {
+	for _, addr := range []string{"8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"} {
 		if !isPublicUnicast(netip.MustParseAddr(addr)) {
 			t.Errorf("isPublicUnicast(%s) refused a public address", addr)
 		}
@@ -850,7 +918,7 @@ func TestAdmissionControlShedsRatherThanAccretes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.sem <- struct{}{} // the one slot is taken
+	r.snapshot().clientSem <- struct{}{} // the one slot is taken
 	w := &captureWriter{}
 	req := new(D.Msg)
 	req.SetQuestion("shed.example.", D.TypeA)
@@ -858,6 +926,104 @@ func TestAdmissionControlShedsRatherThanAccretes(t *testing.T) {
 
 	if w.msg == nil || w.msg.Rcode != D.RcodeRefused {
 		t.Fatalf("got %v, want REFUSED", w.msg)
+	}
+}
+
+func TestDefaultAdmissionBudgetsAreFinite(t *testing.T) {
+	r := NewResolver(Options{})
+	clientSem := r.snapshot().clientSem
+	if clientSem == nil || cap(clientSem) != defaultMaxInflight {
+		t.Fatalf("client admission capacity = %d, want safe default %d", cap(clientSem), defaultMaxInflight)
+	}
+	if r.originSem == nil || cap(r.originSem) != defaultOriginMaxInflight {
+		t.Fatalf("origin admission capacity = %d, want safe default %d", cap(r.originSem), defaultOriginMaxInflight)
+	}
+
+	for i := 0; i < cap(clientSem); i++ {
+		clientSem <- struct{}{}
+	}
+	w := &captureWriter{}
+	req := new(D.Msg)
+	req.SetQuestion("default-shed.example.", D.TypeA)
+	r.ServeDNS(w, req)
+	if w.msg == nil || w.msg.Rcode != D.RcodeRefused {
+		t.Fatalf("client overload reply = %v, want REFUSED", w.msg)
+	}
+}
+
+func TestOriginAdmissionBoundsListenerAndInProcessLookup(t *testing.T) {
+	r := NewResolver(Options{OriginMaxInflight: 1})
+	r.originSem <- struct{}{} // the one independent origin slot is taken
+
+	if _, err := r.OriginResolve(context.Background(), "busy.example"); err != errOriginAdmission {
+		t.Fatalf("OriginResolve error = %v, want %v", err, errOriginAdmission)
+	}
+
+	w := &captureWriter{}
+	req := new(D.Msg)
+	req.SetQuestion("busy.example.", D.TypeA)
+	r.Origin().ServeDNS(w, req)
+	if w.msg == nil || w.msg.Rcode != D.RcodeRefused {
+		t.Fatalf("origin listener overload reply = %v, want REFUSED", w.msg)
+	}
+}
+
+func TestFlightLimitShedsNewKeysWithoutIndependentWork(t *testing.T) {
+	r := NewResolver(Options{Timeout: time.Second, FlightLimit: 1})
+	firstReq := new(D.Msg)
+	firstReq.SetQuestion("first.example.", D.TypeA)
+	started := make(chan struct{})
+	releaseFlight := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseFlight)
+		}
+	}()
+	firstDone := make(chan bool, 1)
+
+	go func() {
+		_, _, ok := r.coalesce(context.Background(), firstReq.Question[0], firstReq, flightScope{}, trace{}, func(_ context.Context, req *D.Msg, _ *trace) *D.Msg {
+			close(started)
+			<-releaseFlight
+			msg := new(D.Msg)
+			msg.SetReply(req)
+			return msg
+		})
+		firstDone <- ok
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first flight did not start")
+	}
+
+	secondReq := new(D.Msg)
+	secondReq.SetQuestion("second.example.", D.TypeA)
+	ran := false
+	_, _, ok := r.coalesce(context.Background(), secondReq.Question[0], secondReq, flightScope{}, trace{}, func(_ context.Context, req *D.Msg, _ *trace) *D.Msg {
+		ran = true
+		msg := new(D.Msg)
+		msg.SetReply(req)
+		return msg
+	})
+	if ok {
+		t.Error("a new key was accepted after the flight map reached its limit")
+	}
+	if ran {
+		t.Error("flight overflow ran independent upstream work")
+	}
+
+	close(releaseFlight)
+	released = true
+	select {
+	case ok := <-firstDone:
+		if !ok {
+			t.Error("the admitted flight failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the admitted flight did not finish")
 	}
 }
 

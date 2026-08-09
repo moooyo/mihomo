@@ -226,7 +226,7 @@ func TestTheOffsetAdvancesPastUpdatesTheBotDeclines(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runWithClient(ctx, doc, c)
+		s.runWithClient(ctx, doc, c, 0)
 	}()
 
 	// Two polls: the first delivers, the second must ask past both updates.
@@ -401,4 +401,120 @@ func TestApplyStopsThePreviousLoopBeforeStartingTheNext(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a second Shutdown blocked")
 	}
+}
+
+func TestConcurrentUpdatesCannotReviveAnOlderLoop(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "bot.json"), Facts{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var loopMu sync.Mutex
+	active, maximum := 0, 0
+	started := make(chan string, 8)
+	firstCancelled := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	s.loop = func(ctx context.Context, doc Document, generation uint64) {
+		loopMu.Lock()
+		active++
+		if active > maximum {
+			maximum = active
+		}
+		loopMu.Unlock()
+		started <- doc.Token
+
+		<-ctx.Done()
+		if doc.Token == "one" {
+			close(firstCancelled)
+			<-releaseFirst
+			// A cancelled generation must not overwrite the state of the
+			// generation that superseded it, even if its teardown finishes late.
+			s.setState(generation, "unreachable", "obsolete token")
+		}
+		loopMu.Lock()
+		active--
+		loopMu.Unlock()
+	}
+
+	_, revision := s.Document()
+	_, revision, err = s.Update(revision, Document{Enabled: true, Admins: []int64{1}}, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token := <-started; token != "one" {
+		t.Fatalf("first loop token %q, want one", token)
+	}
+
+	type result struct {
+		revision string
+		err      error
+	}
+	secondDone := make(chan result, 1)
+	go func() {
+		_, nextRevision, updateErr := s.Update(revision, Document{Enabled: true, Admins: []int64{2}}, "two")
+		secondDone <- result{revision: nextRevision, err: updateErr}
+	}()
+	<-firstCancelled
+
+	current, secondRevision := s.Document()
+	if current.Token != "two" {
+		t.Fatalf("durable second token %q, want two", current.Token)
+	}
+	thirdEntered := make(chan struct{})
+	thirdDone := make(chan result, 1)
+	go func() {
+		close(thirdEntered)
+		_, nextRevision, updateErr := s.Update(secondRevision, Document{Enabled: true, Admins: []int64{3}}, "three")
+		thirdDone <- result{revision: nextRevision, err: updateErr}
+	}()
+	<-thirdEntered
+
+	// The third writer cannot publish while the second transition is still
+	// waiting for generation one to exit.
+	time.Sleep(50 * time.Millisecond)
+	if current, _ := s.Document(); current.Token != "two" {
+		t.Fatalf("third write overtook the in-progress transition: token %q", current.Token)
+	}
+	select {
+	case result := <-thirdDone:
+		t.Fatalf("third update returned before the prior generation stopped: %v", result.err)
+	default:
+	}
+
+	close(releaseFirst)
+	second := <-secondDone
+	if second.err != nil {
+		t.Fatalf("second update failed: %v", second.err)
+	}
+	third := <-thirdDone
+	if third.err != nil {
+		t.Fatalf("third update failed: %v", third.err)
+	}
+
+	for i, want := range []string{"two", "three"} {
+		select {
+		case token := <-started:
+			if token != want {
+				t.Fatalf("replacement loop %d token %q, want %q", i, token, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("replacement loop %d did not start", i)
+		}
+	}
+	loopMu.Lock()
+	gotMaximum := maximum
+	loopMu.Unlock()
+	if gotMaximum != 1 {
+		t.Fatalf("observed %d simultaneous poll loops, want exactly one", gotMaximum)
+	}
+
+	view, snapshotRevision := s.Snapshot()
+	if snapshotRevision != third.revision || len(view.Admins) != 1 || view.Admins[0] != 3 {
+		t.Fatalf("view/revision are not the committed third snapshot: view=%+v revision=%q want=%q", view, snapshotRevision, third.revision)
+	}
+	if view.LastError == "obsolete token" {
+		t.Fatal("a stale generation overwrote the current runtime state")
+	}
+	s.Shutdown()
 }

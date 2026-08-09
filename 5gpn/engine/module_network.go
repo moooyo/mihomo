@@ -40,11 +40,24 @@ type moduleNetworkRequester struct {
 	// the URL is canonicalized, IP literals and unsafe or private hosts are
 	// refused, and the request still leaves through mihomo's own rule
 	// evaluation -- which is what the authenticated SOCKS5 hop was arranging.
-	slots chan struct{}
+	slots  chan struct{}
+	remote func(moduleNetworkRequest, bool) (moduleNetworkResponse, error)
 
 	mu         sync.Mutex
 	transports map[string]*http.Transport
 	closed     bool
+}
+
+func newWorkerModuleNetworkRequester(ctx context.Context, client *workerRPCClient, owner string) *moduleNetworkRequester {
+	return &moduleNetworkRequester{
+		ctx: ctx, owner: owner,
+		remote: func(request moduleNetworkRequest, wait bool) (moduleNetworkResponse, error) {
+			if client == nil {
+				return moduleNetworkResponse{}, ErrHardIsolationUnavailable
+			}
+			return client.Network(request, wait)
+		},
+	}
 }
 
 func newModuleNetworkRequester(
@@ -163,6 +176,9 @@ func moduleNetworkResultObject(vm *goja.Runtime, response moduleNetworkResponse)
 }
 
 func (r *moduleNetworkRequester) Close() {
+	if r == nil || r.remote != nil {
+		return
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -312,6 +328,9 @@ func (r *moduleNetworkRequester) requestWaiting(req moduleNetworkRequest) (modul
 }
 
 func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitForSlot bool) (moduleNetworkResponse, error) {
+	if r.remote != nil {
+		return r.remote(req, waitForSlot)
+	}
 	parsed, origin, target := req.url, req.origin, req.target
 	target.Owner = r.owner
 	target.OwnerOnly = true

@@ -1,14 +1,13 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
 	"github.com/metacubex/http"
-	"strconv"
 
 	"github.com/metacubex/mihomo/5gpn/engine"
 	"github.com/metacubex/mihomo/5gpn/state"
@@ -70,7 +69,8 @@ func interceptionRouter() http.Handler {
 	return r
 }
 
-// getEngineLogs serves a bounded snapshot of retained engine and extension logs.
+// getEngineLogs serves a bounded cursor page of retained engine and extension
+// logs.
 //
 // The ring records events before anyone opens the page. This authenticated
 // controller read is the only log transport; the engine does not bind a second
@@ -78,6 +78,10 @@ func interceptionRouter() http.Handler {
 //
 // limit defaults to a screenful and is capped at the ring, so a caller cannot
 // ask for more than exists or make the response unbounded.
+//
+// An incremental caller echoes stream_id and sends after as an opaque decimal
+// string. A stale stream or a sequence beyond this generation returns reset
+// with the current tail instead of an empty page that can never advance.
 func getEngineLogs(w http.ResponseWriter, r *http.Request) {
 	e := currentEngine()
 	if e == nil {
@@ -85,18 +89,57 @@ func getEngineLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	filter := engine.EngineLogFilter{
+	logQuery := engine.EngineLogQuery{
 		Extension: query.Get("extension"),
 		Level:     query.Get("level"),
 		Contains:  query.Get("contains"),
 		Limit:     200,
+		StreamID:  query.Get("stream_id"),
 	}
 	if raw := query.Get("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			filter.Limit = n
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			badRequest(w, r, "limit must be a positive integer")
+			return
+		}
+		if n > engine.EngineLogMaxLimit {
+			n = engine.EngineLogMaxLimit
+		}
+		logQuery.Limit = n
+	}
+	if len(logQuery.StreamID) > 128 {
+		badRequest(w, r, "stream_id is too long")
+		return
+	}
+	if values, present := query["after"]; present {
+		if len(values) != 1 {
+			badRequest(w, r, "after must appear exactly once")
+			return
+		}
+		raw := values[0]
+		after, err := parseEngineLogAfter(raw)
+		if err != nil {
+			badRequest(w, r, "after must be an unsigned integer")
+			return
+		}
+		logQuery.After = &after
+	}
+	render.JSON(w, r, e.Logs(logQuery))
+}
+
+func parseEngineLogAfter(raw string) (uint64, error) {
+	if raw == "0" {
+		return 0, nil
+	}
+	if raw == "" || raw[0] < '1' || raw[0] > '9' {
+		return 0, errors.New("not canonical decimal")
+	}
+	for index := 1; index < len(raw); index++ {
+		if raw[index] < '0' || raw[index] > '9' {
+			return 0, errors.New("not canonical decimal")
 		}
 	}
-	render.JSON(w, r, render.M{"logs": e.Logs(filter)})
+	return strconv.ParseUint(raw, 10, 64)
 }
 
 // postReview fetches an install candidate and reports what it is, without
@@ -113,7 +156,7 @@ func postReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body engine.ImportRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&body); err != nil {
+	if err := decodeRequestJSON(r, 8<<20, &body); err != nil {
 		badRequest(w, r, "malformed request body: "+err.Error())
 		return
 	}
@@ -297,8 +340,9 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err, e)
 		return
 	}
-	// The URL is returned so the install quotes the same source this review
-	// read, rather than the client reconstructing it from the listing.
+	// The URL is returned as opaque reviewed state. A manifest redirect can make
+	// candidate.detail.source_url different, so the client must quote this value
+	// rather than reconstructing it from either the listing or the candidate.
 	render.JSON(w, r, render.M{"candidate": candidate, "url": url, "revision": revision})
 }
 
@@ -315,9 +359,10 @@ func (b *catalogUpdateRequest) revision() string { return b.Revision }
 // extension, which moves where that extension's code comes from.
 //
 // Its own route rather than a flag on the ordinary update, because that is a
-// different decision: /extensions/{id}/update re-reads the source the operator
-// already chose, and this one replaces it. Collapsing them would make the
-// redirection a parameter of an operation that otherwise cannot redirect.
+// different decision. Installed-source check/apply primitives are deliberately
+// not controller routes; this reviewed Marketplace selection is the only API
+// path that replaces an installed snapshot. Collapsing the decisions would
+// hide the source redirection inside a generic update operation.
 func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 	var body catalogUpdateRequest
 	e, ok := decodeWrite(w, r, &body)
@@ -435,7 +480,7 @@ func decodeWrite(w http.ResponseWriter, r *http.Request, into revisioned) (*engi
 		unavailable(w, r, "the interception engine is not installed")
 		return nil, false
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(into); err != nil {
+	if err := decodeRequestJSON(r, 8<<20, into); err != nil {
 		badRequest(w, r, "malformed request body: "+err.Error())
 		return nil, false
 	}
@@ -499,6 +544,18 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error, e *engi
 	case errors.Is(err, engine.ErrModuleNotFound):
 		render.Status(r, http.StatusNotFound)
 		render.JSON(w, r, render.M{"message": err.Error()})
+	case errors.Is(err, engine.ErrHardIsolationUnavailable):
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, render.M{
+			"code":    "hard_isolation_unavailable",
+			"message": "extension code isolation is unavailable; no code was validated or executed",
+		})
+	case errors.Is(err, engine.ErrWorkerCapacity):
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, render.M{
+			"code":    "worker_capacity_busy",
+			"message": "extension worker capacity is busy; retry the operation",
+		})
 	case errors.Is(err, engine.ErrUnprocessable):
 		render.Status(r, http.StatusUnprocessableEntity)
 		render.JSON(w, r, render.M{"message": err.Error()})

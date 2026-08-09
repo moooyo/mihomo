@@ -79,6 +79,10 @@ func init() {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == fivegpn.ExtensionWorkerCommand() {
+		os.Exit(fivegpn.ExtensionWorkerMain(os.Args[2:]))
+	}
+
 	// Defensive programming: panic when code mistakenly calls net.DefaultResolver
 	net.DefaultResolver.PreferGo = true
 	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -181,13 +185,13 @@ func main() {
 	if testConfig {
 		if len(configBytes) != 0 {
 			if _, err := executor.ParseWithBytes(configBytes); err != nil {
-				log.Errorln(err.Error())
+				log.Errorln("%s", err.Error())
 				fmt.Println("configuration test failed")
 				os.Exit(1)
 			}
 		} else {
 			if _, err := executor.Parse(); err != nil {
-				log.Errorln(err.Error())
+				log.Errorln("%s", err.Error())
 				fmt.Printf("configuration file %s test failed\n", C.Path.Config())
 				os.Exit(1)
 			}

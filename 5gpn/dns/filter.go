@@ -12,7 +12,9 @@ import (
 // It is not a redundant belt: an ANY query returns both RRsets outright, and an
 // MX, NS, SRV, or PTR reply carries the target's AAAA as additional-section
 // glue. An address is exactly as usable to a client from the additional section
-// as it is from the answer, so all three sections are filtered.
+// as it is from the answer, so all three sections are filtered. IPv4 A records
+// remain valid for direct decisions and are removed separately below only when
+// the current decision has already committed the name to the gateway.
 
 // filterSteeringBypass returns a copy of m with the bypass records removed from
 // every section.
@@ -21,7 +23,47 @@ func filterSteeringBypass(m *D.Msg) *D.Msg {
 	cp.Answer = dropBypassRRs(cp.Answer)
 	cp.Ns = dropBypassRRs(cp.Ns)
 	cp.Extra = dropBypassRRs(cp.Extra)
+	if len(cp.Answer) != len(m.Answer) || len(cp.Ns) != len(m.Ns) || len(cp.Extra) != len(m.Extra) {
+		cp.AuthenticatedData = false
+	}
 	return cp
+}
+
+// filterGatewayAddressDisclosure removes every address a client could use to
+// bypass an already-selected gateway decision. Unlike filterSteeringBypass it
+// also removes A: explicit direct decisions may legitimately return IPv4 glue,
+// but gateway decisions may not disclose it, and auto decisions must force a
+// separate A lookup so the address can be arbitrated first.
+func filterGatewayAddressDisclosure(m *D.Msg) *D.Msg {
+	cp := m.Copy()
+	cp.Answer = dropGatewayAddressRRs(cp.Answer)
+	cp.Ns = dropGatewayAddressRRs(cp.Ns)
+	cp.Extra = dropGatewayAddressRRs(cp.Extra)
+	if len(cp.Answer) != len(m.Answer) || len(cp.Ns) != len(m.Ns) || len(cp.Extra) != len(m.Extra) {
+		cp.AuthenticatedData = false
+	}
+	return cp
+}
+
+func dropGatewayAddressRRs(rrs []D.RR) []D.RR {
+	removed := false
+	for _, rr := range rrs {
+		if _, ok := rr.(*D.A); ok || isBypassRR(rr) {
+			removed = true
+			break
+		}
+	}
+	if !removed {
+		return rrs
+	}
+	kept := make([]D.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		if _, ok := rr.(*D.A); ok || isBypassRR(rr) {
+			continue
+		}
+		kept = append(kept, rr)
+	}
+	return stripDNSSEC(kept)
 }
 
 // isBypassRR reports whether rr can defeat A-record steering.

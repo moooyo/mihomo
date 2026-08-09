@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/5gpn/netguard"
 	"github.com/metacubex/mihomo/5gpn/state"
 	"github.com/metacubex/mihomo/log"
 
@@ -47,6 +48,26 @@ const (
 	subscriptionTick = time.Minute
 )
 
+var errEmptySubscription = errors.New("subscription contains no usable domains")
+
+// subscriptionSource is the part of a rule that defines the bytes a fetch is
+// expected to produce. Intent and interval changes do not change the source;
+// URL and format changes do, even when the operator keeps the same rule ID.
+type subscriptionSource struct {
+	url    string
+	format string
+}
+
+type subscriptionFetchToken struct {
+	revision string
+	ruleID   string
+	source   subscriptionSource
+}
+
+func sourceOf(rule Rule) subscriptionSource {
+	return subscriptionSource{url: rule.Value, format: rule.Format}
+}
+
 // SubscriptionStatus is what the console reports for one rule.
 type SubscriptionStatus struct {
 	RuleID      string    `json:"ruleId"`
@@ -54,6 +75,12 @@ type SubscriptionStatus struct {
 	LastSuccess time.Time `json:"lastSuccess,omitempty"`
 	Entries     int       `json:"entries"`
 	Error       string    `json:"error,omitempty"`
+
+	// source names the last successful fetch. It stays private because it is a
+	// scheduling fence, not API state. A failed fetch for a newly edited source
+	// retains the old source here, keeping the new source immediately due until
+	// it has actually published once.
+	source subscriptionSource
 }
 
 type subscriptions struct {
@@ -64,6 +91,10 @@ type subscriptions struct {
 
 	mu     sync.Mutex
 	status map[string]SubscriptionStatus
+
+	// downloadFn is a test seam. Production leaves it nil and uses download,
+	// whose transport pins resolution through guardedDial.
+	downloadFn func(context.Context, Rule) ([]string, error)
 }
 
 func newSubscriptions(s *Service) *subscriptions {
@@ -126,7 +157,7 @@ func (s *subscriptions) snapshot() []SubscriptionStatus {
 // refreshDue fetches every enabled subscription rule whose interval has
 // elapsed, then recompiles the policy once if anything landed.
 func (s *subscriptions) refreshDue() {
-	doc, _ := s.svc.Document()
+	doc, revision := s.svc.Document()
 	changed := false
 	for _, rule := range doc.Policy.Rules {
 		if !rule.Enabled || rule.Kind != KindSubscription {
@@ -135,7 +166,8 @@ func (s *subscriptions) refreshDue() {
 		if !s.due(rule) {
 			continue
 		}
-		if s.fetch(rule) {
+		token := subscriptionFetchToken{revision: revision, ruleID: rule.ID, source: sourceOf(rule)}
+		if s.fetch(rule, token) {
 			changed = true
 		}
 	}
@@ -153,46 +185,105 @@ func (s *subscriptions) due(rule Rule) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, ok := s.status[rule.ID]
-	if !ok || st.LastSuccess.IsZero() {
+	if !ok || st.LastSuccess.IsZero() || st.source != sourceOf(rule) {
 		return true
 	}
 	return time.Since(st.LastSuccess) >= time.Duration(rule.IntervalSeconds)*time.Second
 }
 
 // fetch retrieves and stores one list, reporting whether the cache changed.
-func (s *subscriptions) fetch(rule Rule) bool {
+func (s *subscriptions) fetch(rule Rule, token subscriptionFetchToken) bool {
+	if rule.ID != token.ruleID || sourceOf(rule) != token.source {
+		return false
+	}
+	// A wake can carry an older document snapshot after an update. Avoid the
+	// network call when that staleness is already visible.
+	if !s.fetchCurrent(token) {
+		return false
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	st := SubscriptionStatus{RuleID: rule.ID, LastAttempt: time.Now()}
-	names, err := s.download(ctx, rule)
+	var names []string
+	var err error
+	if s.downloadFn != nil {
+		names, err = s.downloadFn(ctx, rule)
+	} else {
+		names, err = s.download(ctx, rule)
+	}
+	if err == nil && len(names) == 0 {
+		err = errEmptySubscription
+	}
 	if err != nil {
+		// Do not let a completed request for an edited source replace the newer
+		// source's status. The retained wake will schedule the new source.
+		if !s.fetchCurrent(token) {
+			return false
+		}
 		st.Error = err.Error()
-		s.record(rule.ID, st, false)
+		s.record(rule.ID, token.source, st, false)
 		log.Warnln("[5GPN/DNS] subscription %s: %v (keeping the previous cache)", rule.ID, err)
 		return false
 	}
 
-	body := strings.Join(names, "\n") + "\n"
-	if err := state.WriteFile(subscriptionCachePath(s.svc.rulesDir, rule.ID), []byte(body)); err != nil {
+	published, err := s.publish(token, names)
+	if err != nil {
 		st.Error = err.Error()
-		s.record(rule.ID, st, false)
+		s.record(rule.ID, token.source, st, false)
+		return false
+	}
+	if !published {
+		log.Infoln("[5GPN/DNS] subscription %s: discarded fetch for an older document or source", rule.ID)
 		return false
 	}
 	st.Entries = len(names)
 	st.LastSuccess = time.Now()
-	s.record(rule.ID, st, true)
+	s.record(rule.ID, token.source, st, true)
 	log.Infoln("[5GPN/DNS] subscription %s: %d names", rule.ID, len(names))
 	return true
 }
 
-func (s *subscriptions) record(id string, st SubscriptionStatus, success bool) {
+// publish performs the source/revision check and cache rename under the same
+// update lock used by document writes. An update therefore lands either before
+// this check (and rejects the old fetch) or after the complete cache publish;
+// it cannot change the source between the check and the rename.
+func (s *subscriptions) publish(token subscriptionFetchToken, names []string) (bool, error) {
+	s.svc.updateMu.Lock()
+	defer s.svc.updateMu.Unlock()
+	if !s.fetchCurrent(token) {
+		return false, nil
+	}
+	body := strings.Join(names, "\n") + "\n"
+	if err := state.WriteFile(subscriptionCachePath(s.svc.rulesDir, token.ruleID), []byte(body)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *subscriptions) fetchCurrent(token subscriptionFetchToken) bool {
+	doc, revision := s.svc.Document()
+	if revision != token.revision {
+		return false
+	}
+	for _, rule := range doc.Policy.Rules {
+		if rule.ID == token.ruleID && rule.Enabled && rule.Kind == KindSubscription {
+			return sourceOf(rule) == token.source
+		}
+	}
+	return false
+}
+
+func (s *subscriptions) record(id string, source subscriptionSource, st SubscriptionStatus, success bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if previous, ok := s.status[id]; ok && !success {
 		// Keep what the last good fetch reported, so a failing rule still shows
 		// the matcher that is actually live rather than zero.
-		st.LastSuccess, st.Entries = previous.LastSuccess, previous.Entries
+		st.LastSuccess, st.Entries, st.source = previous.LastSuccess, previous.Entries, previous.source
+	} else if success {
+		st.source = source
 	}
 	s.status[id] = st
 }
@@ -223,6 +314,7 @@ func (s *subscriptions) download(ctx context.Context, rule Rule) ([]string, erro
 		},
 		Timeout: 60 * time.Second,
 	}
+	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -246,7 +338,14 @@ func (s *subscriptions) download(ctx context.Context, rule Rule) ([]string, erro
 	if len(raw) > maxSubscriptionBody {
 		return nil, fmt.Errorf("body exceeds %d bytes", maxSubscriptionBody)
 	}
-	return parseDomains(rule.Format, raw)
+	names, err := parseDomains(rule.Format, raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, errEmptySubscription
+	}
+	return names, nil
 }
 
 // guardedDial resolves the host through this gateway's own trust group and
@@ -293,26 +392,10 @@ func (s *subscriptions) guardedDial(ctx context.Context, network, addr string) (
 	return nil, lastErr
 }
 
-// isPublicUnicast rejects the address families a fetch has no business
-// reaching: loopback, link-local, multicast, unspecified, private, and the
-// carrier-grade NAT range that behaves like private space on this kind of host.
+// isPublicUnicast preserves the local fetch boundary name while delegating the
+// actual IANA scope decision to the product-wide audited guard.
 func isPublicUnicast(a netip.Addr) bool {
-	a = a.Unmap()
-	if !a.IsValid() || a.IsLoopback() || a.IsUnspecified() ||
-		a.IsMulticast() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
-		a.IsInterfaceLocalMulticast() || a.IsPrivate() {
-		return false
-	}
-	if a.Is4() {
-		b := a.As4()
-		if b[0] == 100 && b[1] >= 64 && b[1] <= 127 { // 100.64.0.0/10
-			return false
-		}
-		if b[0] == 0 || b[0] == 127 || b[0] >= 240 {
-			return false
-		}
-	}
-	return true
+	return netguard.IsPubliclyRoutable(a)
 }
 
 // --- parsers -------------------------------------------------------------

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 
@@ -46,15 +47,9 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 	return code, nil
 }
 
-// jqProgram returns the action's compiled expression, mirroring scriptProgram.
-//
-// The snapshot carries it in production. The on-demand compile is for a rule
-// assembled directly in a test, which never goes through compileScriptConfig --
-// the same reason scriptProgram keeps its fallback.
+// jqProgram compiles inside the one-shot worker. Parent snapshots deliberately
+// retain only source text.
 func jqProgram(rule ScriptRule) (*gojq.Code, error) {
-	if rule.jq != nil {
-		return rule.jq, nil
-	}
 	return compileJQProgram(rule.JQProgram)
 }
 
@@ -112,7 +107,8 @@ func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[strin
 	// json.Unmarshal accepts a single value and trailing whitespace, nothing
 	// else. Decode alone would accept a stream, so a body of two concatenated
 	// documents would start being filtered as if it were the first one.
-	if err := requireJSONEOF(decoder); err != nil {
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return nil, errJQBodyNotJSON
 	}
 	input, representable := normaliseJQNumbers(input)

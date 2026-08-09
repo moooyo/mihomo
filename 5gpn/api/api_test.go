@@ -34,9 +34,9 @@ func TestCapabilitiesReflectFeaturePublishAndWithdrawal(t *testing.T) {
 	if _, ok := read().Features[key]; ok {
 		t.Fatal("withdrawn interception feature remains in /capabilities")
 	}
-	Advertise(key, Feature{Version: 5})
-	if feature, ok := read().Features[key]; !ok || feature.Version != 5 {
-		t.Fatalf("/capabilities interception feature = %+v, present %v; want version 5", feature, ok)
+	Advertise(key, Feature{Version: 6})
+	if feature, ok := read().Features[key]; !ok || feature.Version != 6 {
+		t.Fatalf("/capabilities interception feature = %+v, present %v; want version 6", feature, ok)
 	}
 	Advertise(key, Feature{})
 	if _, ok := read().Features[key]; ok {

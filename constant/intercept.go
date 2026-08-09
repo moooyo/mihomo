@@ -29,14 +29,4 @@ type Interceptor interface {
 	// sniffer peeked -- its ClientHello or request line is still unread. The
 	// implementation is responsible for closing it.
 	HandleTCP(conn net.Conn, metadata *Metadata)
-
-	// MatchUDP and HandleUDP are the datagram equivalents, used for QUIC.
-	//
-	// HandleUDP differs in shape from HandleTCP because the core's UDP path has
-	// no connection to give away: it builds an association and needs a
-	// PacketConn back. The interceptor returns the one it owns, and the core
-	// uses it in place of what an outbound would have produced. The same INNER
-	// rule applies.
-	MatchUDP(metadata *Metadata) bool
-	HandleUDP(metadata *Metadata) (PacketConn, error)
 }

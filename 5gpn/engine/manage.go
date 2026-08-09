@@ -223,7 +223,7 @@ func cloneConfig(c Config) Config {
 	out := c
 	out.runtime = nil
 	out.ExecutionOrder = copyStrings(c.ExecutionOrder)
-	out.Catalogs = append([]CatalogSource(nil), c.Catalogs...)
+	out.Catalogs = append([]CatalogSource{}, c.Catalogs...)
 	out.Modules = make([]Module, len(c.Modules))
 	for i, m := range c.Modules {
 		m.CaptureHosts = copyStrings(m.CaptureHosts)
@@ -481,7 +481,11 @@ func (e *Engine) validateInstall(m Module) (CommittedConfigView, error) {
 	if err != nil {
 		return CommittedConfigView{}, fmt.Errorf("5gpn/engine: marshal config: %w", err)
 	}
-	if _, err := decodeConfig(raw); err != nil {
+	compiled, err := decodeConfig(raw)
+	if err != nil {
+		return CommittedConfigView{}, err
+	}
+	if err := e.config.validateGuestCode(raw, compiled); err != nil {
 		return CommittedConfigView{}, err
 	}
 	return view, nil

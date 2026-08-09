@@ -23,6 +23,7 @@ type Engine struct {
 	egressGroups        *egressGroupRegistry
 	trafficChanged      func()
 	clientBoundaryReady func() bool
+	workers             *workerController
 	// catalogs holds fetched extension indexes for a few minutes. Nothing in it
 	// is state: it exists so opening the extensions page does not put a request
 	// on a publisher's host per render.
@@ -37,8 +38,13 @@ type Engine struct {
 // installed. That ordering is deliberate -- an engine that bound a listener in
 // its constructor would be serving before the caller had decided it should be.
 func New(configPath, stateDir string) (*Engine, error) {
-	config, err := newConfigStore(configPath)
+	workers, err := newWorkerController()
 	if err != nil {
+		return nil, fmt.Errorf("5gpn/engine: extension hard isolation: %w", err)
+	}
+	config, err := newConfigStore(configPath, workers)
+	if err != nil {
+		_ = workers.Close()
 		return nil, fmt.Errorf("5gpn/engine: load %s: %w", configPath, err)
 	}
 	certs := newCertificateStore(config)
@@ -51,16 +57,25 @@ func New(configPath, stateDir string) (*Engine, error) {
 	logs := newEngineLogHub(engineLogRingCapacity)
 	config.setEngineLogPublisher(logs)
 
-	proxy := newInterceptProxy(config, certs, stateDir)
+	proxy := newInterceptProxy(config, certs, workers, stateDir)
 	proxy.setEngineLogPublisher(logs)
 
 	e := &Engine{
-		config: config, certs: certs, logs: logs, proxy: proxy,
+		config: config, certs: certs, logs: logs, proxy: proxy, workers: workers,
 	}
 	proxy.runtimeReady = e.runtimeReadyForHostConfig
 	e.interceptor = NewInterceptor(proxy)
 	e.interceptor.engine = e
 	return e, nil
+}
+
+// Close releases the process-local isolation manager. It is idempotent and
+// kills any worker still scoped to this engine generation.
+func (e *Engine) Close() error {
+	if e == nil || e.workers == nil {
+		return nil
+	}
+	return e.workers.Close()
 }
 
 // Interceptor returns the capture stage to install via tunnel.SetInterceptor.
@@ -89,14 +104,15 @@ func (e *Engine) Reload() error {
 	return nil
 }
 
-// Logs returns retained engine and extension log events, oldest first.
+// Logs returns one cursor-addressable page of retained engine and extension log
+// events.
 //
 // The console reads this rather than subscribing: an operator opens the log
 // after something went wrong, and a stream that starts at "now" has nothing to
 // show them. The hub retains a bounded ring for exactly that case.
-func (e *Engine) Logs(filter EngineLogFilter) []EngineLog {
+func (e *Engine) Logs(query EngineLogQuery) EngineLogPage {
 	if e == nil {
-		return nil
+		return EngineLogPage{Logs: make([]EngineLog, 0)}
 	}
-	return e.logs.Snapshot(filter)
+	return e.logs.Snapshot(query)
 }

@@ -61,9 +61,9 @@ type preparedModuleRequest struct {
 	// bodyBufferRetained means the caller's pre-action body reservation has to
 	// stay held past preparation.
 	bodyBufferRetained bool
-	// bodyBufferBytes is what the buffer actually holds, so the caller can shrink
-	// a reservation that was taken before the length was known down to the real
-	// residency. Zero on the streaming paths, which buffer nothing.
+	// bodyBufferBytes is the buffer capacity actually retained, so the caller can
+	// shrink a reservation that was taken before the length was known down to the
+	// real residency. Zero on the streaming paths, which buffer nothing.
 	bodyBufferBytes int64
 	// responseCandidates is the response-phase match with the status filter not
 	// yet applied. Nil when the request was answered or refused.
@@ -79,7 +79,7 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 
 func moduleRequestProbe(incoming *http.Request, host string) scriptMessage {
 	scheme := "http"
-	if incoming.TLS != nil || incoming.ProtoMajor == 3 {
+	if incoming.TLS != nil {
 		scheme = "https"
 	}
 	return scriptMessage{
@@ -108,20 +108,15 @@ func requestNeedsModuleBodyReservation(incoming *http.Request, rules []matchedSc
 // meant a request with zero matched rules -- one the interceptor forwards
 // byte-for-byte -- was fully resident and held one of the two body slots for as
 // long as the client took to send it.
-//
-// HTTP/3 is the exception and the guard must stay. roundTripHTTP3 replays the
-// request against QUIC version 2 after a version negotiation error, and the
-// replay needs GetBody, which only the buffered path supplies.
 func requestCanStreamWithoutModuleBuffer(incoming *http.Request, rules []matchedScriptRule) bool {
 	if len(rules) > 0 || !requestHasBodySection(incoming) {
 		return len(rules) == 0
 	}
-	return incoming.ProtoMajor != 3 && incoming.ContentLength <= maxModuleHTTPBody
+	return incoming.ContentLength <= maxModuleHTTPBody
 }
 
 func requestCanConditionallyStreamWithModuleActions(incoming *http.Request, rules []matchedScriptRule) bool {
-	if len(rules) == 0 || !requestHasPayload(incoming) || incoming.ProtoMajor == 3 ||
-		incoming.ContentLength > maxModuleHTTPBody {
+	if len(rules) == 0 || !requestHasPayload(incoming) || incoming.ContentLength > maxModuleHTTPBody {
 		return false
 	}
 	encoding, err := normalizedContentEncoding(incoming.Header)
@@ -167,12 +162,9 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			return preparedModuleRequest{}, bodyErr
 		}
 		message.Body = body
-		bodyBufferBytes = int64(len(body))
+		bodyBufferBytes = int64(cap(body))
 		// Retention is about bytes and trailers actually held, not about whether
-		// the request arrived with a body section. quic-go attaches a non-nil Body
-		// and ContentLength -1 to every HTTP/3 request, including a plain GET, so
-		// the old disjunct made every H3 exchange "retain" a zero-byte buffer --
-		// and hold its whole undeclared-length reservation for the round trip.
+		// the request arrived with a body section.
 		bodyBufferRetained = len(body) > 0 || len(incoming.Trailer) > 0
 	}
 	message.Headers.Del("Content-Encoding")
@@ -246,6 +238,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			message.Body = result.Body
 			bodyChanged = true
 			bodyBufferRetained = true
+			bodyBufferBytes = int64(cap(message.Body))
 		}
 	}
 	if conditionalStream {
@@ -261,6 +254,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			}
 			message.Body = body
 			bodyBufferRetained = true
+			bodyBufferBytes = int64(cap(body))
 		default:
 			outbound, responseCandidates, streamErr := streamingModuleRequest(w, incoming, cfg, message)
 			return preparedModuleRequest{outbound: outbound, responseCandidates: responseCandidates}, streamErr
@@ -728,8 +722,8 @@ func (p *interceptProxy) applyStreamingResponseHeaderEdits(
 	return nil
 }
 
-// maxModuleBodyBudgetBytes is the resident body memory the whole process will
-// commit to interception at once.
+// maxModuleBodyBudgetBytes is the resident body working set the whole process
+// will commit to interception at once.
 //
 // It replaces a two-slot semaphore. That semaphore counted streams, not bytes,
 // so a bodyMode "none" proxy-compat action and a 16 MiB buffered response cost
@@ -741,40 +735,26 @@ func (p *interceptProxy) applyStreamingResponseHeaderEdits(
 // with a hard 503 and response-phase with a 502 on an exchange the origin had
 // already answered.
 //
-// 64 MiB is the same figure as maxModuleHTTPBody: one maximal body may be in
-// flight, or many ordinary ones. The invariant the count was there for survives
-// -- admission is still taken before any action can produce a side effect,
-// including for a bodyless request, because a script can synthesise a body from
-// nothing.
-//
-// The budget is deliberately a multiple of maxModuleHTTPBody rather than equal
-// to it. A reservation has to be taken before the body is read, so a response
-// of undeclared length reserves the whole of what it is allowed to read; when
-// the budget was exactly one maximal body, one such exchange excluded every
-// other one for its duration. Sizing the budget at four maximal bodies keeps
-// admission honest -- reserving what will actually be read rather than a
-// smaller number -- without turning every chunked response into a global lock.
-const maxModuleBodyBudgetBytes = int64(4 * maxModuleHTTPBody)
+// A buffered action may simultaneously retain the wire body, its decoded
+// representation, a guest projection, a guest result and the exported result.
+// Six maximal bodies admit that five-copy worst case plus the request buffer
+// retained while a maximal response is transformed. Ordinary messages reserve
+// their declared and action limits, so they still share the budget.
+const maxModuleBodyBudgetBytes = int64(6 * maxModuleHTTPBody)
 
 // moduleBodyBudget admits resident body bytes rather than streams.
 type moduleBodyBudget struct {
-	mu    sync.Mutex
-	cond  *sync.Cond
-	limit int64
-	used  int64
+	mu      sync.Mutex
+	limit   int64
+	used    int64
+	changed chan struct{}
 }
 
 func newModuleBodyBudget(limit int64) *moduleBodyBudget {
-	budget := &moduleBodyBudget{limit: limit}
-	budget.cond = sync.NewCond(&budget.mu)
-	return budget
+	return &moduleBodyBudget{limit: limit, changed: make(chan struct{})}
 }
 
 // acquire reserves want bytes, waiting up to wait for room.
-//
-// A reservation larger than the whole budget is clamped to it rather than
-// refused: the caller has already been bounded by maxModuleHTTPBody, and
-// refusing outright would make the largest legal body permanently unservable.
 func (b *moduleBodyBudget) acquire(ctx context.Context, want int64, wait time.Duration) bool {
 	if b == nil {
 		return true
@@ -783,39 +763,33 @@ func (b *moduleBodyBudget) acquire(ctx context.Context, want int64, wait time.Du
 		want = 0
 	}
 	if want > b.limit {
-		want = b.limit
+		return false
 	}
-	deadline := time.Now().Add(wait)
-
-	// A waiter that stops waiting has to be woken, and sync.Cond has no
-	// deadline. One timer per waiter broadcasts at the deadline; ctx
-	// cancellation is folded in the same way.
-	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
-	defer stop()
-	timer := time.AfterFunc(wait, func() {
-		close(done)
-		b.cond.Broadcast()
-	})
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for b.used+want > b.limit {
-		select {
-		case <-done:
+	for {
+		if err := ctx.Err(); err != nil {
 			return false
+		}
+		b.mu.Lock()
+		if b.used+want <= b.limit {
+			b.used += want
+			b.mu.Unlock()
+			return true
+		}
+		if b.changed == nil {
+			b.changed = make(chan struct{})
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
 		case <-ctx.Done():
 			return false
-		default:
-		}
-		if !time.Now().Before(deadline) {
+		case <-timer.C:
 			return false
+		case <-changed:
 		}
-		b.cond.Wait()
 	}
-	b.used += want
-	return true
 }
 
 func (b *moduleBodyBudget) release(want int64) {
@@ -833,77 +807,176 @@ func (b *moduleBodyBudget) release(want int64) {
 	if b.used < 0 {
 		b.used = 0
 	}
+	if b.changed != nil {
+		close(b.changed)
+	}
+	b.changed = make(chan struct{})
 	b.mu.Unlock()
-	b.cond.Broadcast()
 }
 
-// moduleBodyReservation is what a request is expected to hold resident.
-//
-// A declared length is the honest figure, capped by what the matched rules are
-// allowed to read. An undeclared one, and a bodyless request whose actions may
-// still synthesise a response, reserve the largest limit any matched rule
-// carries -- which is what those actions are permitted to hand back. A mock is
-// different: its output is fixed by the manifest and may legally exceed the
-// neighbouring maxBodyBytes read limit, so its already-validated exact size is
-// also a floor. Using the size cached during validation avoids decoding and
-// allocating a large synthetic body before admission accepts it.
+// moduleBodyReservation covers every request-body representation that can be
+// live during one action: wire bytes, decoded bytes for a coded request, the
+// guest input, the guest result and the exported host result. The reservation
+// is taken before reading or decoding anything.
 func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) int64 {
-	limit := moduleBodyReadLimit(rules)
+	readLimit := moduleBodyReadLimit(rules)
+	wire := moduleRequestWireReservation(incoming, readLimit)
+	decodedBound := wire
+	mayDecode := wire > 0 && moduleRequestMayDecode(incoming)
+	if mayDecode {
+		decodedBound = readLimit
+	}
+	hostResult, guestResult := moduleResultLimits(rules)
+	guestInput := moduleGuestInputWorkingSet(rules, decodedBound)
+	reservation := addModuleBytes(wire, guestInput, hostResult, guestResult)
+	if mayDecode {
+		reservation = addModuleBytes(reservation, decodedBound)
+	}
+	return reservation
+}
+
+// moduleResponseBodyReservation is taken before the wire body is read. A
+// response with no Content-Encoding may still be a gzip stream detected by its
+// magic bytes, so every buffered response reserves the decode ceiling before
+// that sniff and before decompression. This is intentionally more conservative
+// than the request path, which never performs content sniffing.
+func moduleResponseBodyReservation(response *http.Response, rules []matchedScriptRule) int64 {
+	readLimit := moduleBodyReadLimit(rules)
+	wire := moduleResponseWireReservation(response, readLimit)
+	decodedBound := wire
+	mayDecode := wire > 0 && moduleResponseMayDecode(response)
+	if mayDecode {
+		decodedBound = maxModuleHTTPBody
+	}
+	hostResult, guestResult := moduleResultLimits(rules)
+	guestInput := moduleGuestInputWorkingSet(rules, decodedBound)
+	reservation := addModuleBytes(wire, guestInput, hostResult, guestResult)
+	if mayDecode {
+		reservation = addModuleBytes(reservation, decodedBound)
+	}
+	return reservation
+}
+
+func moduleRequestWireReservation(request *http.Request, limit int64) int64 {
+	if request == nil || (request.ContentLength == 0 && !requestHasPayload(request)) {
+		return 0
+	}
+	return moduleWireReservation(request.ContentLength, limit)
+}
+
+func moduleResponseWireReservation(response *http.Response, limit int64) int64 {
+	if response == nil || response.ContentLength == 0 {
+		return 0
+	}
+	return moduleWireReservation(response.ContentLength, limit)
+}
+
+func moduleWireReservation(contentLength, limit int64) int64 {
+	if contentLength > 0 && contentLength < limit {
+		return contentLength
+	}
+	return limit
+}
+
+func moduleRequestMayDecode(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	encoding, err := normalizedContentEncoding(request.Header)
+	return err != nil || (encoding != "" && encoding != "identity")
+}
+
+func moduleResponseMayDecode(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	encoding, err := normalizedContentEncoding(response.Header)
+	// An empty coding can still take the gzip-magic compatibility path.
+	return err != nil || encoding != "identity"
+}
+
+func moduleGuestInputWorkingSet(rules []matchedScriptRule, initialBody int64) int64 {
+	body := initialBody
 	widest := int64(0)
 	for _, matched := range rules {
-		if matched.Rule.MaxBodyBytes > widest {
-			widest = matched.Rule.MaxBodyBytes
+		rule := matched.Rule
+		if rule.BodyMode != "none" {
+			projected := minModuleBytes(body, rule.MaxBodyBytes)
+			if projected > widest {
+				widest = projected
+			}
 		}
-		if mockBytes := matched.Rule.Mock.bodySize(); mockBytes > widest {
-			widest = mockBytes
+		if moduleRuleChangesBody(rule) {
+			if result := moduleRuleResultLimit(rule); result > body {
+				body = result
+			}
 		}
-	}
-	if widest == 0 {
-		widest = limit
-	}
-	if incoming != nil && incoming.ContentLength > 0 {
-		declared := incoming.ContentLength
-		if declared > limit {
-			declared = limit
-		}
-		if declared > widest {
-			return declared
-		}
-		return widest
 	}
 	return widest
 }
 
-// moduleResponseBodyReservation is what the buffered response path will hold.
-//
-// The response leg cannot reuse moduleBodyReservation, because the two answer
-// different questions. moduleBodyReadLimit deliberately skips bodyMode "none"
-// rules and falls back to the process-wide cap when none remains, so a response
-// rule set that is entirely "none" reads up to 64 MiB -- while the widest
-// declared limit across those same rules can be as little as 1 KiB. Reserving
-// the declared figure therefore under-counted the read by up to four orders of
-// magnitude, and the budget stopped bounding the thing it exists to bound.
-//
-// The widest declared limit stays as a floor because an action may synthesise a
-// body it never read, up to its own limit. A mock's exact validated body is a
-// second floor because mock output is intentionally independent of that read
-// limit.
-func moduleResponseBodyReservation(response *http.Response, rules []matchedScriptRule) int64 {
-	reserve := moduleBodyReadLimit(rules)
-	if response != nil && response.ContentLength > 0 && response.ContentLength < reserve {
-		reserve = response.ContentLength
-	}
-	widest := int64(0)
+// moduleResultLimits includes the host result every action may produce. A
+// JavaScript, jq, or body-replace action also retains a guest/intermediate
+// result until export completes. Declarative mock output is fixed and needs no
+// second copy; its validated size is used without decoding it during admission.
+func moduleResultLimits(rules []matchedScriptRule) (int64, int64) {
+	hostResult := int64(0)
+	guestResult := int64(0)
 	for _, matched := range rules {
-		if matched.Rule.MaxBodyBytes > widest {
-			widest = matched.Rule.MaxBodyBytes
+		rule := matched.Rule
+		if rule.Mock == nil && !moduleRuleMaterializesResult(rule) {
+			continue
 		}
-		if mockBytes := matched.Rule.Mock.bodySize(); mockBytes > widest {
-			widest = mockBytes
+		candidate := moduleRuleResultLimit(rule)
+		if candidate > hostResult {
+			hostResult = candidate
+		}
+		if moduleRuleMaterializesResult(rule) && candidate > guestResult {
+			guestResult = candidate
 		}
 	}
-	if widest > reserve {
-		return widest
+	return hostResult, guestResult
+}
+
+func moduleRuleResultLimit(rule ScriptRule) int64 {
+	limit := rule.MaxBodyBytes
+	if rule.Mock != nil {
+		limit = rule.Mock.bodySize()
 	}
-	return reserve
+	if limit > maxModuleHTTPBody {
+		return maxModuleHTTPBody
+	}
+	if limit < 0 {
+		return 0
+	}
+	return limit
+}
+
+func moduleRuleChangesBody(rule ScriptRule) bool {
+	return rule.Mock != nil || moduleRuleMaterializesResult(rule)
+}
+
+func moduleRuleMaterializesResult(rule ScriptRule) bool {
+	return rule.Mock == nil && !rule.Reject && rule.Headers == nil && rule.Rewrite == nil
+}
+
+func minModuleBytes(left, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func addModuleBytes(values ...int64) int64 {
+	total := int64(0)
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if value > maxModuleBodyBudgetBytes-total {
+			return maxModuleBodyBudgetBytes
+		}
+		total += value
+	}
+	return total
 }

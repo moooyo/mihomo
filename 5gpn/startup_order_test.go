@@ -63,7 +63,7 @@ func TestDNSDoesNotListenWhenInterceptionPlanCannotBeBuilt(t *testing.T) {
 	}
 }
 
-func TestInterceptionCapabilityV5PublishAndWithdraw(t *testing.T) {
+func TestInterceptionCapabilityV6PublishAndWithdraw(t *testing.T) {
 	advertiseInterceptionCapability(false)
 	t.Cleanup(func() { advertiseInterceptionCapability(false) })
 	if _, ok := api.LookupFeature(capabilityInterceptionKey); ok {
@@ -72,8 +72,8 @@ func TestInterceptionCapabilityV5PublishAndWithdraw(t *testing.T) {
 
 	advertiseInterceptionCapability(true)
 	feature, ok := api.LookupFeature(capabilityInterceptionKey)
-	if !ok || feature.Version != 5 {
-		t.Fatalf("advertised interception capability = %+v, present %v; want version 5", feature, ok)
+	if !ok || feature.Version != 6 {
+		t.Fatalf("advertised interception capability = %+v, present %v; want version 6", feature, ok)
 	}
 
 	advertiseInterceptionCapability(false)

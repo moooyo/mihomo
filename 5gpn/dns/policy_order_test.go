@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,12 +152,6 @@ func TestUpdateStoresRulesGrouped(t *testing.T) {
 
 	_, revision := svc.Document()
 	doc, _, err := svc.Update(revision, func(d Document) (Document, error) {
-		// Same reasons startService does this: a bound DoT listener drags a
-		// certificate lineage into a test about rule order, and the default
-		// document's fixed debug port is not bindable on every machine.
-		d.Listen.DoT = ""
-		d.Listen.Debug = freePort(t)
-		d.Listen.Origin = freePort(t)
 		d.Policy = Policy{
 			Fallback: FallbackAuto,
 			Rules: []Rule{
@@ -172,11 +167,9 @@ func TestUpdateStoresRulesGrouped(t *testing.T) {
 	sameIDs(t, "stored", doc.Policy.Rules, "hand", "sub")
 }
 
-// A gateway configured while the two kinds were one interleaved list converges
-// on open, not on the next write -- otherwise it would keep resolving in the
-// old precedence for as long as nobody touched the policy, while the console
-// showed the new one.
-func TestOpenGroupsAnInterleavedDocument(t *testing.T) {
+// The pre-release schema accepts only the current grouped representation. An
+// interleaved document is rejected instead of being silently migrated on open.
+func TestOpenRejectsAnInterleavedDocument(t *testing.T) {
 	dir := t.TempDir()
 	seed := Document{
 		Gateway:   "198.51.100.1",
@@ -197,11 +190,7 @@ func TestOpenGroupsAnInterleavedDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := openForTest(t, dir)
-	doc, _ := svc.Document()
-	sameIDs(t, "after open", doc.Policy.Rules, "hand", "sub")
-
-	// It converged on disk, not just in memory.
-	again, _ := openForTest(t, dir).Document()
-	sameIDs(t, "after reopen", again.Policy.Rules, "hand", "sub")
+	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "hand-written rules must precede subscriptions") {
+		t.Fatalf("Open() error = %v, want current-schema ordering rejection", err)
+	}
 }

@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -184,10 +183,14 @@ func dialAddr(raw, defaultPort string) (string, error) {
 
 // member is one built upstream: what to dial and how.
 type member struct {
-	spec   MemberSpec
-	net    string      // "udp" or "tcp-tls"; empty for DoH
-	tlsCfg *tls.Config // nil for plain UDP
-	doh    *dohClient  // non-nil only for DoH
+	spec    MemberSpec
+	net     string      // "udp" or "tcp-tls"; empty for DoH
+	tlsCfg  *tls.Config // nil for plain UDP
+	doh     *dohClient  // non-nil only for DoH
+	breaker *breaker
+	// exchangeFn is a test seam for member failover and breaker behavior.
+	// Production members always leave it nil and use the concrete transports.
+	exchangeFn func(context.Context, *D.Msg) (*D.Msg, error)
 }
 
 // group is one of the two operator upstream pools.
@@ -199,12 +202,10 @@ type member struct {
 type group struct {
 	members []member
 	label   string
-	breaker *breaker
 
-	// ecs is the client subnet attached to every outgoing query, set only on
-	// the china group. An atomic pointer because the console swaps it while
-	// queries are reading it.
-	ecs atomic.Pointer[netip.Prefix]
+	// ecs is the client subnet attached to every outgoing query, set only while
+	// the china group is prepared and immutable after runtime publication.
+	ecs netip.Prefix
 }
 
 // newGroup builds a group from parsed specs.
@@ -222,45 +223,36 @@ func newGroup(label string, specs []MemberSpec) *group {
 				// next member, which is strictly better than refusing to build a
 				// resolver the gateway cannot start without.
 				log.Warnln("[5GPN/DNS] %s upstream %q: %v -- member disabled", label, s.Raw, err)
-				members = append(members, member{spec: s})
+				members = append(members, member{spec: s, breaker: newBreaker()})
 				continue
 			}
-			members = append(members, member{spec: s, doh: client})
+			members = append(members, member{spec: s, doh: client, breaker: newBreaker()})
 		case TransportDoT:
 			members = append(members, member{
-				spec:   s,
-				net:    "tcp-tls",
-				tlsCfg: &tls.Config{ServerName: s.ServerName, ClientSessionCache: sessions, MinVersion: tls.VersionTLS12},
+				spec:    s,
+				net:     "tcp-tls",
+				tlsCfg:  &tls.Config{ServerName: s.ServerName, ClientSessionCache: sessions, MinVersion: tls.VersionTLS12},
+				breaker: newBreaker(),
 			})
 		default:
-			members = append(members, member{spec: s, net: "udp"})
+			members = append(members, member{spec: s, net: "udp", breaker: newBreaker()})
 		}
 	}
-	return &group{members: members, label: label, breaker: newBreaker()}
+	return &group{members: members, label: label}
 }
 
 // SetECS sets or, with an invalid prefix, clears the subnet attached to
-// outgoing queries.
+// outgoing queries. It is called only while a group is being prepared, before
+// the immutable runtime snapshot publishes it.
 func (g *group) SetECS(p netip.Prefix) {
 	if g == nil {
 		return
 	}
 	if !p.IsValid() {
-		g.ecs.Store(nil)
+		g.ecs = netip.Prefix{}
 		return
 	}
-	g.ecs.Store(&p)
-}
-
-// ECS reports the attached subnet, or the zero prefix when disabled.
-func (g *group) ECS() netip.Prefix {
-	if g == nil {
-		return netip.Prefix{}
-	}
-	if p := g.ecs.Load(); p != nil {
-		return *p
-	}
-	return netip.Prefix{}
+	g.ecs = p
 }
 
 // Specs reports the raw member specs, for the API and diagnostics.
@@ -282,62 +274,94 @@ func (g *group) Specs() []string {
 // query budget and starve the ones behind it, and whatever an early failure
 // does not spend rolls forward to the next.
 func (g *group) Exchange(ctx context.Context, q *D.Msg) (*D.Msg, error) {
-	if !g.breaker.allow() {
-		return nil, fmt.Errorf("5gpn/dns: %s group circuit open", g.label)
-	}
-
 	// Always send a private copy with the client's subnet removed. Only the
 	// operator's configured value may leave the gateway, trust must never
 	// receive one at all, and a client-supplied value must never influence a
 	// response another client will read out of the cache.
 	send := q.Copy()
 	stripECS(send)
-	if p := g.ecs.Load(); p != nil {
-		setECS(send, *p)
+	if g.ecs.IsValid() {
+		setECS(send, g.ecs)
 	}
 
+	type candidate struct {
+		member *member
+		probe  bool
+	}
+	candidates := make([]candidate, 0, len(g.members))
+	for i := range g.members {
+		allowed, probe := g.members[i].breaker.admit()
+		if allowed {
+			candidates = append(candidates, candidate{member: &g.members[i], probe: probe})
+		}
+	}
+	// Release half-open reservations for candidates an earlier success or
+	// caller cancellation prevents us from reaching.
+	nextCandidate := 0
+	defer func() {
+		for ; nextCandidate < len(candidates); nextCandidate++ {
+			if candidates[nextCandidate].probe {
+				candidates[nextCandidate].member.breaker.recordCanceled()
+			}
+		}
+	}()
+
 	var lastErr error
-	for i, m := range g.members {
+	for nextCandidate < len(candidates) {
+		candidate := candidates[nextCandidate]
+		m := candidate.member
+		remaining := len(candidates) - nextCandidate
+		nextCandidate++
 		attemptCtx := ctx
 		var cancel context.CancelFunc
 		if dl, ok := ctx.Deadline(); ok {
-			attemptCtx, cancel = context.WithTimeout(ctx, time.Until(dl)/time.Duration(len(g.members)-i))
+			attemptCtx, cancel = context.WithTimeout(ctx, time.Until(dl)/time.Duration(remaining))
 		}
 		msg, err := m.exchange(attemptCtx, send)
 		if cancel != nil {
 			cancel()
 		}
 
-		// Caller cancellation is not an upstream health signal -- see
-		// breaker.recordCanceled. Checked on the PARENT context, because an
-		// attempt-slice timeout is DeadlineExceeded on the child only and must
-		// keep the loop going.
-		if ctx.Err() == context.Canceled {
-			g.breaker.recordCanceled()
-			if err == nil {
-				err = ctx.Err()
+		// Inspect the PARENT context so an attempt-slice DeadlineExceeded on the
+		// child still falls through to the next member. Explicit caller
+		// cancellation is not a health signal. Exhausting the complete query
+		// deadline is a failure of the member that consumed it, but later members
+		// were never attempted and must not be scored.
+		if parentErr := ctx.Err(); parentErr != nil {
+			if parentErr == context.Canceled {
+				if candidate.probe {
+					m.breaker.recordCanceled()
+				}
+			} else {
+				m.breaker.record(false)
 			}
-			return nil, fmt.Errorf("5gpn/dns: %s exchange abandoned by caller: %w", g.label, err)
+			if err == nil {
+				err = parentErr
+			}
+			return nil, fmt.Errorf("5gpn/dns: %s exchange context ended: %w", g.label, err)
 		}
 
 		if err == nil {
 			// The subnet is an upstream implementation detail. Strip an echo, or
 			// an option nobody asked for, whether or not we sent one.
 			stripECS(msg)
-			g.breaker.record(true)
+			m.breaker.record(true)
 			return msg, nil
 		}
+		m.breaker.record(false)
 		lastErr = err
 	}
 
 	if lastErr == nil {
-		lastErr = errors.New("no members configured")
+		lastErr = errors.New("no members available")
 	}
-	g.breaker.record(false)
 	return nil, fmt.Errorf("5gpn/dns: all %s upstreams failed: %w", g.label, lastErr)
 }
 
 func (m member) exchange(ctx context.Context, q *D.Msg) (*D.Msg, error) {
+	if m.exchangeFn != nil {
+		return m.exchangeFn(ctx, q)
+	}
 	if m.doh != nil {
 		// Pooled HTTP/2: no per-query handshake, and cancelling resets one
 		// stream rather than tearing down the connection.

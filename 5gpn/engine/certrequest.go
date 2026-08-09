@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -141,15 +140,7 @@ func readBoundedControlFile(path string) ([]byte, error) {
 }
 
 func decodeStrictCertificateJSON(raw []byte, destination any) error {
-	if err := rejectDuplicateJSONKeys(raw); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	return requireJSONEOF(decoder)
+	return state.DecodeJSONBytes(raw, maxCertificateControlFile, destination)
 }
 
 func validLowerHex(value string, size int) bool {
