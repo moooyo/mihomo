@@ -45,12 +45,12 @@ fi
 if grep -Eq '^  Upload-Prerelease:' "$build_workflow"; then
   fail "workflow still moves a rolling prerelease tag"
 fi
-grep -Fq -- '--latest=false' "$build_workflow" \
-  || fail "publish job does not opt out of implicit latest selection"
-grep -Fq 'Reconcile-Latest:' "$build_workflow" \
-  || fail "workflow does not reconcile latest after publication"
-grep -Fq 'group: mihomo-monolith-reconcile-latest' "$build_workflow" \
-  || fail "latest reconciliation does not use its fixed concurrency group"
+grep -Fq -- '--latest' "$build_workflow" \
+  || fail "stable publication does not set latest before becoming immutable"
+grep -Fq 'group: mihomo-monolith-publish' "$build_workflow" \
+  || fail "immutable publication is not serialized"
+grep -Fq '.immutable == true' "$build_workflow" \
+  || fail "published release immutability is not verified"
 grep -Fq 'git cat-file -t "refs/tags/${CURRENT_VERSION}"' "$build_workflow" \
   || fail "release resume does not require an annotated tag"
 grep -Fq 'grep -vxF "${CURRENT_VERSION}"' "$build_workflow" \
