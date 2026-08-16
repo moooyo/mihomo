@@ -31,3 +31,25 @@ func TestNewRequiresPrivateDocumentMode(t *testing.T) {
 		t.Fatal("New accepted a state document that was not mode 0600")
 	}
 }
+
+func TestWritePublicFilePublishesFinalModeBeforeDirectorySync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "certificate-request")
+	checked := false
+	err := writeFileMode(path, []byte(`{"version":1}`), 0o644, func(string) error {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat published request: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Fatalf("mode at directory sync = %04o, want 0644", got)
+		}
+		checked = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("write public file: %v", err)
+	}
+	if !checked {
+		t.Fatal("directory sync seam was not reached")
+	}
+}

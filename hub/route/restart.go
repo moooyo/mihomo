@@ -34,6 +34,9 @@ func restart(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	if requestProcessRestart() {
+		return
+	}
 
 	// modify from https://github.com/AdguardTeam/AdGuardHome/blob/595484e0b3fb4c457f9bb727a6b94faa78a66c5f/internal/home/controlupdate.go#L180
 	// The background context is used because the underlying functions wrap it

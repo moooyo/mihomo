@@ -84,10 +84,13 @@ type SubscriptionStatus struct {
 }
 
 type subscriptions struct {
-	svc  *Service
-	stop chan struct{}
-	wake chan struct{}
-	once sync.Once
+	svc    *Service
+	stop   chan struct{}
+	wake   chan struct{}
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	once   sync.Once
 
 	mu     sync.Mutex
 	status map[string]SubscriptionStatus
@@ -98,10 +101,14 @@ type subscriptions struct {
 }
 
 func newSubscriptions(s *Service) *subscriptions {
+	ctx, cancel := context.WithCancel(context.Background())
 	subs := &subscriptions{
 		svc:    s,
 		stop:   make(chan struct{}),
 		wake:   make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
 		status: make(map[string]SubscriptionStatus),
 	}
 	go subs.run()
@@ -109,6 +116,7 @@ func newSubscriptions(s *Service) *subscriptions {
 }
 
 func (s *subscriptions) run() {
+	defer close(s.done)
 	ticker := time.NewTicker(subscriptionTick)
 	defer ticker.Stop()
 	for {
@@ -136,7 +144,17 @@ func (s *subscriptions) stopRun() {
 	if s == nil {
 		return
 	}
-	s.once.Do(func() { close(s.stop) })
+	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.stop != nil {
+			close(s.stop)
+		}
+	})
+	if s.done != nil {
+		<-s.done
+	}
 }
 
 // Status reports every subscription rule's last fetch.
@@ -202,7 +220,11 @@ func (s *subscriptions) fetch(rule Rule, token subscriptionFetchToken) bool {
 		return false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 
 	st := SubscriptionStatus{RuleID: rule.ID, LastAttempt: time.Now()}

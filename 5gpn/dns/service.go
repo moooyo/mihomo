@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/5gpn/dns/ingress"
@@ -247,6 +248,7 @@ type Service struct {
 	// without this outer lock a later revision could publish before an earlier
 	// writer resumes and installs stale runtime state.
 	updateMu sync.Mutex
+	closing  atomic.Bool
 
 	subs *subscriptions
 }
@@ -345,6 +347,10 @@ func (s *Service) Document() (Document, string) {
 func (s *Service) Update(revision string, mutate func(Document) (Document, error)) (Document, string, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	if s.closing.Load() {
+		document, currentRevision := s.Document()
+		return document, currentRevision, errors.New("5gpn/dns: service is shutting down")
+	}
 
 	var prepared *preparedDocument
 	snap, err := s.doc.Update(revision, func(current Document) (Document, error) {
@@ -384,6 +390,9 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 func (s *Service) refreshCompiledPolicy() error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	if s.closing.Load() {
+		return errors.New("5gpn/dns: service is shutting down")
+	}
 	document, _ := s.Document()
 	compiled, err := compile(document.Policy, s.rulesDir)
 	if err != nil {
@@ -527,13 +536,23 @@ func (s *Service) Subscriptions() []SubscriptionStatus { return s.subs.snapshot(
 
 // Shutdown stops the listeners and the subscription refresher.
 func (s *Service) Shutdown(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.closing.Store(true)
 	s.subs.stopRun()
+	// Wait for a document transaction that entered before closing became
+	// visible. Update rechecks closing under this same lock, so nothing can
+	// publish a fresh upstream generation after the final pools are closed.
+	s.updateMu.Lock()
+	s.updateMu.Unlock()
 	s.mu.Lock()
 	ing := s.ing
 	s.mu.Unlock()
 	if ing != nil {
 		ing.Shutdown(ctx)
 	}
+	s.resolver.Close()
 }
 
 // certSource serves the DoT leaf, re-reading it as it is renewed.

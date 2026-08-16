@@ -114,6 +114,32 @@ func TestSubscriptionSourceChangeIsImmediatelyDue(t *testing.T) {
 	}
 }
 
+func TestSubscriptionStopCancelsCurrentFetchAndWaits(t *testing.T) {
+	rule := testSubscriptionRule("https://lists.example/slow", "plain")
+	_, svc, _, _ := newSubscriptionHarness(t, rule)
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	subs := &subscriptions{
+		svc: svc, stop: make(chan struct{}), wake: make(chan struct{}, 1), done: make(chan struct{}),
+		ctx: ctx, cancel: cancel, status: make(map[string]SubscriptionStatus),
+		downloadFn: func(ctx context.Context, _ Rule) ([]string, error) {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
+			return nil, ctx.Err()
+		},
+	}
+	go subs.run()
+	<-started
+	subs.stopRun()
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("stopRun returned before the current fetch observed cancellation")
+	}
+}
+
 func TestSubscriptionStaleFetchCannotReplaceNewSourceCache(t *testing.T) {
 	oldRule := testSubscriptionRule("https://lists.example/old", "plain")
 	subs, svc, oldToken, cachePath := newSubscriptionHarness(t, oldRule)

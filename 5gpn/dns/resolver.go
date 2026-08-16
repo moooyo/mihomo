@@ -108,6 +108,7 @@ type Resolver struct {
 
 	runtime   atomic.Pointer[runtimeSnapshot]
 	runtimeMu sync.Mutex
+	closed    atomic.Bool
 	// originSem is deliberately separate from the client budget. Origin
 	// lookups are made by the tunnel and by guarded subscription fetches; if
 	// they shared a saturated client budget, work already admitted on the
@@ -117,6 +118,25 @@ type Resolver struct {
 	flightMu    sync.Mutex
 	flights     map[flightKey]*flight
 	flightLimit int
+}
+
+// Close releases the currently published upstream connection pools after the
+// service has stopped accepting DNS requests. Replaced generations already
+// retire themselves; this handles the final live generation at process exit.
+func (r *Resolver) Close() {
+	if r == nil || r.closed.Swap(true) {
+		return
+	}
+	current := r.snapshot()
+	if current == nil || current.ups == nil {
+		return
+	}
+	if current.ups.china != nil {
+		current.ups.china.Close()
+	}
+	if current.ups.trust != nil {
+		current.ups.trust.Close()
+	}
 }
 
 // Options configures a Resolver. Zero values take documented defaults.

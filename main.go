@@ -75,13 +75,41 @@ func init() {
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
-	flag.Parse()
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == fivegpn.ExtensionWorkerCommand() {
-		os.Exit(fivegpn.ExtensionWorkerMain(os.Args[2:]))
+	os.Exit(run())
+}
+
+func run() (exitCode int) {
+	if len(os.Args) > 1 && os.Args[1] == fivegpn.ContainerContractCommand() {
+		return fivegpn.ContainerContractMain(os.Args[2:], os.Stdout)
 	}
+	if len(os.Args) > 1 && os.Args[1] == fivegpn.ExtensionWorkerCommand() {
+		return fivegpn.ExtensionWorkerMain(os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-nodes" {
+		fivegpn.NodesMain(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "convert-ruleset" {
+		provider.ConvertMain(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "generate" {
+		generator.Main(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "age" {
+		age.Main(os.Args[2:])
+		return
+	}
+
+	// init only registers application flags. Test binaries register their
+	// -test.* flags after package initialization, so parsing there makes the
+	// root package impossible to test. Same-binary one-shot modes deliberately
+	// dispatch above this ordinary-runtime boundary.
+	flag.Parse()
 
 	// Defensive programming: panic when code mistakenly calls net.DefaultResolver
 	net.DefaultResolver.PreferGo = true
@@ -103,26 +131,6 @@ func main() {
 
 	_, _ = maxprocs.Set(maxprocs.Logger(func(string, ...any) {}))
 
-	if len(os.Args) > 1 && os.Args[1] == "5gpn-nodes" {
-		fivegpn.NodesMain(os.Args[2:])
-		return
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "convert-ruleset" {
-		provider.ConvertMain(os.Args[2:])
-		return
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "generate" {
-		generator.Main(os.Args[2:])
-		return
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "age" {
-		age.Main(os.Args[2:])
-		return
-	}
-
 	if version {
 		fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
 			C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)
@@ -131,6 +139,21 @@ func main() {
 		}
 
 		return
+	}
+
+	termSource := make(chan os.Signal, 1)
+	termSign := make(chan struct{}, 1)
+	hupSign := make(chan os.Signal, 1)
+	if !testConfig {
+		termRelayStop := make(chan struct{})
+		signal.Notify(termSource, syscall.SIGINT, syscall.SIGTERM)
+		signal.Notify(hupSign, syscall.SIGHUP)
+		go relayRuntimeTermination(termSource, termSign, termRelayStop, hub.ArmFiveGPNExitWatchdog)
+		defer func() {
+			close(termRelayStop)
+			signal.Stop(termSource)
+			signal.Stop(hupSign)
+		}()
 	}
 
 	if homeDir != "" {
@@ -156,15 +179,15 @@ func main() {
 		var err error
 		configBytes, err = base64.StdEncoding.DecodeString(configString)
 		if err != nil {
-			log.Fatalln("Initial configuration error: %s", err.Error())
-			return
+			log.Errorln("Initial configuration error: %s", err.Error())
+			return 1
 		}
 	} else if configFile == "-" {
 		var err error
 		configBytes, err = io.ReadAll(os.Stdin)
 		if err != nil {
-			log.Fatalln("Initial configuration error: %s", err.Error())
-			return
+			log.Errorln("Initial configuration error: %s", err.Error())
+			return 1
 		}
 	} else {
 		if configFile != "" {
@@ -178,7 +201,8 @@ func main() {
 		C.SetConfig(configFile)
 
 		if err := config.Init(C.Path.HomeDir()); err != nil {
-			log.Fatalln("Initial configuration directory error: %s", err.Error())
+			log.Errorln("Initial configuration directory error: %s", err.Error())
+			return 1
 		}
 	}
 
@@ -187,13 +211,13 @@ func main() {
 			if _, err := executor.ParseWithBytes(configBytes); err != nil {
 				log.Errorln("%s", err.Error())
 				fmt.Println("configuration test failed")
-				os.Exit(1)
+				return 1
 			}
 		} else {
 			if _, err := executor.Parse(); err != nil {
 				log.Errorln("%s", err.Error())
 				fmt.Printf("configuration file %s test failed\n", C.Path.Config())
-				os.Exit(1)
+				return 1
 			}
 		}
 		fmt.Printf("configuration file %s test is successful\n", C.Path.Config())
@@ -223,41 +247,65 @@ func main() {
 		options = append(options, hub.WithSecret(secret))
 	}
 
+	postDownReady := false
+	defer func() {
+		finishRuntimeExit(shutdownRuntime, func() {
+			if postDownReady && postDown != "" && !hub.FiveGPNFatalPending() {
+				if _, err := cmd.ExecShell(postDown); err != nil {
+					log.Errorln("post-down script error: %s", err.Error())
+				}
+			}
+		})
+		if hub.FiveGPNFatalPending() {
+			exitCode = 1
+		}
+	}()
+
+	if exit, ready := pollRuntimeExit(termSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents()); ready {
+		logRuntimeExit(exit)
+		return runtimeExitCode(exit)
+	}
 	if err := hub.Parse(configBytes, options...); err != nil {
-		log.Fatalln("Parse config error: %s", err.Error())
+		log.Errorln("Parse config error: %s", err.Error())
+		return 1
+	}
+	if exit, ready := pollRuntimeExit(termSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents()); ready {
+		logRuntimeExit(exit)
+		return runtimeExitCode(exit)
 	}
 
 	if updater.GeoAutoUpdate() {
 		updater.RegisterGeoUpdater()
 	}
-
-	if postDown != "" {
-		defer func() {
-			if _, err := cmd.ExecShell(postDown); err != nil {
-				log.Errorln("post-down script error: %s", err.Error())
-			}
-		}()
+	if exit, ready := pollRuntimeExit(termSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents()); ready {
+		logRuntimeExit(exit)
+		return runtimeExitCode(exit)
 	}
+
+	postDownReady = true
 	if postUp != "" {
 		if _, err := cmd.ExecShell(postUp); err != nil {
-			log.Fatalln("post-up script error: %s", err.Error())
-		}
-	}
-
-	defer executor.Shutdown()
-
-	termSign := make(chan os.Signal, 1)
-	hupSign := make(chan os.Signal, 1)
-	signal.Notify(termSign, syscall.SIGINT, syscall.SIGTERM)
-	signal.Notify(hupSign, syscall.SIGHUP)
-	for {
-		select {
-		case <-termSign:
-			return
-		case <-hupSign:
-			if err := hub.Parse(configBytes, options...); err != nil {
-				log.Errorln("Parse config error: %s", err.Error())
+			log.Errorln("post-up script error: %s", err.Error())
+			if exit, ready := pollRuntimeExit(termSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents()); ready {
+				logRuntimeExit(exit)
+				if exit.fatal != nil || exit.restart {
+					postDownReady = false
+				}
 			}
+			return 1
 		}
 	}
+	exit := waitForRuntimeExit(termSign, hupSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents(), func() {
+		if err := hub.Parse(configBytes, options...); err != nil {
+			log.Errorln("Parse config error: %s", err.Error())
+		}
+	})
+	logRuntimeExit(exit)
+	if exit.fatal != nil || exit.restart {
+		// A critical failure or explicit supervisor restart must not be held by
+		// an arbitrary operator post-down shell. SIGTERM retains the historical
+		// post-down behavior and still has an external stop deadline.
+		postDownReady = false
+	}
+	return runtimeExitCode(exit)
 }

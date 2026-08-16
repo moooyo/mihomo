@@ -201,14 +201,14 @@ func (e *Engine) RetryCertificateRequest(expectedRevision, expectedTargetDigest,
 			// the identity but atomically rewrite the request so a path-unit event
 			// lost to lock contention is retriggered. systemd serializes the
 			// oneshot; no second signing attempt can overlap the first.
-			if err := writeCertificateRequest(certificateRequestPath(e.config.path), current); err != nil {
+			if err := e.config.writeCertificateRequest(current); err != nil {
 				return fmt.Errorf("5gpn/engine: retry pending certificate request: %w", err)
 			}
 			return nil
 		}
 		if result.Status == "ready" {
 			if !result.readyShapeMatches(len(current.Hosts) == 0) {
-				if err := writeCertificateRequest(certificateRequestPath(e.config.path), current); err != nil {
+				if err := e.config.writeCertificateRequest(current); err != nil {
 					return fmt.Errorf("5gpn/engine: retry mismatched certificate request: %w", err)
 				}
 				if e.certs != nil {
@@ -226,7 +226,7 @@ func (e *Engine) RetryCertificateRequest(expectedRevision, expectedTargetDigest,
 		if err != nil {
 			return err
 		}
-		if err := writeCertificateRequest(certificateRequestPath(e.config.path), published); err != nil {
+		if err := e.config.writeCertificateRequest(published); err != nil {
 			return fmt.Errorf("5gpn/engine: retry certificate request: %w", err)
 		}
 		if e.certs != nil {
