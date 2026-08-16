@@ -106,6 +106,122 @@ func testClaimedMetadata(host string) *C.Metadata {
 	return &C.Metadata{Type: C.HTTP, NetWork: C.TCP, Host: host, DstPort: 443}
 }
 
+const (
+	testTypedRejectHost = "typed-reject.example.net"
+	testTypedDirectHost = "typed-direct.example.net"
+)
+
+func installTestTypedRoutingRules(t *testing.T, e *Engine) {
+	t.Helper()
+	_, _, err := e.config.Update(e.Revision(), func(current Config) (Config, error) {
+		candidate := cloneConfig(current)
+		module, err := findModule(&candidate, "first")
+		if err != nil {
+			return current, err
+		}
+		module.RoutingRules = append(module.RoutingRules,
+			RoutingRule{Action: "reject", Domain: trafficStringPointer(testTypedRejectHost)},
+			RoutingRule{Action: "direct", Domain: trafficStringPointer(testTypedDirectHost)},
+		)
+		return candidate, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertTestTypedRoutingPlan(t *testing.T, e *Engine, ready bool) {
+	t.Helper()
+	claimedWant := C.ClientRouteReject
+	if ready {
+		claimedWant = C.ClientRouteNone
+	}
+	for _, port := range []uint16{80, 443} {
+		metadata := testClaimedMetadata("shared.example.com")
+		metadata.DstPort = port
+		if got := e.RouteClient(metadata); got != claimedWant {
+			t.Fatalf("claimed TCP/%d route = %v, want %v", port, got, claimedWant)
+		}
+	}
+
+	tests := []struct {
+		name string
+		host string
+		live C.ClientRouteAction
+	}{
+		{name: "typed reject", host: testTypedRejectHost, live: C.ClientRouteReject},
+		{name: "typed direct", host: testTypedDirectHost, live: C.ClientRouteDirect},
+	}
+	for _, test := range tests {
+		want := C.ClientRouteNone
+		if ready {
+			want = test.live
+		}
+		if got := e.RouteClient(testClaimedMetadata(test.host)); got != want {
+			t.Fatalf("%s route = %v, want %v", test.name, got, want)
+		}
+	}
+}
+
+func TestUnavailableExtensionRuntimePlanWithdrawsTypedRoutingRules(t *testing.T) {
+	tests := []struct {
+		name     string
+		withdraw func(*testing.T, *Engine) func()
+	}{
+		{
+			name: "certificate pending",
+			withdraw: func(t *testing.T, e *Engine) func() {
+				if state := e.CertificateRuntimeState(); state.Ready || state.Status != "pending" {
+					t.Fatalf("certificate state = %+v, want pending", state)
+				}
+				return func() { publishTestReadyCertificate(t, e, 181) }
+			},
+		},
+		{
+			name: "certificate error",
+			withdraw: func(t *testing.T, e *Engine) func() {
+				request := publishTestCertificateResult(t, e, "error", "signing_failed", "The certificate could not be signed.")
+				if state := e.CertificateRuntimeState(); state.Ready || state.Status != "error" {
+					t.Fatalf("certificate state = %+v, want error", state)
+				}
+				return func() {
+					if _, _, err := e.RetryCertificateRequest(e.Revision(), request.TargetDigest, request.Attempt); err != nil {
+						t.Fatal(err)
+					}
+					publishTestReadyCertificate(t, e, 182)
+				}
+			},
+		},
+		{
+			name: "client boundary unavailable",
+			withdraw: func(t *testing.T, e *Engine) func() {
+				publishTestReadyCertificate(t, e, 183)
+				boundaryReady := false
+				e.SetClientBoundarySource(func() bool { return boundaryReady })
+				return func() { boundaryReady = true }
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e, _, _ := newCertificateStateTestEngine(t)
+			e.certs.runtimeTTL = -1
+			installTestTypedRoutingRules(t, e)
+			restore := test.withdraw(t, e)
+
+			// Claimed capture hosts remain fail-closed while unrelated traffic
+			// returns to the ordinary operator-owned routing rules.
+			assertTestTypedRoutingPlan(t, e, false)
+			restore()
+			if state := e.CertificateRuntimeState(); !state.Ready || state.Status != "ready" {
+				t.Fatalf("restored certificate state = %+v, want ready", state)
+			}
+			assertTestTypedRoutingPlan(t, e, true)
+		})
+	}
+}
+
 func TestCertificatePendingWithdrawsTheWholeRuntimePlan(t *testing.T) {
 	e, _, _ := newCertificateStateTestEngine(t)
 	e.certs.runtimeTTL = -1
