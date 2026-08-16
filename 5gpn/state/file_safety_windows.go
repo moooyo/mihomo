@@ -40,9 +40,21 @@ func openPrivateNoFollow(path string) (*os.File, error) {
 	return file, nil
 }
 
-func validatePrivatePathInfo(_ os.FileInfo) error { return nil }
+func validateExpectedPrivateFileOwner(_ int) error {
+	return errors.New("5gpn/state: an expected Unix owner UID is unsupported on Windows")
+}
 
-func validatePrivateOpenFile(file *os.File, _ os.FileInfo) error {
+func validatePrivatePathInfo(_ os.FileInfo, expectedUID *int) error {
+	if expectedUID != nil {
+		return errors.New("an expected Unix owner UID is unsupported on Windows")
+	}
+	return nil
+}
+
+func validatePrivateOpenFile(file *os.File, _ os.FileInfo, expectedUID *int) error {
+	if expectedUID != nil {
+		return errors.New("an expected Unix owner UID is unsupported on Windows")
+	}
 	var information windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &information); err != nil {
 		return fmt.Errorf("inspect file link count: %w", err)

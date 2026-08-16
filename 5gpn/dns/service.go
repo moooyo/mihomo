@@ -496,8 +496,45 @@ func (s *Service) validateRequiredListeners(want Listen) error {
 	if !s.requireCriticalListeners {
 		return nil
 	}
+	return ValidateRequiredListeners(want)
+}
+
+// ValidateRequiredListeners applies the monolith's critical DNS listener
+// boundary without binding either socket. One-shot state validation uses the
+// same check as startup while remaining read-only.
+func ValidateRequiredListeners(want Listen) error {
 	if strings.TrimSpace(want.DoT) == "" || strings.TrimSpace(want.Origin) == "" {
 		return errors.New("5gpn/dns: both DoT and origin listeners are required")
+	}
+	return nil
+}
+
+// ValidateInstalledListeners checks the installation-owned DNS listener
+// boundary without binding a socket or reading certificate material. The
+// installer uses this before publication; the paths and loopback coordinates
+// are fixed product state rather than operator policy.
+func ValidateInstalledListeners(want Listen) error {
+	if err := ValidateRequiredListeners(want); err != nil {
+		return err
+	}
+	const (
+		installedDoT         = ":853"
+		installedDebug       = "127.0.0.1:5353"
+		installedOrigin      = "127.0.0.1:5354"
+		installedCertificate = "/etc/5gpn/cert/dot/current/fullchain.pem"
+		installedPrivateKey  = "/etc/5gpn/cert/dot/current/privkey.pem"
+	)
+	if want.DoT != installedDoT || want.Debug != installedDebug || want.Origin != installedOrigin {
+		return fmt.Errorf(
+			"5gpn/dns: listener coordinates must be DoT %q, debug %q, and origin %q",
+			installedDoT, installedDebug, installedOrigin,
+		)
+	}
+	if want.Certificate != installedCertificate || want.PrivateKey != installedPrivateKey {
+		return fmt.Errorf(
+			"5gpn/dns: DoT certificate paths must be %q and %q",
+			installedCertificate, installedPrivateKey,
+		)
 	}
 	return nil
 }

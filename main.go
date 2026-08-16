@@ -82,6 +82,10 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == fivegpn.ExtensionWorkerCommand() {
 		os.Exit(fivegpn.ExtensionWorkerMain(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-state" {
+		fivegpn.StateMain(os.Args[2:])
+		return
+	}
 
 	// Defensive programming: panic when code mistakenly calls net.DefaultResolver
 	net.DefaultResolver.PreferGo = true
