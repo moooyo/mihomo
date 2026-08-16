@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/5gpn/dns"
+	"github.com/metacubex/mihomo/5gpn/engine"
 	"github.com/metacubex/mihomo/5gpn/state"
 )
 
@@ -27,6 +28,9 @@ func TestCapabilityKeyContract(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("capability keys = %v, want %v", got, want)
+	}
+	if capabilityInterceptionVersion != engine.ReviewContractVersion || engine.ReviewContractVersion != 7 {
+		t.Fatalf("interception capability version = %d, review contract = %d, want 7", capabilityInterceptionVersion, engine.ReviewContractVersion)
 	}
 }
 

@@ -105,10 +105,11 @@ func (e *Engine) DetailView(id string) (ModuleDetail, string, error) {
 // ModuleDetail is everything a review has to state before an operator confirms.
 type ModuleDetail struct {
 	ModuleSummary
-	Description string `json:"description,omitempty"`
-	ImportedAt  string `json:"imported_at,omitempty"`
-	SourceURL   string `json:"source_url,omitempty"`
-	// SourceDigest is the digest of the manifest snapshot. Script digests are
+	Description    string `json:"description,omitempty"`
+	ImportedAt     string `json:"imported_at,omitempty"`
+	SourceURL      string `json:"source_url,omitempty"`
+	ReviewContract int    `json:"review_contract"`
+	// SourceDigest is the digest of the manifest snapshot. Code digests are
 	// reported with Actions; Candidate.Digest is the complete review digest.
 	SourceDigest string `json:"source_digest,omitempty"`
 	// SnapshotDigest covers the complete immutable capability and code shape.
@@ -124,22 +125,9 @@ type ModuleDetail struct {
 	PersistentStorage bool `json:"persistent_storage"`
 
 	Settings     []ModuleSetting  `json:"settings,omitempty"`
-	Actions      []ActionSummary  `json:"actions,omitempty"`
+	Actions      []ActionReview   `json:"actions,omitempty"`
 	RoutingRules RoutingRules     `json:"routing_rules,omitempty"`
 	HostMappings []MappingSummary `json:"upstream_mappings,omitempty"`
-}
-
-// ActionSummary describes one script action without its source.
-type ActionSummary struct {
-	ID       string   `json:"id"`
-	Phase    string   `json:"phase"`
-	Hosts    []string `json:"hosts,omitempty"`
-	Schemes  []string `json:"schemes,omitempty"`
-	Methods  []string `json:"methods,omitempty"`
-	Path     string   `json:"path,omitempty"`
-	Statuses []int    `json:"statuses,omitempty"`
-	// Digest is the identity of the code that will run.
-	Digest string `json:"digest,omitempty"`
 }
 
 // MappingSummary is one upstream mapping, with the form named.
@@ -158,6 +146,7 @@ func detailOf(m Module) ModuleDetail {
 		Description:       m.Description,
 		ImportedAt:        m.ImportedAt,
 		SourceURL:         m.Source.URL,
+		ReviewContract:    ReviewContractVersion,
 		SourceDigest:      m.Source.Digest,
 		SnapshotDigest:    SnapshotDigest(m),
 		Network:           m.Network,
@@ -166,18 +155,7 @@ func detailOf(m Module) ModuleDetail {
 		RoutingRules:      append(RoutingRules(nil), m.RoutingRules...),
 	}
 	for _, s := range m.Scripts {
-		d.Actions = append(d.Actions, ActionSummary{
-			ID:       s.ID,
-			Phase:    s.Phase,
-			Hosts:    append([]string(nil), s.Match.Hosts...),
-			Schemes:  append([]string(nil), s.Match.Schemes...),
-			Methods:  append([]string(nil), s.Match.Methods...),
-			Path:     s.Match.PathRegex,
-			Statuses: append([]int(nil), s.Match.StatusCodes...),
-			// The digest of the fetched script, not of the body as stored: it is
-			// what the operator approved and what an update check compares.
-			Digest: s.ScriptDigest,
-		})
+		d.Actions = append(d.Actions, actionReviewOf(s))
 	}
 	for _, h := range m.HostMappings {
 		d.HostMappings = append(d.HostMappings, MappingSummary{

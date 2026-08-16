@@ -42,9 +42,10 @@ const (
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
 
-	// Version 6 retains the version-5 location-search surface and adds the
-	// stream_id/seq cursor contract for authenticated plugin logs.
-	capabilityInterceptionVersion = 6
+	// The interception capability version is the review contract. Keeping one
+	// exported engine constant prevents the advertised API and confirmation
+	// writes from advancing independently.
+	capabilityInterceptionVersion = engine.ReviewContractVersion
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.
