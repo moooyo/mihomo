@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/5gpn/bot"
-	"github.com/metacubex/mihomo/5gpn/dns"
 	"github.com/metacubex/mihomo/5gpn/engine"
 )
 
