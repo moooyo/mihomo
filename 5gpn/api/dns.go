@@ -16,10 +16,9 @@ import (
 //
 // Field-level endpoints were the previous design -- a route for the policy, one
 // for the upstreams, one for the client subnet -- and they made every
-// cross-cutting edit a sequence of writes with no way to name the sequence. An
-// operator moving a gateway to a new address had to change the address and the
-// upstreams that serve it as two requests, with a window in between where the
-// resolver was configured as neither.
+// cross-cutting edit a sequence of writes with no way to name the sequence.
+// Listen and Gateway remain in the document as installation-owned runtime
+// coordinates; whole-document clients must round-trip them unchanged.
 
 var dnsService struct {
 	svc *dns.Service

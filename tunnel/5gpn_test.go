@@ -494,9 +494,10 @@ func TestExtensionEgressAddressPolicyFailsClosedAndRejectsFakeIP(t *testing.T) {
 
 func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 	previousAddressPolicy := extensionEgressAddressPolicy.Load()
+	previousGatewaySource := managedGatewaySource.Load()
 	SetExtensionEgressAddressPolicy(func(address netip.Addr) bool {
 		switch address.String() {
-		case "1.1.1.1", "8.8.4.4", "8.8.8.8":
+		case "1.1.1.1", "8.8.4.4", "8.8.8.8", "9.9.9.9":
 			return true
 		default:
 			return false
@@ -508,6 +509,7 @@ func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 	previousHosts := resolver.DefaultHosts
 	defer func() {
 		extensionEgressAddressPolicy.Store(previousAddressPolicy)
+		managedGatewaySource.Store(previousGatewaySource)
 		resolver.DefaultHosts = previousHosts
 		configMux.Lock()
 		rules, subRules, proxies, mode = previousRules, previousSubRules, previousProxies, previousMode
@@ -552,6 +554,8 @@ func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 	insertHost("console.example.com", "127.0.0.1")
 	insertHost("private.example.com", "10.1.2.3")
 	insertHost("public.example.com", "8.8.8.8")
+	insertHost("gateway.example.com", "9.9.9.9")
+	insertHost("mixed-gateway.example.com", "1.1.1.1", "9.9.9.9")
 	insertHost("blocked.example.com", "8.8.4.4")
 	insertHost("special.example.com", "8.8.4.4")
 	insertHost("drop.example.com", "127.0.0.2")
@@ -585,6 +589,7 @@ func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 	refreshFixedClientBoundaryLocked()
 	routingConfigEpoch.Add(1)
 	configMux.Unlock()
+	SetManagedGatewaySource(func() netip.Addr { return netip.MustParseAddr("9.9.9.9") })
 
 	carrier := func(binding string) string {
 		t.Helper()
@@ -660,6 +665,23 @@ func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 	}, "GroupA"); err != nil {
 		t.Fatalf("pooled public egress preflight failed: %v", err)
 	}
+	gateway, proxy, rule, err := resolve("gateway.example.com")
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil || gateway.DstIP.String() != "9.9.9.9" {
+		t.Fatalf("gateway egress = proxy:%v rule:%v ip:%s err:%v", proxy, rule, gateway.DstIP, err)
+	}
+	if err := Tunnel.AuthorizeExtensionEgress(&C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443,
+	}, "GroupA"); err == nil {
+		t.Fatal("pooled egress preflight accepted the managed gateway")
+	}
+	if mixedGateway, mixedProxy, mixedRule, mixedErr := resolve("mixed-gateway.example.com"); mixedErr != nil || mixedProxy == nil || mixedProxy.Name() != "REJECT" || mixedRule != nil || !mixedGateway.DstIP.IsValid() {
+		t.Fatalf("mixed gateway egress = proxy:%v rule:%v ip:%s err:%v", mixedProxy, mixedRule, mixedGateway.DstIP, mixedErr)
+	}
+	if err := Tunnel.AuthorizeExtensionEgress(&C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "mixed-gateway.example.com", DstPort: 443,
+	}, "GroupA"); err == nil {
+		t.Fatal("pooled egress preflight accepted a mixed gateway answer")
+	}
 
 	_, proxy, rule, err = resolve("blocked.example.com")
 	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != explicitReject {
@@ -692,6 +714,293 @@ func TestExtensionEgressRunsSafetyPrefixAndPinsPublicTargets(t *testing.T) {
 		if _, proxy, rule, err = resolve(host); err == nil || proxy != nil || rule != nil {
 			t.Fatalf("special-purpose target %s was not refused: proxy:%v rule:%v err:%v", host, proxy, rule, err)
 		}
+	}
+}
+
+func TestManagedGatewayAntiLoopIsScopedToFiveGPNEgress(t *testing.T) {
+	previousGatewaySource := managedGatewaySource.Load()
+	previousHosts := resolver.DefaultHosts
+	configMux.Lock()
+	previousRules, previousSubRules, previousProxies, previousMode := rules, subRules, proxies, mode
+	configMux.Unlock()
+	defer func() {
+		managedGatewaySource.Store(previousGatewaySource)
+		resolver.DefaultHosts = previousHosts
+		configMux.Lock()
+		rules, subRules, proxies, mode = previousRules, previousSubRules, previousProxies, previousMode
+		refreshFixedClientBoundaryLocked()
+		routingConfigEpoch.Add(1)
+		configMux.Unlock()
+	}()
+
+	parse := func(ruleType, payload, target string, params ...string) C.Rule {
+		t.Helper()
+		rule, err := R.ParseRule(ruleType, payload, target, params, nil)
+		if err != nil {
+			t.Fatalf("parse %s: %v", ruleType, err)
+		}
+		return rule
+	}
+	operatorReject := parse("DOMAIN", "blocked.example.com", "REJECT")
+	operatorDirect := parse("DOMAIN", "gateway.example.com", "DIRECT")
+	guard := parse("AND", "((NETWORK,UDP),(DST-PORT,443))", "REJECT")
+	fallback := parse("MATCH", "", "Proxies")
+
+	hosts := trie.New[resolver.HostValue]()
+	insertHost := func(host string, addresses ...string) {
+		t.Helper()
+		parsed := make([]netip.Addr, 0, len(addresses))
+		for _, address := range addresses {
+			parsed = append(parsed, netip.MustParseAddr(address))
+		}
+		value, err := resolver.NewHostValueByIPs(parsed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hosts.Insert(host, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertHost("gateway.example.com", "8.8.8.8")
+	insertHost("blocked.example.com", "8.8.8.8")
+	insertHost("public.example.com", "1.1.1.1")
+	insertHost("mixed.example.com", "1.1.1.1", "8.8.8.8")
+	insertHost("swap.example.com", "9.9.9.9")
+	hosts.Optimize()
+	resolver.DefaultHosts = resolver.NewHosts(hosts)
+
+	configMux.Lock()
+	rules = []C.Rule{operatorReject, operatorDirect, guard, fallback}
+	subRules = map[string][]C.Rule{}
+	proxies = map[string]C.Proxy{
+		"DIRECT":  &tunnelTestProxy{name: "DIRECT", type_: C.Direct, udp: true},
+		"GLOBAL":  &tunnelTestProxy{name: "GLOBAL", type_: C.Selector, udp: true},
+		"REJECT":  &tunnelTestProxy{name: "REJECT", type_: C.Reject, udp: true},
+		"Proxies": &tunnelTestProxy{name: "Proxies", type_: C.Selector, udp: true},
+	}
+	mode = Rule
+	refreshFixedClientBoundaryLocked()
+	routingConfigEpoch.Add(1)
+	configMux.Unlock()
+	gatewayAddress := netip.MustParseAddr("8.8.8.8")
+	SetManagedGatewaySource(func() netip.Addr { return gatewayAddress })
+
+	managed := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err := resolveMetadata(managed)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil || managed.DstIP.String() != "8.8.8.8" {
+		t.Fatalf("managed gateway route = proxy:%v rule:%v ip:%s err:%v", proxy, rule, managed.DstIP, err)
+	}
+
+	blocked := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "blocked.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(blocked)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != operatorReject {
+		t.Fatalf("operator reject precedence = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	mixed := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "mixed.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(mixed)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil {
+		t.Fatalf("mixed gateway route = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+
+	func() {
+		originalHosts := resolver.DefaultHosts
+		defer func() { resolver.DefaultHosts = originalHosts }()
+		swappedTrie := trie.New[resolver.HostValue]()
+		swappedValue, swapErr := resolver.NewHostValueByIPs([]netip.Addr{netip.MustParseAddr("8.8.8.8")})
+		if swapErr != nil {
+			t.Fatal(swapErr)
+		}
+		if swapErr := swappedTrie.Insert("swap.example.com", swappedValue); swapErr != nil {
+			t.Fatal(swapErr)
+		}
+		swappedTrie.Optimize()
+		swappedHosts := resolver.NewHosts(swappedTrie)
+
+		pinnedReject := parse("IP-CIDR", "9.9.9.9/32", "REJECT", "no-resolve")
+		configMux.Lock()
+		rules = []C.Rule{operatorReject, operatorDirect, pinnedReject, guard, fallback}
+		refreshFixedClientBoundaryLocked()
+		routingConfigEpoch.Add(1)
+		configMux.Unlock()
+		defer func() {
+			configMux.Lock()
+			rules = []C.Rule{operatorReject, operatorDirect, guard, fallback}
+			refreshFixedClientBoundaryLocked()
+			routingConfigEpoch.Add(1)
+			configMux.Unlock()
+		}()
+
+		swapMetadata := &C.Metadata{
+			Type: C.INNER, NetWork: C.TCP, Host: "swap.example.com", DstPort: 443,
+			SpecialRules: managedSystemEgressRulesV1,
+		}
+		routeStartedUnresolved := false
+		routeKeptDomain := false
+		swapRoute := func(audited *C.Metadata) (C.Proxy, C.Rule, error) {
+			resolver.DefaultHosts = swappedHosts
+			routeMetadata := managedSystemEgressRouteMetadata(audited)
+			routeStartedUnresolved = !routeMetadata.DstIP.IsValid()
+			routeKeptDomain = routeMetadata.RuleHost() == "swap.example.com"
+			return resolveOrdinaryMetadata(routeMetadata)
+		}
+		proxy, rule, err = resolveManagedSystemEgressWithRoute(swapMetadata, swapRoute)
+		if err != nil || proxy == nil || proxy.Name() != "Proxies" || rule != fallback {
+			t.Fatalf("hosts-swap route = proxy:%v rule:%v err:%v", proxy, rule, err)
+		}
+		if !routeStartedUnresolved || !routeKeptDomain {
+			t.Fatalf("route clone started unresolved=%v kept-domain=%v", routeStartedUnresolved, routeKeptDomain)
+		}
+		if swapMetadata.DstIP.String() != "9.9.9.9" || swapMetadata.Host != "swap.example.com" || swapMetadata.SpecialRules != managedSystemEgressRulesV1 {
+			t.Fatalf("audited metadata changed after hosts swap: host:%q ip:%s rules:%q", swapMetadata.Host, swapMetadata.DstIP, swapMetadata.SpecialRules)
+		}
+		dialMetadata := managedSystemEgressDialMetadata(swapMetadata)
+		if dialMetadata.Host != "" || dialMetadata.DstIP.String() != "9.9.9.9" || dialMetadata.SpecialRules != "" {
+			t.Fatalf("hosts-swap dial metadata = host:%q ip:%s rules:%q", dialMetadata.Host, dialMetadata.DstIP, dialMetadata.SpecialRules)
+		}
+	}()
+
+	public := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "public.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(public)
+	if err != nil || proxy == nil || proxy.Name() != "Proxies" || rule != fallback || public.DstIP.String() != "1.1.1.1" {
+		t.Fatalf("managed public route = proxy:%v rule:%v ip:%s err:%v", proxy, rule, public.DstIP, err)
+	}
+	pinned := managedSystemEgressDialMetadata(public)
+	if pinned == public || pinned.Host != "" || pinned.DstIP.String() != "1.1.1.1" || pinned.SpecialRules != "" || public.SpecialRules != "" {
+		t.Fatalf("managed system pinned metadata = same:%v host:%q ip:%s rules:%q original-rules:%q", pinned == public, pinned.Host, pinned.DstIP, pinned.SpecialRules, public.SpecialRules)
+	}
+
+	ordinaryInner := &C.Metadata{Type: C.INNER, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443}
+	proxy, rule, err = resolveMetadata(ordinaryInner)
+	if err != nil || proxy == nil || proxy.Name() != "DIRECT" || rule != operatorDirect {
+		t.Fatalf("ordinary INNER changed = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	client := &C.Metadata{Type: C.HTTP, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443}
+	proxy, rule, err = resolveMetadata(client)
+	if err != nil || proxy == nil || proxy.Name() != "DIRECT" || rule != operatorDirect {
+		t.Fatalf("client gateway ingress changed = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	h3 := &C.Metadata{Type: C.HTTP, NetWork: C.UDP, Host: "gateway.example.com", DstPort: 443}
+	proxy, rule, err = resolveMetadata(h3)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != guard {
+		t.Fatalf("fixed UDP/443 guard changed = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+
+	gatewayAddress = netip.MustParseAddr("::ffff:1.1.1.1")
+	changed := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "public.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(changed)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil {
+		t.Fatalf("updated mapped gateway source = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	gatewayAddress = netip.Addr{}
+	invalidSource := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	if proxy, rule, err = resolveMetadata(invalidSource); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("invalid gateway source did not fail closed: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	managedGatewaySource.Store(nil)
+	missingSource := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "gateway.example.com", DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	if proxy, rule, err = resolveMetadata(missingSource); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("missing gateway source did not fail closed: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	if err := Tunnel.AuthorizeExtensionEgress(&C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, Host: "public.example.com", DstPort: 443,
+	}, "DIRECT"); err == nil {
+		t.Fatal("extension authorization accepted a missing gateway source")
+	}
+	SetManagedGatewaySource(func() netip.Addr { return gatewayAddress })
+	gatewayAddress = netip.MustParseAddr("8.8.8.8")
+	configMux.Lock()
+	delete(proxies, "REJECT")
+	configMux.Unlock()
+	missingReject := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	if proxy, rule, err = resolveMetadata(missingReject); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("missing REJECT adapter did not fail closed: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	configMux.Lock()
+	proxies["REJECT"] = &tunnelTestProxy{name: "REJECT", type_: C.Reject, udp: true}
+	configMux.Unlock()
+
+	configMux.Lock()
+	mode = Global
+	routingConfigEpoch.Add(1)
+	configMux.Unlock()
+	globalMode := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(globalMode)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil {
+		t.Fatalf("global-mode managed gateway route = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	ordinaryGlobal := &C.Metadata{Type: C.INNER, NetWork: C.TCP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 443}
+	proxy, rule, err = resolveMetadata(ordinaryGlobal)
+	if err != nil || proxy == nil || proxy.Name() != "GLOBAL" || rule != nil {
+		t.Fatalf("global-mode ordinary INNER changed = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+
+	configMux.Lock()
+	mode = Direct
+	routingConfigEpoch.Add(1)
+	configMux.Unlock()
+	directMode := &C.Metadata{
+		Type: C.INNER, NetWork: C.TCP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 443,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	proxy, rule, err = resolveMetadata(directMode)
+	if err != nil || proxy == nil || proxy.Name() != "REJECT" || rule != nil {
+		t.Fatalf("direct-mode managed gateway route = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	ordinaryDirect := &C.Metadata{Type: C.INNER, NetWork: C.TCP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 443}
+	proxy, rule, err = resolveMetadata(ordinaryDirect)
+	if err != nil || proxy == nil || proxy.Name() != "DIRECT" || rule != nil {
+		t.Fatalf("direct-mode ordinary INNER changed = proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+
+	forged := managed.Clone()
+	forged.Type = C.HTTP
+	forged.SpecialRules = managedSystemEgressRulesV1
+	if proxy, rule, err = resolveMetadata(forged); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("non-INNER managed carrier was not refused: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	udpCarrier := managed.Clone()
+	udpCarrier.NetWork = C.UDP
+	udpCarrier.SpecialRules = managedSystemEgressRulesV1
+	if proxy, rule, err = resolveMetadata(udpCarrier); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("UDP managed carrier was not refused: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	unknown := managed.Clone()
+	unknown.SpecialRules = managedSystemEgressRulesRoot + "v2"
+	if proxy, rule, err = resolveMetadata(unknown); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("unknown managed carrier was not refused: proxy:%v rule:%v err:%v", proxy, rule, err)
+	}
+	forced := managed.Clone()
+	forced.SpecialRules = managedSystemEgressRulesV1
+	forced.SpecialProxy = "DIRECT"
+	if proxy, rule, err = resolveMetadata(forced); err == nil || proxy != nil || rule != nil {
+		t.Fatalf("forced managed carrier was not refused: proxy:%v rule:%v err:%v", proxy, rule, err)
 	}
 }
 

@@ -41,6 +41,7 @@ const (
 	capabilityDNSKey          = "5gpn-dns"
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
+	capabilityDNSVersion      = 2
 
 	// The interception capability version is the review contract. Keeping one
 	// exported engine constant prevents the advertised API and confirmation
@@ -101,6 +102,11 @@ func Start(home string, onFatal func(error)) error {
 		return err
 	}
 	dnsRef.Store(svc)
+	// The gateway is installation-owned DNS state. Publish its current startup
+	// projection to the narrow managed-egress guard before any listener opens;
+	// a checked host reconfigure takes effect on the next process start without
+	// rewriting the operator-owned mihomo rule list.
+	tunnel.SetManagedGatewaySource(svc.Resolver().Gateway)
 	tunnel.SetEgressProxyUpdateCallback(func() {
 		svc.Resolver().FlushCache()
 		if e := engineRef.Load(); e != nil {
@@ -109,7 +115,7 @@ func Start(home string, onFatal func(error)) error {
 	})
 	tunnel.SetClientBoundaryUpdateCallback(svc.Resolver().FlushCache)
 	api.SetDNSService(svc)
-	api.Advertise(capabilityDNSKey, api.Feature{Version: 1})
+	api.Advertise(capabilityDNSKey, api.Feature{Version: capabilityDNSVersion})
 
 	// Extension fetches resolve through the gateway's own trust group. Using
 	// the host resolver instead would let the box's /etc/resolv.conf decide

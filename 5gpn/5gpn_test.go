@@ -29,6 +29,9 @@ func TestCapabilityKeyContract(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("capability keys = %v, want %v", got, want)
 	}
+	if capabilityDNSVersion != 2 {
+		t.Fatalf("DNS capability version = %d, want 2", capabilityDNSVersion)
+	}
 	if capabilityInterceptionVersion != engine.ReviewContractVersion || engine.ReviewContractVersion != 7 {
 		t.Fatalf("interception capability version = %d, review contract = %d, want 7", capabilityInterceptionVersion, engine.ReviewContractVersion)
 	}
