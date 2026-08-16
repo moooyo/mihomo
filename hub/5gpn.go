@@ -25,6 +25,14 @@ var (
 	}
 )
 
+func prepareFiveGPNDistribution() {
+	// Publish the distribution boundary only after the complete managed
+	// controller preflight succeeds and before entering the shared runtime
+	// failure domain. Once startup begins, an error must not turn a partially
+	// initialized 5gpn process back into ordinary mihomo behavior.
+	updater.SetManagedDistribution(true)
+}
+
 // startFiveGPN installs the 5gpn subsystems exactly once, before listeners accept.
 //
 // Once, because ApplyConfig runs on every reload and the interception engine
@@ -45,7 +53,6 @@ func startFiveGPN() error {
 	fivegpnOnce.Do(func() {
 		// 5gpn publishes both core and Console through its digest-pinned installer.
 		// Upstream self-updaters cannot preserve the fork or its artifact pins.
-		updater.SetManagedDistribution(true)
 		fivegpnStartErr = fivegpn.Start(C.Path.HomeDir(), func(err error) { fivegpnFatal(err) })
 	})
 	return fivegpnStartErr

@@ -16,7 +16,7 @@ func TestWorkerDispatchPrecedesOrdinaryMainSetup(t *testing.T) {
 	source := string(body)
 	dispatch := strings.Index(source, "os.Args[1] == fivegpn.ExtensionWorkerCommand()")
 	resolver := strings.Index(source, "net.DefaultResolver.PreferGo")
-	configuration := strings.Index(source, "hub.Parse(configBytes")
+	configuration := strings.Index(source, "hub.ParseManaged(configBytes")
 	if dispatch < 0 || resolver < 0 || configuration < 0 || dispatch > resolver || dispatch > configuration {
 		t.Fatal("hidden worker dispatch no longer precedes ordinary resolver/configuration setup")
 	}

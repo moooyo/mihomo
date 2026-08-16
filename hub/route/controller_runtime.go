@@ -114,8 +114,21 @@ func ValidateConfig(cfg *Config) error {
 	if !updater.ManagedDistribution() {
 		return nil
 	}
+	return ValidateManagedConfig(cfg)
+}
+
+// ValidateManagedConfig validates the controller boundary required by the
+// managed 5gpn distribution without consulting global process state. Local
+// one-shot inspectors use the same check before releasing controller facts.
+func ValidateManagedConfig(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("controller config is nil")
+	}
 	if strings.TrimSpace(cfg.Secret) == "" {
 		return fmt.Errorf("managed 5gpn requires a non-empty controller secret")
+	}
+	if strings.IndexFunc(cfg.Secret, func(r rune) bool { return r <= 0x1f || r == 0x7f }) >= 0 {
+		return fmt.Errorf("managed 5gpn controller secret contains a forbidden control character")
 	}
 	if cfg.Addr != "" {
 		return fmt.Errorf("managed 5gpn forbids the plaintext external controller")
@@ -123,8 +136,20 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.TLSAddr != "127.0.0.1:443" {
 		return fmt.Errorf("managed 5gpn requires external-controller-tls 127.0.0.1:443")
 	}
+	if cfg.RoutingMark != 0 {
+		return fmt.Errorf("managed 5gpn forbids external-controller-routing-mark")
+	}
 	if strings.TrimSpace(cfg.Certificate) == "" || strings.TrimSpace(cfg.PrivateKey) == "" {
 		return fmt.Errorf("managed 5gpn requires the controller TLS certificate and private key")
+	}
+	if cfg.ClientAuthType != "" {
+		return fmt.Errorf("managed 5gpn forbids tls.client-auth-type")
+	}
+	if cfg.ClientAuthCert != "" {
+		return fmt.Errorf("managed 5gpn forbids tls.client-auth-cert")
+	}
+	if cfg.EchKey != "" {
+		return fmt.Errorf("managed 5gpn forbids controller TLS ECH")
 	}
 	if cfg.DohServer != "" {
 		return fmt.Errorf("managed 5gpn forbids an external DoH route")
@@ -138,11 +163,45 @@ func ValidateConfig(cfg *Config) error {
 	return nil
 }
 
-// ErrControllerRestartRequired identifies a valid controller listener change
-// that cannot be committed by PUT /configs without closing the connection that
-// is carrying that request. The caller must reject it instead of returning a
-// false 204 while leaving the previous listener live.
-var ErrControllerRestartRequired = errors.New("controller listener change requires a process restart")
+// PreflightManagedController performs every managed controller check that can
+// fail before listener staging. It resolves the UI path and loads the TLS key
+// pair without binding a socket, so fivegpn.Start can retain its mandatory
+// worker-isolation-before-listener ordering without a later controller failure
+// leaving DoT briefly live on its own.
+func PreflightManagedController(cfg *Config, externalUI string) error {
+	if err := ValidateManagedConfig(cfg); err != nil {
+		return err
+	}
+	if _, err := resolveControllerUI(externalUI); err != nil {
+		return fmt.Errorf("validate managed external-ui: %w", err)
+	}
+	if err := ca.ValidateTLSKeyPair(cfg.Certificate, cfg.PrivateKey); err != nil {
+		return fmt.Errorf("prepare external controller TLS certificate: %w", err)
+	}
+	return nil
+}
+
+// ErrControllerRestartRequired identifies a valid controller change that
+// cannot be committed by PUT /configs. Listener topology cannot change without
+// closing the carrying connection, and a managed secret rotation must terminate
+// every connection authenticated by the previous credential.
+var ErrControllerRestartRequired = errors.New("controller configuration change requires a process restart")
+
+func validateManagedControllerRestartTransition(previous *controllerRuntime, next Config, resolvedUI string) error {
+	if previous == nil || !updater.ManagedDistribution() {
+		return nil
+	}
+	if previous.config.Secret != next.Secret {
+		return fmt.Errorf("%w: managed controller secret changes require a process restart", ErrControllerRestartRequired)
+	}
+	if previous.config.Certificate != next.Certificate || previous.config.PrivateKey != next.PrivateKey {
+		return fmt.Errorf("%w: managed controller certificate and private-key changes require a process restart", ErrControllerRestartRequired)
+	}
+	if previous.uiPath != resolvedUI {
+		return fmt.Errorf("%w: managed external-ui changes require a process restart", ErrControllerRestartRequired)
+	}
+	return nil
+}
 
 // SetControllerFatalHandler installs the process-owner seam for a critical
 // controller listener ending. Production supplies the same fatal callback used
@@ -163,11 +222,12 @@ func ReCreateServer(cfg *Config, externalUI string) error {
 }
 
 // ReconcileHotServer applies the controller fields that can change on existing
-// listeners. Address, transport and routing-mark changes are explicitly
-// rejected so PUT /configs never drops its own connection or reports a
-// controller configuration that is not live. A plan swap governs every new
-// HTTP request and TLS handshake; already authenticated WebSockets and existing
-// TLS connections finish in their original connection generation.
+// listeners. Address, transport, routing-mark, and managed secret changes are
+// explicitly rejected so PUT /configs never drops its own connection, claims a
+// configuration that is not live, or leaves sessions authenticated by a
+// retired managed credential. Other plan changes govern every new HTTP request
+// and TLS handshake; already authenticated WebSockets and existing TLS
+// connections finish in their original connection generation.
 func ReconcileHotServer(cfg *Config, externalUI string) error {
 	return reconcileController(cfg, externalUI, false)
 }
@@ -209,6 +269,9 @@ func reconcileController(cfg *Config, externalUI string, allowListenerChanges bo
 	controllerMu.Unlock()
 	if previousFailed {
 		return errors.New("current controller has failed")
+	}
+	if err := validateManagedControllerRestartTransition(previous, snapshot, resolvedUI); err != nil {
+		return err
 	}
 	if previous != nil && previous.uiPath == resolvedUI && sameControllerConfig(previous.config, snapshot) {
 		return nil

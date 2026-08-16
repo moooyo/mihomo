@@ -86,6 +86,10 @@ func main() {
 		fivegpn.StateMain(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-config" {
+		fivegpn.ConfigInspectMain(os.Args[2:])
+		return
+	}
 
 	// Defensive programming: panic when code mistakenly calls net.DefaultResolver
 	net.DefaultResolver.PreferGo = true
@@ -227,7 +231,7 @@ func main() {
 		options = append(options, hub.WithSecret(secret))
 	}
 
-	if err := hub.Parse(configBytes, options...); err != nil {
+	if err := hub.ParseManaged(configBytes, options...); err != nil {
 		log.Fatalln("Parse config error: %s", err.Error())
 	}
 
@@ -259,7 +263,7 @@ func main() {
 		case <-termSign:
 			return
 		case <-hupSign:
-			if err := hub.Parse(configBytes, options...); err != nil {
+			if err := hub.ParseManaged(configBytes, options...); err != nil {
 				log.Errorln("Parse config error: %s", err.Error())
 			}
 		}

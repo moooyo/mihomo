@@ -22,42 +22,36 @@ import (
 	"github.com/metacubex/tls"
 )
 
+var newTLSKeyPairWatcher = fswatch.NewWatcher
+
+// ValidateTLSKeyPair parses an inline or file-backed certificate and private
+// key without starting a filesystem watcher. Startup preflights use this when
+// they need the same safe-path and key-match checks as the live loader but do
+// not retain the returned certificate generation.
+func ValidateTLSKeyPair(certificate, privateKey string) error {
+	_, _, _, _, err := loadTLSKeyPair(certificate, privateKey)
+	return err
+}
+
 // NewTLSKeyPairLoader creates a loader function for TLS key pairs from the provided certificate and private key data or file paths.
 // If both certificate and privateKey are empty, generates a random TLS RSA key pair.
 func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certificate, error), error) {
-	if certificate == "" && privateKey == "" {
-		var err error
-		certificate, privateKey, _, err = NewRandomTLSKeyPair(KeyPairTypeRSA)
-		if err != nil {
-			return nil, err
-		}
+	cert, certificatePath, privateKeyPath, fileBacked, err := loadTLSKeyPair(certificate, privateKey)
+	if err != nil {
+		return nil, err
 	}
-	cert, painTextErr := tls.X509KeyPair([]byte(certificate), []byte(privateKey))
-	if painTextErr == nil {
+	if !fileBacked {
 		return func() (*tls.Certificate, error) {
 			return &cert, nil
 		}, nil
 	}
 
-	certificate = C.Path.Resolve(certificate)
-	privateKey = C.Path.Resolve(privateKey)
-	var loadErr error
-	if !C.Path.IsSafePath(certificate) {
-		loadErr = C.Path.ErrNotSafePath(certificate)
-	} else if !C.Path.IsSafePath(privateKey) {
-		loadErr = C.Path.ErrNotSafePath(privateKey)
-	} else {
-		cert, loadErr = tls.LoadX509KeyPair(certificate, privateKey)
-	}
-	if loadErr != nil {
-		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
-	}
 	gcFlag := new(os.File) // tiny (on the order of 16 bytes or less) and pointer-free objects may never run the finalizer, so we choose new an os.File
 	updateMutex := sync.RWMutex{}
-	if watcher, err := fswatch.NewWatcher(fswatch.Options{Path: []string{certificate, privateKey}, Callback: func(path string) {
+	if watcher, err := newTLSKeyPairWatcher(fswatch.Options{Path: []string{certificatePath, privateKeyPath}, Callback: func(path string) {
 		updateMutex.Lock()
 		defer updateMutex.Unlock()
-		if newCert, err := tls.LoadX509KeyPair(certificate, privateKey); err == nil {
+		if newCert, err := tls.LoadX509KeyPair(certificatePath, privateKeyPath); err == nil {
 			cert = newCert
 		}
 	}}); err == nil {
@@ -73,6 +67,34 @@ func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certifica
 		defer updateMutex.RUnlock()
 		return &cert, nil
 	}, nil
+}
+
+func loadTLSKeyPair(certificate, privateKey string) (cert tls.Certificate, certificatePath, privateKeyPath string, fileBacked bool, err error) {
+	if certificate == "" && privateKey == "" {
+		certificate, privateKey, _, err = NewRandomTLSKeyPair(KeyPairTypeRSA)
+		if err != nil {
+			return cert, "", "", false, err
+		}
+	}
+	cert, plainTextErr := tls.X509KeyPair([]byte(certificate), []byte(privateKey))
+	if plainTextErr == nil {
+		return cert, "", "", false, nil
+	}
+
+	certificatePath = C.Path.Resolve(certificate)
+	privateKeyPath = C.Path.Resolve(privateKey)
+	var loadErr error
+	if !C.Path.IsSafePath(certificatePath) {
+		loadErr = C.Path.ErrNotSafePath(certificatePath)
+	} else if !C.Path.IsSafePath(privateKeyPath) {
+		loadErr = C.Path.ErrNotSafePath(privateKeyPath)
+	} else {
+		cert, loadErr = tls.LoadX509KeyPair(certificatePath, privateKeyPath)
+	}
+	if loadErr != nil {
+		return cert, "", "", false, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", plainTextErr.Error(), loadErr.Error())
+	}
+	return cert, certificatePath, privateKeyPath, true, nil
 }
 
 func LoadCertificates(certificate string) (*x509.CertPool, error) {

@@ -1,6 +1,8 @@
 package route
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -8,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/metacubex/http"
+	"github.com/metacubex/http/httptest"
 )
 
 func TestManagedDebugRouteSharesControllerAuthentication(t *testing.T) {
@@ -58,10 +62,20 @@ func TestManagedControllerConfigFailsClosed(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{name: "empty secret", mutate: func(cfg *Config) { cfg.Secret = "" }},
+		{name: "NUL in secret", mutate: func(cfg *Config) { cfg.Secret = "before\x00after" }},
+		{name: "unit separator in secret", mutate: func(cfg *Config) { cfg.Secret = "before\x1fafter" }},
+		{name: "DEL in secret", mutate: func(cfg *Config) { cfg.Secret = "before\x7fafter" }},
 		{name: "plaintext controller", mutate: func(cfg *Config) { cfg.Addr = "127.0.0.1:9090" }},
 		{name: "missing TLS controller", mutate: func(cfg *Config) { cfg.TLSAddr = "" }},
 		{name: "wrong TLS controller", mutate: func(cfg *Config) { cfg.TLSAddr = "127.0.0.1:9090" }},
+		{name: "routing mark", mutate: func(cfg *Config) { cfg.RoutingMark = 1 }},
 		{name: "missing certificate", mutate: func(cfg *Config) { cfg.Certificate = "" }},
+		{name: "TLS client auth type", mutate: func(cfg *Config) { cfg.ClientAuthType = "require-and-verify-client-cert" }},
+		{name: "whitespace TLS client auth type", mutate: func(cfg *Config) { cfg.ClientAuthType = " " }},
+		{name: "TLS client auth certificate", mutate: func(cfg *Config) { cfg.ClientAuthCert = "/etc/5gpn/client-ca.pem" }},
+		{name: "whitespace TLS client auth certificate", mutate: func(cfg *Config) { cfg.ClientAuthCert = " " }},
+		{name: "TLS ECH", mutate: func(cfg *Config) { cfg.EchKey = "/etc/5gpn/ech.pem" }},
+		{name: "whitespace TLS ECH", mutate: func(cfg *Config) { cfg.EchKey = " " }},
 		{name: "DoH", mutate: func(cfg *Config) { cfg.DohServer = "/dns-query" }},
 		{name: "Unix socket", mutate: func(cfg *Config) { cfg.UnixAddr = "mihomo.sock" }},
 		{name: "named pipe", mutate: func(cfg *Config) { cfg.PipeAddr = `\\.\pipe\mihomo` }},
@@ -75,18 +89,178 @@ func TestManagedControllerConfigFailsClosed(t *testing.T) {
 			}
 		})
 	}
+	unicodeSecret := valid
+	unicodeSecret.Secret = "控制器🔐"
+	if err := ValidateConfig(&unicodeSecret); err != nil {
+		t.Fatalf("ordinary Unicode managed secret was rejected: %v", err)
+	}
 
 	updater.SetManagedDistribution(false)
 	upstream := valid
-	upstream.Secret = ""
+	upstream.Secret = "upstream\x00secret"
 	upstream.Addr = "0.0.0.0:9090"
 	upstream.TLSAddr = ""
 	upstream.Certificate = ""
 	upstream.PrivateKey = ""
+	upstream.RoutingMark = 99
+	upstream.ClientAuthType = "require-and-verify-client-cert"
+	upstream.ClientAuthCert = "/etc/mihomo/client-ca.pem"
+	upstream.EchKey = "/etc/mihomo/ech.pem"
 	upstream.DohServer = "/dns-query"
 	upstream.UnixAddr = "mihomo.sock"
 	if err := ValidateConfig(&upstream); err != nil {
 		t.Fatalf("upstream controller behavior was restricted: %v", err)
+	}
+}
+
+func TestManagedControllerPreflightLoadsTheKeyPairAndValidatesTheUIPath(t *testing.T) {
+	home := t.TempDir()
+	previousHome := C.Path.HomeDir()
+	C.SetHomeDir(home)
+	t.Cleanup(func() { C.SetHomeDir(previousHome) })
+
+	certificate, privateKey, _, err := ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPrivateKey, _, err := ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "cert.pem"), []byte(certificate), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "key.pem"), []byte(privateKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		TLSAddr:     "127.0.0.1:443",
+		Secret:      "controller-secret",
+		Certificate: "cert.pem",
+		PrivateKey:  "key.pem",
+	}
+	if err := PreflightManagedController(&cfg, "ui"); err != nil {
+		t.Fatalf("valid managed controller preflight failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "key.pem"), []byte(otherPrivateKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PreflightManagedController(&cfg, "ui"); err == nil {
+		t.Fatal("mismatched controller certificate and private key were accepted")
+	}
+	unsafeUI := filepath.Join(filepath.Dir(home), "outside-ui")
+	if err := PreflightManagedController(&cfg, unsafeUI); err == nil {
+		t.Fatal("unsafe managed external-ui path was accepted")
+	}
+}
+
+func TestManagedControllerBootstrapChangesRequireRestart(t *testing.T) {
+	previousManaged := updater.ManagedDistribution()
+	t.Cleanup(func() { updater.SetManagedDistribution(previousManaged) })
+
+	previous := &controllerRuntime{
+		config: Config{Secret: "old-secret", Certificate: "old-cert.pem", PrivateKey: "old-key.pem"},
+		uiPath: "/opt/5gpn/ui",
+	}
+	updater.SetManagedDistribution(true)
+	unchanged := previous.config
+	if err := validateManagedControllerRestartTransition(previous, unchanged, previous.uiPath); err != nil {
+		t.Fatalf("unchanged managed secret was rejected: %v", err)
+	}
+	tests := []struct {
+		name string
+		next Config
+		ui   string
+	}{
+		{name: "secret", next: Config{Secret: "new-secret", Certificate: "old-cert.pem", PrivateKey: "old-key.pem"}, ui: previous.uiPath},
+		{name: "certificate", next: Config{Secret: "old-secret", Certificate: "new-cert.pem", PrivateKey: "old-key.pem"}, ui: previous.uiPath},
+		{name: "private key", next: Config{Secret: "old-secret", Certificate: "old-cert.pem", PrivateKey: "new-key.pem"}, ui: previous.uiPath},
+		{name: "external UI", next: unchanged, ui: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateManagedControllerRestartTransition(previous, test.next, test.ui); !errors.Is(err, ErrControllerRestartRequired) {
+				t.Fatalf("managed bootstrap transition error = %v, want ErrControllerRestartRequired", err)
+			}
+		})
+	}
+
+	updater.SetManagedDistribution(false)
+	for _, test := range tests {
+		if err := validateManagedControllerRestartTransition(previous, test.next, test.ui); err != nil {
+			t.Fatalf("non-managed %s transition was restricted: %v", test.name, err)
+		}
+	}
+}
+
+func TestManagedConfigPutRejectsBootstrapChangesAndKeepsTheLiveGeneration(t *testing.T) {
+	tests := []struct {
+		name        string
+		secret      string
+		certificate string
+		privateKey  string
+		externalUI  string
+	}{
+		{name: "secret", secret: "new-secret", certificate: "old-cert.pem", privateKey: "old-key.pem", externalUI: "ui"},
+		{name: "certificate", secret: "old-secret", certificate: "new-cert.pem", privateKey: "old-key.pem", externalUI: "ui"},
+		{name: "private key", secret: "old-secret", certificate: "old-cert.pem", privateKey: "new-key.pem", externalUI: "ui"},
+		{name: "external UI", secret: "old-secret", certificate: "old-cert.pem", privateKey: "old-key.pem", externalUI: "other-ui"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetControllerTestState(t)
+			previousManaged := updater.ManagedDistribution()
+			updater.SetManagedDistribution(true)
+			t.Cleanup(func() { updater.SetManagedDistribution(previousManaged) })
+
+			listener := &controllerListener{spec: controllerListenerSpec{
+				kind: controllerTLS, network: "tcp", address: "127.0.0.1:443",
+			}}
+			live := &controllerRuntime{
+				generation: 7,
+				config: Config{
+					TLSAddr: "127.0.0.1:443", Secret: "old-secret",
+					Certificate: "old-cert.pem", PrivateKey: "old-key.pem",
+				},
+				uiPath:    C.Path.Resolve("ui"),
+				listeners: map[controllerListenerKind]*controllerListener{controllerTLS: listener},
+			}
+			plan := &controllerPlan{}
+			controllerMu.Lock()
+			currentController = live
+			currentControllerPlan.Store(plan)
+			controllerMu.Unlock()
+			t.Cleanup(func() {
+				controllerMu.Lock()
+				currentController = nil
+				currentControllerPlan.Store(nil)
+				controllerMu.Unlock()
+			})
+
+			payload := "secret: " + test.secret + "\n" +
+				"external-controller-tls: 127.0.0.1:443\n" +
+				"external-ui: " + test.externalUI + "\n" +
+				"tls:\n" +
+				"  certificate: " + test.certificate + "\n" +
+				"  private-key: " + test.privateKey + "\n"
+			body, err := json.Marshal(map[string]string{"payload": payload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPut, "/configs", bytes.NewReader(body))
+			response := httptest.NewRecorder()
+			updateConfigs(response, request)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("PUT /configs status %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+			}
+			controllerMu.Lock()
+			unchanged := currentController == live && currentController.generation == 7 && currentController.listeners[controllerTLS] == listener
+			controllerMu.Unlock()
+			if !unchanged || currentControllerPlan.Load() != plan {
+				t.Fatal("rejected PUT /configs changed the live controller generation")
+			}
+		})
 	}
 }
 
