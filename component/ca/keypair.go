@@ -12,15 +12,36 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"runtime"
+	"path/filepath"
 	"sync"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 
-	"github.com/metacubex/fswatch"
 	"github.com/metacubex/tls"
 )
+
+const tlsKeyPairReloadInterval = time.Second
+
+type tlsFileIdentity struct {
+	resolvedPath string
+	info         os.FileInfo
+}
+
+type tlsKeyPairIdentity struct {
+	certificate tlsFileIdentity
+	privateKey  tlsFileIdentity
+}
+
+type tlsKeyPairFileLoader struct {
+	mutex           sync.Mutex
+	certificatePath string
+	privateKeyPath  string
+	certificate     *tls.Certificate
+	nextCheck       time.Time
+	checkInterval   time.Duration
+	now             func() time.Time
+}
 
 // NewTLSKeyPairLoader creates a loader function for TLS key pairs from the provided certificate and private key data or file paths.
 // If both certificate and privateKey are empty, generates a random TLS RSA key pair.
@@ -46,33 +67,126 @@ func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certifica
 		loadErr = C.Path.ErrNotSafePath(certificate)
 	} else if !C.Path.IsSafePath(privateKey) {
 		loadErr = C.Path.ErrNotSafePath(privateKey)
-	} else {
-		cert, loadErr = tls.LoadX509KeyPair(certificate, privateKey)
 	}
 	if loadErr != nil {
 		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
 	}
-	gcFlag := new(os.File) // tiny (on the order of 16 bytes or less) and pointer-free objects may never run the finalizer, so we choose new an os.File
-	updateMutex := sync.RWMutex{}
-	if watcher, err := fswatch.NewWatcher(fswatch.Options{Path: []string{certificate, privateKey}, Callback: func(path string) {
-		updateMutex.Lock()
-		defer updateMutex.Unlock()
-		if newCert, err := tls.LoadX509KeyPair(certificate, privateKey); err == nil {
-			cert = newCert
-		}
-	}}); err == nil {
-		if err = watcher.Start(); err == nil {
-			runtime.SetFinalizer(gcFlag, func(f *os.File) {
-				_ = watcher.Close()
-			})
-		}
+	loader, loadErr := newTLSKeyPairFileLoader(certificate, privateKey, tlsKeyPairReloadInterval, time.Now)
+	if loadErr != nil {
+		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
 	}
-	return func() (*tls.Certificate, error) {
-		defer runtime.KeepAlive(gcFlag)
-		updateMutex.RLock()
-		defer updateMutex.RUnlock()
-		return &cert, nil
+	return loader.load, nil
+}
+
+func newTLSKeyPairFileLoader(certificate, privateKey string, checkInterval time.Duration, now func() time.Time) (*tlsKeyPairFileLoader, error) {
+	cert, _, err := loadStableTLSKeyPair(certificate, privateKey)
+	if err != nil {
+		return nil, err
+	}
+	return &tlsKeyPairFileLoader{
+		certificatePath: certificate,
+		privateKeyPath:  privateKey,
+		certificate:     cert,
+		nextCheck:       now().Add(checkInterval),
+		checkInterval:   checkInterval,
+		now:             now,
 	}, nil
+}
+
+func (l *tlsKeyPairFileLoader) load() (*tls.Certificate, error) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	now := l.now()
+	if now.Before(l.nextCheck) {
+		return l.certificate, nil
+	}
+	// Advance the deadline even when inspection or loading fails. A broken pair
+	// must not turn every incoming handshake into filesystem I/O.
+	l.nextCheck = now.Add(l.checkInterval)
+
+	// Always attempt one stable load after the bounded interval. Metadata alone
+	// cannot identify an in-place rewrite whose inode, size, and mtime were
+	// preserved, while the resolved-path checks below are still needed for an
+	// atomic parent-symlink generation switch.
+	certificate, _, err := loadStableTLSKeyPair(l.certificatePath, l.privateKeyPath)
+	if err == nil {
+		// Certificates are immutable after parsing. Swapping the pointer keeps a
+		// certificate already returned to another handshake safe to use.
+		l.certificate = certificate
+	}
+	return l.certificate, nil
+}
+
+func loadStableTLSKeyPair(certificate, privateKey string) (*tls.Certificate, tlsKeyPairIdentity, error) {
+	return loadStableTLSKeyPairWithInspector(certificate, privateKey, inspectTLSKeyPair)
+}
+
+func loadStableTLSKeyPairWithInspector(
+	certificate, privateKey string,
+	inspect func(string, string) (tlsKeyPairIdentity, error),
+) (*tls.Certificate, tlsKeyPairIdentity, error) {
+	var lastErr error
+	for range 2 {
+		before, err := inspect(certificate, privateKey)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Load the concrete targets captured above. In particular, an atomic
+		// parent-symlink switch cannot make the certificate and key opens land in
+		// different generations.
+		cert, err := tls.LoadX509KeyPair(before.certificate.resolvedPath, before.privateKey.resolvedPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		after, err := inspect(certificate, privateKey)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if before.equal(after) {
+			return &cert, after, nil
+		}
+		lastErr = fmt.Errorf("TLS certificate or private key changed while loading")
+	}
+	return nil, tlsKeyPairIdentity{}, lastErr
+}
+
+func inspectTLSKeyPair(certificate, privateKey string) (tlsKeyPairIdentity, error) {
+	certificateIdentity, err := inspectTLSFile(certificate)
+	if err != nil {
+		return tlsKeyPairIdentity{}, err
+	}
+	privateKeyIdentity, err := inspectTLSFile(privateKey)
+	if err != nil {
+		return tlsKeyPairIdentity{}, err
+	}
+	return tlsKeyPairIdentity{certificate: certificateIdentity, privateKey: privateKeyIdentity}, nil
+}
+
+func inspectTLSFile(path string) (tlsFileIdentity, error) {
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return tlsFileIdentity{}, err
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return tlsFileIdentity{}, err
+	}
+	return tlsFileIdentity{resolvedPath: resolvedPath, info: info}, nil
+}
+
+func (i tlsKeyPairIdentity) equal(other tlsKeyPairIdentity) bool {
+	return i.certificate.equal(other.certificate) && i.privateKey.equal(other.privateKey)
+}
+
+func (i tlsFileIdentity) equal(other tlsFileIdentity) bool {
+	return i.resolvedPath == other.resolvedPath &&
+		os.SameFile(i.info, other.info) &&
+		i.info.Size() == other.info.Size() &&
+		i.info.ModTime().Equal(other.info.ModTime())
 }
 
 func LoadCertificates(certificate string) (*x509.CertPool, error) {
