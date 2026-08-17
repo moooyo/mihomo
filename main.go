@@ -88,6 +88,14 @@ func run() (exitCode int) {
 	if len(os.Args) > 1 && os.Args[1] == fivegpn.ExtensionWorkerCommand() {
 		return fivegpn.ExtensionWorkerMain(os.Args[2:])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-state" {
+		fivegpn.StateMain(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "5gpn-config" {
+		fivegpn.ConfigInspectMain(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "5gpn-nodes" {
 		fivegpn.NodesMain(os.Args[2:])
 		return
@@ -265,7 +273,7 @@ func run() (exitCode int) {
 		logRuntimeExit(exit)
 		return runtimeExitCode(exit)
 	}
-	if err := hub.Parse(configBytes, options...); err != nil {
+	if err := hub.ParseManaged(configBytes, options...); err != nil {
 		log.Errorln("Parse config error: %s", err.Error())
 		return 1
 	}
@@ -296,7 +304,7 @@ func run() (exitCode int) {
 		}
 	}
 	exit := waitForRuntimeExit(termSign, hupSign, hub.FiveGPNFatalEvents(), hub.FiveGPNRestartEvents(), func() {
-		if err := hub.Parse(configBytes, options...); err != nil {
+		if err := hub.ParseManaged(configBytes, options...); err != nil {
 			log.Errorln("Parse config error: %s", err.Error())
 		}
 	})

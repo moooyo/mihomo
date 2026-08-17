@@ -42,10 +42,12 @@ const (
 	capabilityDNSKey          = "5gpn-dns"
 	capabilityInterceptionKey = "5gpn-interception"
 	capabilityBotKey          = "5gpn-bot"
+	capabilityDNSVersion      = 2
 
-	// Version 6 retains the version-5 location-search surface and adds the
-	// stream_id/seq cursor contract for authenticated plugin logs.
-	capabilityInterceptionVersion = 6
+	// The interception capability version is the review contract. Keeping one
+	// exported engine constant prevents the advertised API and confirmation
+	// writes from advancing independently.
+	capabilityInterceptionVersion = engine.ReviewContractVersion
 )
 
 // Start prepares the 5gpn subsystems and installs them into the core.
@@ -103,6 +105,11 @@ func Start(home string, onFatal func(error)) error {
 		return err
 	}
 	dnsRef.Store(svc)
+	// The gateway is installation-owned DNS state. Publish its current startup
+	// projection to the narrow managed-egress guard before any listener opens;
+	// a checked host reconfigure takes effect on the next process start without
+	// rewriting the operator-owned mihomo rule list.
+	tunnel.SetManagedGatewaySource(svc.Resolver().Gateway)
 	tunnel.SetEgressProxyUpdateCallback(func() {
 		svc.Resolver().FlushCache()
 		if e := engineRef.Load(); e != nil {
@@ -111,7 +118,7 @@ func Start(home string, onFatal func(error)) error {
 	})
 	tunnel.SetClientBoundaryUpdateCallback(svc.Resolver().FlushCache)
 	api.SetDNSService(svc)
-	api.Advertise(capabilityDNSKey, api.Feature{Version: 1})
+	api.Advertise(capabilityDNSKey, api.Feature{Version: capabilityDNSVersion})
 
 	// Extension fetches resolve through the gateway's own trust group. Using
 	// the host resolver instead would let the box's /etc/resolv.conf decide
@@ -178,9 +185,9 @@ func Start(home string, onFatal func(error)) error {
 // Shutdown waits for each owned goroutine or child process. It is idempotent:
 // process signals, a fatal event, and a restart request all converge here.
 //
-// The traffic hooks deliberately remain installed until process exit. Ordinary
-// mihomo listeners are still alive while a certificate helper receives TERM;
-// withdrawing the interceptor or policy first would create a fail-open window.
+// The traffic hooks deliberately remain installed until process exit. Shutdown
+// releases owned goroutines and workers without publishing an empty interceptor
+// or policy that could create a fail-open window.
 func Shutdown(ctx context.Context) error {
 	installed.Store(false)
 

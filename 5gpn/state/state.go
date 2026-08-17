@@ -31,10 +31,10 @@ import (
 // ErrRevisionConflict is returned when an update names a revision that is no
 // longer current.
 //
-// This is the one piece of concurrency control that survives, and it survives
-// for a reason that has nothing to do with processes: two operators with the
-// extensions page open in two tabs will otherwise last-write-wins each other
-// silently. The API turns this into a 409.
+// This is the per-document optimistic concurrency check used by the 5gpn
+// document APIs. It exists for a reason that has nothing to do with processes:
+// two operators with the same page open in two tabs will otherwise
+// last-write-wins each other silently. The API turns this into a 409.
 var ErrRevisionConflict = errors.New("5gpn/state: revision conflict")
 
 // Doc is a JSON document held in memory and mirrored to disk.
@@ -94,8 +94,9 @@ func (d *Doc[T]) Get() Snapshot[T] {
 //
 // An empty expected revision means "I do not care what it was" and is for
 // internal callers that own the document outright. Any other value must match
-// the current revision or the update is refused; that is the whole of the
-// optimistic concurrency the system needs.
+// the current revision or the update is refused. This protects one document
+// from stale API writes; mutexes, atomic publication, and other subsystem fences
+// enforce their separate ordering and durability contracts.
 func (d *Doc[T]) Update(expected string, mutate func(T) (T, error)) (Snapshot[T], error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

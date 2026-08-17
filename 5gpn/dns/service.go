@@ -18,14 +18,13 @@ import (
 	"github.com/metacubex/tls"
 )
 
-// Document is the whole operator-owned DNS state, in one file with one
-// revision.
+// Document is the whole DNS runtime document, in one file with one revision.
 //
 // It replaces four: policy.json, upstreams.json, ecs.json, and the DNS-shaped
 // half of an environment file that systemd read and the daemon could not write.
-// Splitting them made every cross-cutting edit -- change the gateway address
-// and the upstreams that serve it -- two writes with no way to name the pair,
-// and put the one file the console most needed to fix out of its reach.
+// Policy, upstream, subnet, and tuning changes remain one revision-protected
+// decision. Listen and Gateway are installation-owned projections that a
+// whole-document API client must round-trip unchanged.
 type Document struct {
 	Listen     Listen    `json:"listen"`
 	Gateway    string    `json:"gateway"`
@@ -361,13 +360,19 @@ func (s *Service) Update(revision string, mutate func(Document) (Document, error
 		// Group before validating, so what is checked is what will be stored
 		// and what will run.
 		next.Policy = next.Policy.ordered()
-		// Listener and certificate paths are installation-owned. Binding a
+		// Listener, certificate paths, and the client gateway coordinate are
+		// installation-owned. Binding a
 		// complete replacement while the unchanged critical sockets are live is
 		// impossible without socket activation, and persisting before a bind
 		// succeeds can turn one rejected API write into a permanent restart loop.
-		// Whole-document clients therefore round-trip this section unchanged.
+		// The gateway also feeds installation-owned data-plane guards outside this
+		// document. Whole-document clients therefore round-trip both fields
+		// unchanged; the checked installer transaction is their only writer.
 		if next.Listen != current.Listen {
 			return current, fmt.Errorf("%w: listener settings are installation-owned", ErrInvalidPolicy)
+		}
+		if next.Gateway != current.Gateway {
+			return current, fmt.Errorf("%w: gateway is installation-owned and must be round-tripped unchanged", ErrInvalidPolicy)
 		}
 		prepared, err = prepareDocument(next, s.rulesDir)
 		if err != nil {
@@ -460,9 +465,9 @@ func (s *Service) Listen() error {
 
 // relisten rebinds only when the listener configuration actually changed.
 //
-// Unconditional rebinding would drop :853 on every unrelated edit -- a policy
-// rule, an upstream, a gateway address -- and each of those would be a moment
-// where every client on the network has no resolver.
+// Unconditional rebinding would drop :853 on every unrelated policy, upstream,
+// or tuning edit, and each would be a moment where every client on the network
+// has no resolver.
 func (s *Service) relisten(want Listen) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,8 +510,45 @@ func (s *Service) validateRequiredListeners(want Listen) error {
 	if !s.requireCriticalListeners {
 		return nil
 	}
+	return ValidateRequiredListeners(want)
+}
+
+// ValidateRequiredListeners applies the monolith's critical DNS listener
+// boundary without binding either socket. One-shot state validation uses the
+// same check as startup while remaining read-only.
+func ValidateRequiredListeners(want Listen) error {
 	if strings.TrimSpace(want.DoT) == "" || strings.TrimSpace(want.Origin) == "" {
 		return errors.New("5gpn/dns: both DoT and origin listeners are required")
+	}
+	return nil
+}
+
+// ValidateInstalledListeners checks the installation-owned DNS listener
+// boundary without binding a socket or reading certificate material. The
+// installer uses this before publication; the paths and loopback coordinates
+// are fixed product state rather than operator policy.
+func ValidateInstalledListeners(want Listen) error {
+	if err := ValidateRequiredListeners(want); err != nil {
+		return err
+	}
+	const (
+		installedDoT         = ":853"
+		installedDebug       = "127.0.0.1:5353"
+		installedOrigin      = "127.0.0.1:5354"
+		installedCertificate = "/etc/5gpn/cert/dot/current/fullchain.pem"
+		installedPrivateKey  = "/etc/5gpn/cert/dot/current/privkey.pem"
+	)
+	if want.DoT != installedDoT || want.Debug != installedDebug || want.Origin != installedOrigin {
+		return fmt.Errorf(
+			"5gpn/dns: listener coordinates must be DoT %q, debug %q, and origin %q",
+			installedDoT, installedDebug, installedOrigin,
+		)
+	}
+	if want.Certificate != installedCertificate || want.PrivateKey != installedPrivateKey {
+		return fmt.Errorf(
+			"5gpn/dns: DoT certificate paths must be %q and %q",
+			installedCertificate, installedPrivateKey,
+		)
 	}
 	return nil
 }

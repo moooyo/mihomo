@@ -31,13 +31,16 @@ func (p *dialTestPolicy) SelectEgress(metadata *C.Metadata, owner string, ownerO
 }
 
 type dialTestTunnel struct {
-	metadata     *C.Metadata
-	binding      string
-	authorizeErr error
-	dialAddress  string
-	dialBinding  string
-	dialCalls    int
-	dialErr      error
+	metadata      *C.Metadata
+	binding       string
+	authorizeErr  error
+	dialAddress   string
+	dialBinding   string
+	dialCalls     int
+	dialErr       error
+	systemAddress string
+	systemCalls   int
+	systemErr     error
 }
 
 func (*dialTestTunnel) HandleTCPConn(net.Conn, *C.Metadata)      {}
@@ -60,6 +63,37 @@ func (t *dialTestTunnel) DialExtensionEgress(address string, binding string) (ne
 	client, server := net.Pipe()
 	_ = server.Close()
 	return client, nil
+}
+
+func (t *dialTestTunnel) DialManagedSystemEgress(address string) (net.Conn, error) {
+	t.systemCalls++
+	t.systemAddress = address
+	if t.systemErr != nil {
+		return nil, t.systemErr
+	}
+	client, server := net.Pipe()
+	_ = server.Close()
+	return client, nil
+}
+
+func TestSystemTCPUsesManagedEgressCarrierPath(t *testing.T) {
+	tunnel := &dialTestTunnel{}
+	conn, err := systemTCPWithTunnel(context.Background(), tunnel, "control.example.com", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if tunnel.systemCalls != 1 || tunnel.systemAddress != "control.example.com:443" || tunnel.dialCalls != 0 {
+		t.Fatalf("system dial calls=%d address=%q extension-calls=%d", tunnel.systemCalls, tunnel.systemAddress, tunnel.dialCalls)
+	}
+
+	tunnel.systemErr = errors.New("managed gateway denied")
+	if _, err := systemTCPWithTunnel(context.Background(), tunnel, "control.example.com", 443); err == nil {
+		t.Fatal("managed system dial error was ignored")
+	}
+	if _, err := systemTCPWithTunnel(context.Background(), nil, "control.example.com", 443); !errors.Is(err, ErrNoTunnel) {
+		t.Fatalf("nil tunnel error = %v, want ErrNoTunnel", err)
+	}
 }
 
 func TestAuthorizeRunsFinalTunnelSafetyForPooledConnections(t *testing.T) {

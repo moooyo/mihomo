@@ -34,9 +34,13 @@ var routingConfigEpoch atomic.Uint64
 
 var extensionEgressAddressPolicy atomic.Pointer[func(netip.Addr) bool]
 
+var managedGatewaySource atomic.Pointer[func() netip.Addr]
+
 const (
 	extensionEgressSpecialRulesRoot   = "\x005gpn-extension-egress:"
 	extensionEgressSpecialRulesPrefix = extensionEgressSpecialRulesRoot + "v1:"
+	managedSystemEgressRulesRoot      = "\x005gpn-system-egress:"
+	managedSystemEgressRulesV1        = managedSystemEgressRulesRoot + "v1"
 )
 
 // Protected by configMux and refreshed with the default rule list.
@@ -61,6 +65,35 @@ func SetExtensionEgressAddressPolicy(policy func(netip.Addr) bool) {
 		return
 	}
 	extensionEgressAddressPolicy.Store(&policy)
+}
+
+// SetManagedGatewaySource publishes the installation-owned DNS projection that
+// private 5gpn system and extension tunnel carriers must never dial back into.
+// Direct-socket DNS, subscription, and importer paths are outside this boundary
+// and retain their separate destination policies. Ordinary mihomo startup never
+// calls this hook, so its INNER flows retain upstream behavior.
+func SetManagedGatewaySource(source func() netip.Addr) {
+	if source == nil {
+		managedGatewaySource.Store(nil)
+		return
+	}
+	managedGatewaySource.Store(&source)
+}
+
+func managedGatewaySnapshot() (netip.Addr, bool) {
+	source := managedGatewaySource.Load()
+	if source == nil {
+		return netip.Addr{}, false
+	}
+	gateway := (*source)().Unmap()
+	if !gateway.Is4() || !gateway.IsGlobalUnicast() || gateway.IsLoopback() {
+		return netip.Addr{}, false
+	}
+	return gateway, true
+}
+
+func managedGatewayTarget(address, gateway netip.Addr) bool {
+	return gateway.IsValid() && address.IsValid() && address.Unmap() == gateway
 }
 
 // SetEgressProxyUpdateCallback installs a notification for live group-set
@@ -408,6 +441,14 @@ func extensionEgressCarrierPresent(specialRules string) bool {
 	return strings.HasPrefix(specialRules, extensionEgressSpecialRulesRoot)
 }
 
+func managedSystemEgressCarrierPresent(specialRules string) bool {
+	return strings.HasPrefix(specialRules, managedSystemEgressRulesRoot)
+}
+
+func managedEgressCarrierPresent(specialRules string) bool {
+	return extensionEgressCarrierPresent(specialRules) || managedSystemEgressCarrierPresent(specialRules)
+}
+
 func decodeExtensionEgressCarrier(metadata *C.Metadata) (binding string, present bool, err error) {
 	if metadata == nil || !extensionEgressCarrierPresent(metadata.SpecialRules) {
 		return "", false, nil
@@ -425,6 +466,36 @@ func decodeExtensionEgressCarrier(metadata *C.Metadata) (binding string, present
 		return "", true, errors.New("reserved extension egress carrier is malformed")
 	}
 	return string(decoded), true, nil
+}
+
+func decodeManagedSystemEgressCarrier(metadata *C.Metadata) (present bool, err error) {
+	if metadata == nil || !managedSystemEgressCarrierPresent(metadata.SpecialRules) {
+		return false, nil
+	}
+	if metadata.SpecialRules != managedSystemEgressRulesV1 {
+		return true, errors.New("reserved managed system egress carrier version is unsupported")
+	}
+	if metadata.Type != C.INNER || metadata.NetWork != C.TCP || metadata.SpecialProxy != "" {
+		return true, errors.New("reserved managed system egress carrier requires an unforced INNER TCP flow")
+	}
+	return true, nil
+}
+
+func newManagedSystemEgressMetadata(address string) (*C.Metadata, error) {
+	metadata := &C.Metadata{
+		NetWork:      C.TCP,
+		Type:         C.INNER,
+		DNSMode:      C.DNSNormal,
+		Process:      C.MihomoName,
+		SpecialRules: managedSystemEgressRulesV1,
+	}
+	if err := metadata.SetRemoteAddress(address); err != nil {
+		return nil, fmt.Errorf("invalid managed system egress target: %w", err)
+	}
+	if !metadata.Valid() || metadata.DstPort == 0 {
+		return nil, errors.New("invalid managed system egress target address")
+	}
+	return metadata, nil
 }
 
 func newExtensionEgressMetadata(address string, binding string) (*C.Metadata, error) {
@@ -461,6 +532,133 @@ func (t tunnel) DialExtensionEgress(address string, binding string) (net.Conn, e
 	return conn1, nil
 }
 
+// DialManagedSystemEgress enters the normal TCP tunnel with a private marker
+// that scopes the dynamic gateway anti-loop guard to 5gpn-owned control
+// traffic. Generic mihomo INNER traffic never receives this marker.
+func (t tunnel) DialManagedSystemEgress(address string) (net.Conn, error) {
+	metadata, err := newManagedSystemEgressMetadata(address)
+	if err != nil {
+		return nil, err
+	}
+	conn1, conn2 := N.Pipe()
+	go t.HandleTCPConn(conn2, metadata)
+	return conn1, nil
+}
+
+func resolveManagedSystemEgress(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
+	return resolveManagedSystemEgressWithRoute(metadata, resolveManagedSystemEgressRoute)
+}
+
+type managedSystemEgressRoute func(*C.Metadata) (C.Proxy, C.Rule, error)
+
+func resolveManagedSystemEgressWithRoute(metadata *C.Metadata, route managedSystemEgressRoute) (C.Proxy, C.Rule, error) {
+	present, err := decodeManagedSystemEgressCarrier(metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !present {
+		return nil, nil, errors.New("managed system egress carrier is missing")
+	}
+	gateway, sourceReady := managedGatewaySnapshot()
+	if !sourceReady {
+		return nil, nil, errors.New("managed gateway source is unavailable or invalid")
+	}
+
+	targetAllowed, gatewayTarget, targetErr := resolveManagedEgressTarget(metadata, gateway, false)
+	proxy, rule, routeErr := route(metadata)
+	if routeErr != nil {
+		return nil, nil, routeErr
+	}
+	if proxy == nil {
+		return nil, nil, errors.New("managed system egress routing returned no proxy")
+	}
+	// Preserve operator REJECT precedence and rule identity. Any non-rejecting
+	// route remains subordinate to the immutable gateway anti-loop boundary.
+	if proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
+		return proxy, rule, nil
+	}
+	if targetErr != nil {
+		return nil, nil, targetErr
+	}
+	if gatewayTarget {
+		reject, rejectErr := managedGatewayRejectProxy()
+		return reject, nil, rejectErr
+	}
+	if !targetAllowed {
+		return nil, nil, fmt.Errorf("managed system egress target %s resolved to an unusable address", metadata.RuleHost())
+	}
+	return proxy, rule, nil
+}
+
+func resolveManagedSystemEgressRoute(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
+	return resolveOrdinaryMetadata(managedSystemEgressRouteMetadata(metadata))
+}
+
+func managedSystemEgressRouteMetadata(metadata *C.Metadata) *C.Metadata {
+	routeMetadata := metadata.Clone()
+	routeMetadata.SpecialRules = ""
+	if routeMetadata.Host != "" {
+		// The original ordinary INNER flow entered rule evaluation with an
+		// unresolved domain. Preserve that no-resolve behavior while carrying the
+		// domain independently of any hosts lookup performed by the rule helper.
+		routeMetadata.SniffHost = routeMetadata.Host
+		routeMetadata.DstIP = netip.Addr{}
+	}
+	return routeMetadata
+}
+
+func resolveManagedEgressTarget(metadata *C.Metadata, gateway netip.Addr, requirePublic bool) (allAllowed bool, gatewayTarget bool, err error) {
+	if metadata == nil {
+		return false, false, errors.New("managed egress metadata is missing")
+	}
+	if metadata.DstIP.IsValid() {
+		metadata.DstIP = metadata.DstIP.Unmap()
+		allowed := !resolver.IsFakeIP(metadata.DstIP) && (!requirePublic || extensionEgressAddressAllowed(metadata.DstIP))
+		return allowed, managedGatewayTarget(metadata.DstIP, gateway), nil
+	}
+	if metadata.Host == "" {
+		return false, false, errors.New("managed egress target has no address")
+	}
+	if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
+		metadata.Host = node.Domain
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+	defer cancel()
+	addresses, err := resolver.LookupIP(ctx, metadata.Host)
+	if err != nil {
+		return false, false, fmt.Errorf("resolve managed egress target %s: %w", metadata.Host, err)
+	}
+	selected := netip.Addr{}
+	allAllowed = true
+	for _, address := range addresses {
+		normalized := address.Unmap()
+		if !normalized.IsValid() || resolver.IsFakeIP(normalized) || (requirePublic && !extensionEgressAddressAllowed(address)) {
+			allAllowed = false
+		}
+		if managedGatewayTarget(normalized, gateway) {
+			gatewayTarget = true
+		}
+		if !selected.IsValid() || (normalized.Is4() && !selected.Is4()) {
+			selected = normalized
+		}
+	}
+	if !selected.IsValid() {
+		return false, gatewayTarget, fmt.Errorf("managed egress target %s resolved to no usable address", metadata.Host)
+	}
+	metadata.DstIP = selected
+	return allAllowed, gatewayTarget, nil
+}
+
+func managedGatewayRejectProxy() (C.Proxy, error) {
+	configMux.RLock()
+	defer configMux.RUnlock()
+	reject, exists := proxies["REJECT"]
+	if !exists || reject == nil || reject.Type() != C.Reject {
+		return nil, errors.New("managed gateway anti-loop REJECT adapter is unavailable")
+	}
+	return reject, nil
+}
+
 // resolveExtensionEgress applies the immutable operator safety prefix before
 // treating an extension binding as the terminal egress decision. The target is
 // resolved once and pinned so neither DIRECT nor a remote proxy can resolve the
@@ -475,7 +673,11 @@ func resolveExtensionEgress(metadata *C.Metadata, binding string) (C.Proxy, C.Ru
 	if metadata.Type != C.INNER || metadata.SpecialProxy != "" {
 		return nil, nil, errors.New("extension egress requires an unforced INNER flow")
 	}
-	targetAllowed, targetErr := resolveExtensionEgressTarget(metadata)
+	gateway, sourceReady := managedGatewaySnapshot()
+	if !sourceReady {
+		return nil, nil, errors.New("managed gateway source is unavailable or invalid")
+	}
+	targetAllowed, gatewayTarget, targetErr := resolveManagedEgressTarget(metadata, gateway, true)
 	// Rule matching needs both the dial target and the pinned address. Keep the
 	// target as the rule identity rather than a sniffed application host, while
 	// hiding Host from the helper's live lookup. This keeps pooled preflight and
@@ -491,31 +693,42 @@ func resolveExtensionEgress(metadata *C.Metadata, binding string) (C.Proxy, C.Ru
 	}
 	if prefix.matched {
 		configMux.RLock()
-		defer configMux.RUnlock()
 		if !clientRulePrefixCurrent(prefix) {
+			configMux.RUnlock()
 			return nil, nil, errors.New("mihomo routing changed after the extension egress safety decision")
 		}
 		if prefix.proxy == nil {
+			configMux.RUnlock()
 			return nil, nil, errors.New("extension egress safety prefix returned no proxy")
 		}
+		prefixProxy, prefixRule := prefix.proxy, prefix.rule
+		configMux.RUnlock()
 		// An operator REJECT is terminal even when the resolved address itself is
 		// unsafe; no connection is opened in that case.
-		if prefix.proxy.Type() == C.Reject || prefix.proxy.Type() == C.RejectDrop {
-			return prefix.proxy, prefix.rule, nil
+		if prefixProxy.Type() == C.Reject || prefixProxy.Type() == C.RejectDrop {
+			return prefixProxy, prefixRule, nil
 		}
 		if targetErr != nil {
 			return nil, nil, targetErr
 		}
+		if gatewayTarget {
+			reject, rejectErr := managedGatewayRejectProxy()
+			return reject, nil, rejectErr
+		}
 		if !targetAllowed || !extensionEgressAddressAllowed(metadata.DstIP) {
 			return nil, nil, fmt.Errorf("extension egress target %s resolved to a non-public address", metadata.RuleHost())
 		}
-		if prefix.proxy.Name() != binding || !isOperatorEgressProxy(binding, prefix.proxy) {
-			return nil, nil, fmt.Errorf("operator safety prefix selected %s instead of extension egress %s", prefix.proxy.Name(), binding)
+		if prefixProxy.Name() != binding || !isOperatorEgressProxy(binding, prefixProxy) {
+			return nil, nil, fmt.Errorf("operator safety prefix selected %s instead of extension egress %s", prefixProxy.Name(), binding)
 		}
-		return prefix.proxy, prefix.rule, nil
+		return prefixProxy, prefixRule, nil
 	}
 	if targetErr != nil {
 		return nil, nil, targetErr
+	}
+	if gatewayTarget {
+		reject, rejectErr := managedGatewayRejectProxy()
+		return reject, nil, rejectErr
 	}
 	if !targetAllowed || !extensionEgressAddressAllowed(metadata.DstIP) {
 		return nil, nil, fmt.Errorf("extension egress target %s resolved to a non-public address", metadata.RuleHost())
@@ -570,43 +783,6 @@ func (t tunnel) AuthorizeExtensionEgress(metadata *C.Metadata, egressProxy strin
 	return nil
 }
 
-func resolveExtensionEgressTarget(metadata *C.Metadata) (bool, error) {
-	if metadata.Host == "" {
-		if !metadata.DstIP.IsValid() {
-			return false, errors.New("extension egress target has no address")
-		}
-		return extensionEgressAddressAllowed(metadata.DstIP), nil
-	}
-	if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
-		// Preserve mihomo hosts alias semantics in this dedicated path. Both
-		// pooled preflight and the eventual inner dial pass here exactly once.
-		metadata.Host = node.Domain
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
-	defer cancel()
-	addresses, err := resolver.LookupIP(ctx, metadata.Host)
-	if err != nil {
-		return false, fmt.Errorf("resolve extension egress target %s: %w", metadata.Host, err)
-	}
-	selected := netip.Addr{}
-	allPublic := true
-	for _, address := range addresses {
-		if !extensionEgressAddressAllowed(address) {
-			allPublic = false
-		}
-		normalized := address.Unmap()
-		if !selected.IsValid() || (normalized.Is4() && !selected.Is4()) {
-			selected = normalized
-		}
-	}
-	if !selected.IsValid() {
-		return false, fmt.Errorf("extension egress target %s resolved to no usable address", metadata.Host)
-	}
-	metadata.DstIP = selected
-	return allPublic, nil
-}
-
 func extensionEgressAddressAllowed(address netip.Addr) bool {
 	policy := extensionEgressAddressPolicy.Load()
 	return policy != nil && (*policy)(address) && !resolver.IsFakeIP(address.Unmap())
@@ -620,6 +796,20 @@ func extensionEgressDialMetadata(metadata *C.Metadata) *C.Metadata {
 	// Only the outbound adapter receives the pinned address. The original
 	// metadata and the HTTP transport above this connection retain the hostname
 	// used for rule matching, Host, SNI, and certificate verification.
+	pinned := metadata.Clone()
+	if pinned.DstIP.IsValid() {
+		pinned.Host = ""
+	}
+	pinned.SpecialRules = ""
+	metadata.SpecialRules = ""
+	return pinned
+}
+
+func managedSystemEgressDialMetadata(metadata *C.Metadata) *C.Metadata {
+	present, err := decodeManagedSystemEgressCarrier(metadata)
+	if !present || err != nil {
+		return metadata
+	}
 	pinned := metadata.Clone()
 	if pinned.DstIP.IsValid() {
 		pinned.Host = ""

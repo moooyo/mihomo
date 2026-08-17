@@ -19,21 +19,36 @@ func openPrivateNoFollow(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
-func validatePrivatePathInfo(info os.FileInfo) error {
-	return validatePrivateFileInfo(info)
+func validateExpectedPrivateFileOwner(expectedUID int) error {
+	readerUID := os.Geteuid()
+	if readerUID != 0 && readerUID != expectedUID {
+		return errors.New("5gpn/state: only root may select a different expected file owner")
+	}
+	return nil
 }
 
-func validatePrivateOpenFile(_ *os.File, info os.FileInfo) error {
-	return validatePrivateFileInfo(info)
+func validatePrivatePathInfo(info os.FileInfo, expectedUID *int) error {
+	return validatePrivateFileInfo(info, expectedUID)
 }
 
-func validatePrivateFileInfo(info os.FileInfo) error {
+func validatePrivateOpenFile(_ *os.File, info os.FileInfo, expectedUID *int) error {
+	return validatePrivateFileInfo(info, expectedUID)
+}
+
+func validatePrivateFileInfo(info os.FileInfo, expectedUID *int) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return errors.New("could not inspect owner and link count")
 	}
-	if !privateFileOwnerMatches(stat, os.Geteuid()) {
-		return errors.New("file is not owned by the current service identity")
+	readerUID := os.Geteuid()
+	if !privateFileOwnerMatches(stat, readerUID, expectedUID) {
+		if expectedUID == nil {
+			return errors.New("file is not owned by the current service identity")
+		}
+		if readerUID != 0 && readerUID != *expectedUID {
+			return errors.New("only root may select a different expected file owner")
+		}
+		return fmt.Errorf("file owner UID is %d, want %d", stat.Uid, *expectedUID)
 	}
 	if stat.Nlink != 1 {
 		return errors.New("file must have exactly one hard link")
@@ -47,6 +62,15 @@ func validatePrivateFileInfo(info os.FileInfo) error {
 	return nil
 }
 
-func privateFileOwnerMatches(stat *syscall.Stat_t, uid int) bool {
-	return stat != nil && int(stat.Uid) == uid
+func privateFileOwnerMatches(stat *syscall.Stat_t, readerUID int, expectedUID *int) bool {
+	if stat == nil {
+		return false
+	}
+	if expectedUID == nil {
+		return int(stat.Uid) == readerUID
+	}
+	if readerUID != 0 && readerUID != *expectedUID {
+		return false
+	}
+	return int(stat.Uid) == *expectedUID
 }

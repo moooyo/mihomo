@@ -342,10 +342,13 @@ func needLookupIP(metadata *C.Metadata) bool {
 }
 
 func preHandleMetadata(metadata *C.Metadata) error {
-	// Extension egress already carries an explicit engine-authorized target.
-	// Do not reinterpret it through enhanced-DNS reverse mappings; its dedicated
-	// resolver validates and pins the address before the safety prefix runs.
+	// Managed egress already carries an explicit 5gpn-owned target. Do not
+	// reinterpret it through enhanced-DNS reverse mappings; its dedicated
+	// resolver validates and pins the address before ordinary routing runs.
 	if _, present, err := decodeExtensionEgressCarrier(metadata); present {
+		return err
+	}
+	if present, err := decodeManagedSystemEgressCarrier(metadata); present {
 		return err
 	}
 	// preprocess enhanced-mode metadata
@@ -382,6 +385,13 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	if extensionEgressCarrierPresent(metadata.SpecialRules) {
 		return resolveCarriedExtensionEgress(metadata)
 	}
+	if managedSystemEgressCarrierPresent(metadata.SpecialRules) {
+		return resolveManagedSystemEgress(metadata)
+	}
+	return resolveOrdinaryMetadata(metadata)
+}
+
+func resolveOrdinaryMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
 		configMux.RLock()
@@ -609,10 +619,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
-	_, extensionEgress, carrierErr := decodeExtensionEgressCarrier(metadata)
+	_, extensionEgress, extensionCarrierErr := decodeExtensionEgressCarrier(metadata)
+	systemEgress, systemCarrierErr := decodeManagedSystemEgressCarrier(metadata)
+	carrierErr := errors.Join(extensionCarrierErr, systemCarrierErr)
+	managedEgress := extensionEgress || systemEgress
 	preHandleFailed := carrierErr != nil
 	if carrierErr != nil {
-		log.Debugln("[Metadata PreHandle] extension egress carrier error: %s", carrierErr)
+		log.Debugln("[Metadata PreHandle] managed egress carrier error: %s", carrierErr)
 	} else if err := preHandleMetadata(metadata); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
 		preHandleFailed = true
@@ -620,7 +633,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
-	if !extensionEgress && sniffingEnable && snifferDispatcher.Enable() {
+	if !managedEgress && sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
 		if snifferDispatcher.TCPSniff(conn, metadata) {
@@ -673,7 +686,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 
 	dialMetadata := metadata
-	if !extensionEgressCarrierPresent(metadata.SpecialRules) && len(metadata.Host) > 0 {
+	if !managedEgressCarrierPresent(metadata.SpecialRules) && len(metadata.Host) > 0 {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
 			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
 				dialMetadata.DstIP = dstIp
@@ -683,6 +696,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}
 	}
 	dialMetadata = extensionEgressDialMetadata(dialMetadata)
+	dialMetadata = managedSystemEgressDialMetadata(dialMetadata)
 
 	var peekBytes []byte
 	var peekLen int

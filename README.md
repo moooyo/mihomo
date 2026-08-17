@@ -57,6 +57,10 @@ macOS CI is only a test harness for the private worker protocol.
 Standalone Linux packages and container images are not published because they
 do not provide the required systemd and delegated-cgroup boundary.
 
+The fork-owned runtime acceptance checklists are indexed in
+[acceptance/README.md](acceptance/README.md). They separate read-only deployment
+smoke from destructive and capacity scenarios that require a disposable host.
+
 ## For development
 
 Requirements:

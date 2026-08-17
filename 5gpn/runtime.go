@@ -12,7 +12,7 @@ const runtimeEnvironment = "FIVEGPN_RUNTIME"
 
 const (
 	containerContractCommand = "5gpn-container-contract"
-	containerContractVersion = "5gpn-container-runtime-v1"
+	containerContractVersion = "5gpn-container-runtime-v2"
 )
 
 type deploymentRuntime uint32
@@ -55,7 +55,8 @@ func ContainerMode() bool {
 }
 
 // ContainerContractCommand is the offline CLI used by image assembly to prove
-// that a pinned immutable mihomo artifact contains this container lifecycle.
+// that a pinned immutable mihomo artifact contains the complete container-v2
+// lifecycle and preflight surface.
 func ContainerContractCommand() string { return containerContractCommand }
 
 // ContainerContractMain prints the exact compile-time contract marker without

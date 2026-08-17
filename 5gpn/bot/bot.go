@@ -174,7 +174,7 @@ func Open(path string, facts Facts, dial Dialer) (*Service, error) {
 	}
 	s := &Service{doc: doc, facts: facts, dial: dial, state: "stopped"}
 	s.loop = s.run
-	if err := s.validate(doc.Get().Value); err != nil {
+	if err := doc.Get().Value.Validate(); err != nil {
 		return nil, fmt.Errorf("5gpn/bot: %s is unusable: %w", path, err)
 	}
 	return s, nil
@@ -241,7 +241,7 @@ func (s *Service) Update(revision string, next Document, token string) (View, st
 			next.Token = strings.TrimSpace(token)
 		}
 		next.Admins = normaliseAdmins(next.Admins)
-		if err := s.validate(next); err != nil {
+		if err := next.Validate(); err != nil {
 			return current, err
 		}
 		return next, nil
@@ -253,7 +253,9 @@ func (s *Service) Update(revision string, next Document, token string) (View, st
 	return s.viewOf(updated.Value), updated.Revision, nil
 }
 
-func (s *Service) validate(doc Document) error {
+// Validate checks one bot document without opening a network connection or
+// starting the polling loop.
+func (doc Document) Validate() error {
 	if doc.Version != documentVersion {
 		return fmt.Errorf("bot document version must be %d", documentVersion)
 	}

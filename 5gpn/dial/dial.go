@@ -67,6 +67,10 @@ type extensionEgressDialer interface {
 	DialExtensionEgress(address string, egressProxy string) (net.Conn, error)
 }
 
+type managedSystemEgressDialer interface {
+	DialManagedSystemEgress(address string) (net.Conn, error)
+}
+
 func authorizeWithTunnel(
 	t C.Tunnel,
 	state *trafficAuthorization,
@@ -130,7 +134,18 @@ func SystemTCP(ctx context.Context, host string, port int) (net.Conn, error) {
 	if t == nil {
 		return nil, ErrNoTunnel
 	}
-	conn, err := inner.HandleTcp(t, net.JoinHostPort(host, strconv.Itoa(port)), "")
+	return systemTCPWithTunnel(ctx, t, host, port)
+}
+
+func systemTCPWithTunnel(ctx context.Context, t C.Tunnel, host string, port int) (net.Conn, error) {
+	if t == nil {
+		return nil, ErrNoTunnel
+	}
+	dialer, ok := t.(managedSystemEgressDialer)
+	if !ok {
+		return nil, errors.New("5gpn/dial: tunnel has no managed system egress dialer")
+	}
+	conn, err := dialer.DialManagedSystemEgress(net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}

@@ -1,16 +1,19 @@
 //go:build windows
 
-package state
+package configinspect
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
 	"golang.org/x/sys/windows"
 )
 
-func openPrivateNoFollow(path string) (*os.File, error) {
+func requireConfigInspectionIdentity(int, bool) error {
+	return fmt.Errorf("controller config inspection is supported only by the root-managed Unix installation")
+}
+
+func openConfigNoFollow(path string) (*os.File, error) {
 	pathPointer, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -35,32 +38,22 @@ func openPrivateNoFollow(path string) (*os.File, error) {
 	}
 	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		file.Close()
-		return nil, errors.New("path is a reparse point")
+		return nil, fmt.Errorf("config path is a reparse point")
 	}
 	return file, nil
 }
 
-func validateExpectedPrivateFileOwner(_ int) error {
-	return errors.New("5gpn/state: an expected Unix owner UID is unsupported on Windows")
+func requireSecureConfigMetadata(_ *os.File, _ os.FileInfo, _ int) error {
+	return fmt.Errorf("controller config ownership inspection is unsupported on Windows")
 }
 
-func validatePrivatePathInfo(_ os.FileInfo, expectedUID *int) error {
-	if expectedUID != nil {
-		return errors.New("an expected Unix owner UID is unsupported on Windows")
-	}
-	return nil
-}
-
-func validatePrivateOpenFile(file *os.File, _ os.FileInfo, expectedUID *int) error {
-	if expectedUID != nil {
-		return errors.New("an expected Unix owner UID is unsupported on Windows")
-	}
+func requireSingleConfigLink(file *os.File, _ os.FileInfo) error {
 	var information windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &information); err != nil {
-		return fmt.Errorf("inspect file link count: %w", err)
+		return fmt.Errorf("inspect config link count: %w", err)
 	}
 	if information.NumberOfLinks != 1 {
-		return errors.New("file must have exactly one hard link")
+		return fmt.Errorf("config must have exactly one hard link")
 	}
 	return nil
 }

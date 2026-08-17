@@ -100,6 +100,14 @@ func FiveGPNFatalEvents() <-chan error { return fivegpnFatalEvents }
 // domain; syscall.Exec would skip container bootstrap and lifecycle cleanup.
 func FiveGPNRestartEvents() <-chan struct{} { return fivegpnRestartEvents }
 
+func prepareFiveGPNDistribution() {
+	// Publish the distribution boundary only after the complete managed
+	// controller preflight succeeds and before entering the shared runtime
+	// failure domain. Once startup begins, an error must not turn a partially
+	// initialized 5gpn process back into ordinary mihomo behavior.
+	updater.SetManagedDistribution(true)
+}
+
 // startFiveGPN installs the 5gpn subsystems exactly once, before listeners accept.
 //
 // Once, because ApplyConfig runs on every reload and the interception engine
@@ -108,10 +116,10 @@ func FiveGPNRestartEvents() <-chan struct{} { return fivegpnRestartEvents }
 //
 // DNS is not optional: starting the forwarding plane while the client or origin
 // DNS boundary is absent creates an active-looking gateway that cannot carry
-// traffic. Startup errors therefore return through hub.Parse. A listener that
-// dies later reports through the injected callback and terminates at this one
-// process-owner boundary; plugin, interception, and bot errors remain locally
-// isolated inside fivegpn.Start.
+// traffic. Startup errors therefore return through hub.ParseManaged. A
+// listener that dies later reports through the injected callback and terminates
+// at this one process-owner boundary; plugin, interception, and bot errors
+// remain locally isolated inside fivegpn.Start.
 func startFiveGPN() error {
 	// The controller is part of the same deliberate failure domain as DoT. The
 	// route package owns the listener, while hub owns the process, so the fatal
@@ -124,15 +132,14 @@ func startFiveGPN() error {
 	fivegpnOnce.Do(func() {
 		// 5gpn publishes both core and Console through its digest-pinned installer.
 		// Upstream self-updaters cannot preserve the fork or its artifact pins.
-		updater.SetManagedDistribution(true)
 		fivegpnStartErr = fivegpn.Start(C.Path.HomeDir(), func(err error) { fivegpnFatal(err) })
 	})
 	return fivegpnStartErr
 }
 
-// Shutdown runs the existing core cleanup and then releases the 5gpn services
-// and their workers. Ordinary listener descriptors close with PID 1; the
-// product-owned goroutines and child processes are explicitly waited here.
+// Shutdown closes ordinary core listeners, then releases the 5gpn services and
+// their workers. Product-owned goroutines and child processes are explicitly
+// waited here instead of being left to process exit.
 func Shutdown(ctx context.Context) error {
 	executor.Shutdown()
 	return fivegpn.Shutdown(ctx)

@@ -300,6 +300,53 @@ func TestListenerChangeDoesNotPublishDocument(t *testing.T) {
 	}
 }
 
+func TestGatewayChangeDoesNotPublishDocument(t *testing.T) {
+	upstream := upstreamServer(t, "192.0.2.94")
+	svc, clientAddr, _ := startService(t, upstream)
+
+	beforeDocument, beforeRevision := svc.Document()
+	beforeRuntime := svc.resolver.snapshot()
+	documentPath := filepath.Join(filepath.Dir(svc.rulesDir), "dns.json")
+	beforeBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document before update: %v", err)
+	}
+
+	_, returnedRevision, err := svc.Update(beforeRevision, func(d Document) (Document, error) {
+		d.Gateway = "198.51.100.2"
+		return d, nil
+	})
+	if err == nil {
+		t.Fatal("gateway update changed an installation-owned coordinate")
+	}
+	if !strings.Contains(err.Error(), "gateway is installation-owned") {
+		t.Fatalf("gateway update error = %q", err)
+	}
+	if returnedRevision != beforeRevision {
+		t.Fatalf("returned revision = %q, want %q", returnedRevision, beforeRevision)
+	}
+	afterDocument, afterRevision := svc.Document()
+	if afterRevision != beforeRevision {
+		t.Fatalf("live revision moved from %q to %q", beforeRevision, afterRevision)
+	}
+	if afterDocument.Gateway != beforeDocument.Gateway {
+		t.Fatalf("live gateway changed from %q to %q", beforeDocument.Gateway, afterDocument.Gateway)
+	}
+	if svc.resolver.snapshot() != beforeRuntime {
+		t.Fatal("rejected gateway update changed the live runtime generation")
+	}
+	afterBytes, err := os.ReadFile(documentPath)
+	if err != nil {
+		t.Fatalf("read document after update: %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatal("failed gateway update changed the persisted document")
+	}
+	if got := answerIPs(askOverWire(t, clientAddr, "www.corp.example", D.TypeA), 4); !equalStrings(got, []string{beforeDocument.Gateway}) {
+		t.Fatalf("client gateway answer = %v, want %s", got, beforeDocument.Gateway)
+	}
+}
+
 func TestPolicyPreparationFailureDoesNotPublishDocument(t *testing.T) {
 	upstream := upstreamServer(t, "192.0.2.96")
 	svc, clientAddr, _ := startService(t, upstream)

@@ -43,37 +43,32 @@ type tlsKeyPairFileLoader struct {
 	now             func() time.Time
 }
 
+var newTLSKeyPairReloadLoader = newTLSKeyPairFileLoader
+
+// ValidateTLSKeyPair parses an inline or file-backed certificate and private
+// key without starting a reload loop. Startup preflights use this when they
+// need the same safe-path, stable-generation, and key-match checks as the live
+// loader but do not retain the returned certificate generation.
+func ValidateTLSKeyPair(certificate, privateKey string) error {
+	_, _, _, _, err := loadTLSKeyPair(certificate, privateKey)
+	return err
+}
+
 // NewTLSKeyPairLoader creates a loader function for TLS key pairs from the provided certificate and private key data or file paths.
 // If both certificate and privateKey are empty, generates a random TLS RSA key pair.
 func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certificate, error), error) {
-	if certificate == "" && privateKey == "" {
-		var err error
-		certificate, privateKey, _, err = NewRandomTLSKeyPair(KeyPairTypeRSA)
-		if err != nil {
-			return nil, err
-		}
+	cert, certificatePath, privateKeyPath, fileBacked, err := loadTLSKeyPair(certificate, privateKey)
+	if err != nil {
+		return nil, err
 	}
-	cert, painTextErr := tls.X509KeyPair([]byte(certificate), []byte(privateKey))
-	if painTextErr == nil {
+	if !fileBacked {
 		return func() (*tls.Certificate, error) {
 			return &cert, nil
 		}, nil
 	}
-
-	certificate = C.Path.Resolve(certificate)
-	privateKey = C.Path.Resolve(privateKey)
-	var loadErr error
-	if !C.Path.IsSafePath(certificate) {
-		loadErr = C.Path.ErrNotSafePath(certificate)
-	} else if !C.Path.IsSafePath(privateKey) {
-		loadErr = C.Path.ErrNotSafePath(privateKey)
-	}
+	loader, loadErr := newTLSKeyPairReloadLoader(certificatePath, privateKeyPath, tlsKeyPairReloadInterval, time.Now)
 	if loadErr != nil {
-		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
-	}
-	loader, loadErr := newTLSKeyPairFileLoader(certificate, privateKey, tlsKeyPairReloadInterval, time.Now)
-	if loadErr != nil {
-		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
+		return nil, loadErr
 	}
 	return loader.load, nil
 }
@@ -187,6 +182,38 @@ func (i tlsFileIdentity) equal(other tlsFileIdentity) bool {
 		os.SameFile(i.info, other.info) &&
 		i.info.Size() == other.info.Size() &&
 		i.info.ModTime().Equal(other.info.ModTime())
+}
+
+func loadTLSKeyPair(certificate, privateKey string) (cert tls.Certificate, certificatePath, privateKeyPath string, fileBacked bool, err error) {
+	if certificate == "" && privateKey == "" {
+		certificate, privateKey, _, err = NewRandomTLSKeyPair(KeyPairTypeRSA)
+		if err != nil {
+			return cert, "", "", false, err
+		}
+	}
+	cert, plainTextErr := tls.X509KeyPair([]byte(certificate), []byte(privateKey))
+	if plainTextErr == nil {
+		return cert, "", "", false, nil
+	}
+
+	certificatePath = C.Path.Resolve(certificate)
+	privateKeyPath = C.Path.Resolve(privateKey)
+	var loadErr error
+	if !C.Path.IsSafePath(certificatePath) {
+		loadErr = C.Path.ErrNotSafePath(certificatePath)
+	} else if !C.Path.IsSafePath(privateKeyPath) {
+		loadErr = C.Path.ErrNotSafePath(privateKeyPath)
+	} else {
+		loaded, _, stableErr := loadStableTLSKeyPair(certificatePath, privateKeyPath)
+		loadErr = stableErr
+		if stableErr == nil {
+			cert = *loaded
+		}
+	}
+	if loadErr != nil {
+		return cert, "", "", false, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", plainTextErr.Error(), loadErr.Error())
+	}
+	return cert, certificatePath, privateKeyPath, true, nil
 }
 
 func LoadCertificates(certificate string) (*x509.CertPool, error) {

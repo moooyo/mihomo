@@ -41,7 +41,7 @@ func TestContainerContractMainIsExactAndOffline(t *testing.T) {
 	if code := ContainerContractMain(nil, &output); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if got, want := output.String(), "5gpn-container-runtime-v1\n"; got != want {
+	if got, want := output.String(), "5gpn-container-runtime-v2\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 	output.Reset()

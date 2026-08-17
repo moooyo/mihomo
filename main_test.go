@@ -24,10 +24,20 @@ func TestInitRegistersButDoesNotParseFlags(t *testing.T) {
 	if strings.Contains(source[initStart:mainStart], "flag.Parse()") {
 		t.Fatal("init parses flags before testing registers -test.* flags")
 	}
-	dispatch := strings.Index(source, "os.Args[1] == fivegpn.ContainerContractCommand()")
 	parse := strings.Index(source, "flag.Parse()")
-	if dispatch < 0 || parse < 0 || dispatch > parse {
-		t.Fatal("one-shot container contract no longer dispatches before ordinary flag parsing")
+	if parse < 0 {
+		t.Fatal("ordinary flag parsing is missing")
+	}
+	for _, marker := range []string{
+		"os.Args[1] == fivegpn.ContainerContractCommand()",
+		"os.Args[1] == fivegpn.ExtensionWorkerCommand()",
+		`os.Args[1] == "5gpn-state"`,
+		`os.Args[1] == "5gpn-config"`,
+	} {
+		dispatch := strings.Index(source, marker)
+		if dispatch < 0 || dispatch > parse {
+			t.Fatalf("one-shot dispatch %q does not precede ordinary flag parsing", marker)
+		}
 	}
 }
 
@@ -47,7 +57,7 @@ func TestRunDispatchesContainerContractBeforeRuntimeStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 0 || string(body) != "5gpn-container-runtime-v1\n" {
+	if code != 0 || string(body) != "5gpn-container-runtime-v2\n" {
 		t.Fatalf("contract exit/output = %d/%q", code, body)
 	}
 }

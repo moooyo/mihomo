@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -83,6 +84,10 @@ func TestInstallOnlyReviewRejectsAnInstalledID(t *testing.T) {
 	if reviewResponse.Code != http.StatusOK {
 		t.Fatalf("initial review status %d, want %d; body=%s", reviewResponse.Code, http.StatusOK, reviewResponse.Body.String())
 	}
+	if strings.Contains(reviewResponse.Body.String(), "function transform") ||
+		strings.Contains(reviewResponse.Body.String(), "apiVersion: 5gpn.io/v1") {
+		t.Fatalf("review response published raw manifest or script body: %s", reviewResponse.Body.String())
+	}
 	var review struct {
 		Candidate engine.Candidate `json:"candidate"`
 		Revision  string           `json:"revision"`
@@ -90,12 +95,14 @@ func TestInstallOnlyReviewRejectsAnInstalledID(t *testing.T) {
 	if err := json.Unmarshal(reviewResponse.Body.Bytes(), &review); err != nil {
 		t.Fatalf("decode review response: %v", err)
 	}
-	if review.Candidate.Digest == "" || review.Revision == "" {
+	if review.Candidate.Digest == "" || review.Revision == "" ||
+		review.Candidate.Detail.ReviewContract != engine.ReviewContractVersion {
 		t.Fatalf("initial review omitted digest or revision: %+v", review)
 	}
 
 	installBody, err := json.Marshal(installRequest{
-		Revision: review.Revision,
+		Revision:       review.Revision,
+		ReviewContract: engine.ReviewContractVersion,
 		InstallRequest: engine.InstallRequest{
 			ImportRequest: importRequest,
 			Digest:        review.Candidate.Digest,
@@ -173,7 +180,8 @@ func TestInstallReturnsAReviewConflictWhenTheCandidateChanged(t *testing.T) {
 
 	changed := strings.Replace(installOnlyReviewManifest, "version: 1.0.0", "version: 1.1.0", 1)
 	applyBody, err := json.Marshal(installRequest{
-		Revision: review.Revision,
+		Revision:       review.Revision,
+		ReviewContract: engine.ReviewContractVersion,
 		InstallRequest: engine.InstallRequest{
 			ImportRequest: engine.ImportRequest{Content: changed},
 			Digest:        review.Candidate.Digest,
@@ -212,6 +220,175 @@ func TestInstalledSourceUpdateRoutesAreNotExposed(t *testing.T) {
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("%s installed-source update route returned %d, want 404", method, response.Code)
 		}
+	}
+}
+
+func TestConfirmationWritesRequireTheCurrentReviewContract(t *testing.T) {
+	e := newInterceptionAPIEngine(t)
+	revision := e.Revision()
+
+	type requestFixture struct {
+		method string
+		path   string
+		body   func(int) any
+	}
+	fixtures := map[string]requestFixture{
+		"install": {
+			method: http.MethodPost,
+			path:   "/extensions",
+			body: func(contract int) any {
+				return installRequest{
+					Revision: revision, ReviewContract: contract,
+					InstallRequest: engine.InstallRequest{
+						ImportRequest: engine.ImportRequest{Content: installOnlyReviewManifest},
+						Digest:        strings.Repeat("a", 64),
+					},
+				}
+			},
+		},
+		"catalog update": {
+			method: http.MethodPost,
+			path:   "/catalog/source/entries/entry/update",
+			body: func(contract int) any {
+				return catalogUpdateRequest{
+					Revision: revision, ReviewContract: contract,
+					Digest: strings.Repeat("b", 64), URL: "https://catalog.example.com/extension.yaml",
+				}
+			},
+		},
+		"reorder": {
+			method: http.MethodPut,
+			path:   "/order",
+			body: func(contract int) any {
+				return orderRequest{Revision: revision, ReviewContract: contract, Order: []string{}}
+			},
+		},
+		"enable": {
+			method: http.MethodPut,
+			path:   "/extensions/missing/enabled",
+			body: func(contract int) any {
+				return enabledRequest{Revision: revision, ReviewContract: contract, Enabled: true}
+			},
+		},
+	}
+	wantMessage := "review_contract must be 7; reload the current state and review the action again"
+
+	for name, fixture := range fixtures {
+		for label, contract := range map[string]int{
+			"missing": 0,
+			"stale":   engine.ReviewContractVersion - 1,
+			"future":  engine.ReviewContractVersion + 1,
+		} {
+			t.Run(name+" "+label, func(t *testing.T) {
+				body, err := json.Marshal(fixture.body(contract))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if label == "missing" {
+					var object map[string]any
+					if err := json.Unmarshal(body, &object); err != nil {
+						t.Fatal(err)
+					}
+					delete(object, "review_contract")
+					body, err = json.Marshal(object)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				request := httptest.NewRequest(fixture.method, fixture.path, strings.NewReader(string(body)))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				interceptionRouter().ServeHTTP(response, request)
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("status %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+				}
+				var failure struct {
+					Message string `json:"message"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &failure); err != nil {
+					t.Fatal(err)
+				}
+				if failure.Message != wantMessage {
+					t.Fatalf("review contract error = %q, want %q", failure.Message, wantMessage)
+				}
+				if e.Revision() != revision {
+					t.Fatalf("rejected confirmation moved revision %q to %q", revision, e.Revision())
+				}
+			})
+		}
+	}
+
+	body, err := json.Marshal(orderRequest{
+		Revision: revision, ReviewContract: engine.ReviewContractVersion, Order: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/order", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("current review contract reorder status %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+}
+
+func TestDisableAllowsAnOmittedReviewContract(t *testing.T) {
+	e := newInterceptionAPIEngine(t)
+	engine.SetImporter(engine.NewImporter(nil))
+	t.Cleanup(func() { engine.SetImporter(nil) })
+
+	request := engine.ImportRequest{Content: installOnlyReviewManifest}
+	candidate, revision, err := e.FetchInstallView(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, revision, err = e.Install(context.Background(), revision, engine.InstallRequest{
+		ImportRequest: request, Digest: candidate.Digest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	enableBody, err := json.Marshal(enabledRequest{
+		Revision: revision, ReviewContract: engine.ReviewContractVersion, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enable := httptest.NewRequest(http.MethodPut, "/extensions/"+candidate.Detail.ID+"/enabled", strings.NewReader(string(enableBody)))
+	enable.Header.Set("Content-Type", "application/json")
+	enableResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(enableResponse, enable)
+	if enableResponse.Code != http.StatusOK {
+		t.Fatalf("enable status %d, want %d; body=%s", enableResponse.Code, http.StatusOK, enableResponse.Body.String())
+	}
+	revision = e.Revision()
+
+	body, err := json.Marshal(enabledRequest{Revision: revision, Enabled: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disable := httptest.NewRequest(http.MethodPut, "/extensions/"+candidate.Detail.ID+"/enabled", strings.NewReader(string(body)))
+	disable.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(response, disable)
+	if response.Code != http.StatusOK {
+		t.Fatalf("disable status %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	detail, err := e.Detail(candidate.Detail.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Enabled {
+		t.Fatal("disable without review_contract left the extension enabled")
+	}
+
+	wrongBody := `{"revision":"` + e.Revision() + `","enabled":false,"review_contract":6}`
+	wrong := httptest.NewRequest(http.MethodPut, "/extensions/"+candidate.Detail.ID+"/enabled", strings.NewReader(wrongBody))
+	wrong.Header.Set("Content-Type", "application/json")
+	wrongResponse := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(wrongResponse, wrong)
+	if wrongResponse.Code != http.StatusBadRequest {
+		t.Fatalf("disable with stale contract status %d, want %d; body=%s", wrongResponse.Code, http.StatusBadRequest, wrongResponse.Body.String())
 	}
 }
 

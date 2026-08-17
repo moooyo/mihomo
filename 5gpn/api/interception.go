@@ -172,7 +172,8 @@ func postReview(w http.ResponseWriter, r *http.Request) {
 }
 
 type installRequest struct {
-	Revision string `json:"revision"`
+	Revision       string `json:"revision"`
+	ReviewContract int    `json:"review_contract"`
 	engine.InstallRequest
 }
 
@@ -182,6 +183,9 @@ func postInstall(w http.ResponseWriter, r *http.Request) {
 	var body installRequest
 	e, ok := decodeWrite(w, r, &body)
 	if !ok {
+		return
+	}
+	if !requireReviewContract(w, r, body.ReviewContract, false) {
 		return
 	}
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
@@ -347,10 +351,11 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 }
 
 type catalogUpdateRequest struct {
-	Revision string               `json:"revision"`
-	Digest   string               `json:"digest"`
-	URL      string               `json:"url"`
-	Values   engine.SettingValues `json:"values"`
+	Revision       string               `json:"revision"`
+	ReviewContract int                  `json:"review_contract"`
+	Digest         string               `json:"digest"`
+	URL            string               `json:"url"`
+	Values         engine.SettingValues `json:"values"`
 }
 
 func (b *catalogUpdateRequest) revision() string { return b.Revision }
@@ -369,6 +374,9 @@ func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireReviewContract(w, r, body.ReviewContract, false) {
+		return
+	}
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
@@ -378,8 +386,9 @@ func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 type orderRequest struct {
-	Revision string   `json:"revision"`
-	Order    []string `json:"order"`
+	Revision       string   `json:"revision"`
+	ReviewContract int      `json:"review_contract"`
+	Order          []string `json:"order"`
 }
 
 func putInterceptionOrder(w http.ResponseWriter, r *http.Request) {
@@ -388,19 +397,26 @@ func putInterceptionOrder(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireReviewContract(w, r, body.ReviewContract, false) {
+		return
+	}
 	snapshot, revision, err := e.Reorder(body.Revision, body.Order)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
 type enabledRequest struct {
-	Revision string `json:"revision"`
-	Enabled  bool   `json:"enabled"`
+	Revision       string `json:"revision"`
+	ReviewContract int    `json:"review_contract,omitempty"`
+	Enabled        bool   `json:"enabled"`
 }
 
 func putExtensionEnabled(w http.ResponseWriter, r *http.Request) {
 	var body enabledRequest
 	e, ok := decodeWrite(w, r, &body)
 	if !ok {
+		return
+	}
+	if !requireReviewContract(w, r, body.ReviewContract, !body.Enabled) {
 		return
 	}
 	snapshot, revision, err := e.SetEnabled(body.Revision, chi.URLParam(r, "id"), body.Enabled)
@@ -489,6 +505,14 @@ func decodeWrite(w http.ResponseWriter, r *http.Request, into revisioned) (*engi
 		return nil, false
 	}
 	return e, true
+}
+
+func requireReviewContract(w http.ResponseWriter, r *http.Request, got int, optional bool) bool {
+	if got == engine.ReviewContractVersion || (optional && got == 0) {
+		return true
+	}
+	badRequest(w, r, "review_contract must be "+strconv.Itoa(engine.ReviewContractVersion)+"; reload the current state and review the action again")
+	return false
 }
 
 // revisioned is every write body, which is every body: there is no unversioned
