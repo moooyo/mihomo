@@ -10,8 +10,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func requireRoot() error {
-	if os.Geteuid() != 0 {
+func requireConfigInspectionIdentity(expectedOwnerUID int, containerOwnerMode bool) error {
+	return validateConfigInspectionIdentity(os.Geteuid(), expectedOwnerUID, containerOwnerMode)
+}
+
+func validateConfigInspectionIdentity(currentUID, expectedOwnerUID int, containerOwnerMode bool) error {
+	if containerOwnerMode {
+		if expectedOwnerUID != containerConfigOwnerUID || currentUID != containerConfigOwnerUID {
+			return fmt.Errorf("container controller config inspection requires UID %d", containerConfigOwnerUID)
+		}
+		return nil
+	}
+	if expectedOwnerUID != 0 || currentUID != 0 {
 		return fmt.Errorf("controller config inspection requires root")
 	}
 	return nil
@@ -25,13 +35,13 @@ func openConfigNoFollow(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
-func requireSecureConfigMetadata(_ *os.File, info os.FileInfo) error {
+func requireSecureConfigMetadata(_ *os.File, info os.FileInfo, expectedOwnerUID int) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("could not inspect config ownership")
 	}
-	if stat.Uid != 0 {
-		return fmt.Errorf("config must be owned by root")
+	if uint64(stat.Uid) != uint64(expectedOwnerUID) {
+		return fmt.Errorf("config owner does not match the expected identity")
 	}
 	if info.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("config must not be writable by group or others")

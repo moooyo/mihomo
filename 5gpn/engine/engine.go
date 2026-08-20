@@ -69,13 +69,38 @@ func New(configPath, stateDir string) (*Engine, error) {
 	return e, nil
 }
 
-// Close releases the process-local isolation manager. It is idempotent and
-// kills any worker still scoped to this engine generation.
+// Close releases pooled transports and logs, then the process-local isolation
+// manager. It is idempotent and kills any worker still scoped to this engine
+// generation.
 func (e *Engine) Close() error {
-	if e == nil || e.workers == nil {
+	if e == nil {
 		return nil
 	}
-	return e.workers.Close()
+	if e.config != nil {
+		e.config.setCertificateRequestReconcileCallback(nil)
+	}
+	if e.proxy != nil {
+		e.proxy.closeUpstreamTransports()
+	}
+	if e.logs != nil {
+		e.logs.Close()
+	}
+	if e.workers != nil {
+		return e.workers.Close()
+	}
+	return nil
+}
+
+// SetCertificateRequestReconcileCallback installs the process-owner wakeup for
+// the durable interception-certificate request. The callback receives no
+// request body: it is only a hint to re-read the latest atomically published
+// file, so coalescing several writes cannot make a signer consume stale work.
+// Registration immediately wakes once to cover the request published during
+// Engine construction.
+func (e *Engine) SetCertificateRequestReconcileCallback(callback func()) {
+	if e != nil && e.config != nil {
+		e.config.setCertificateRequestReconcileCallback(callback)
+	}
 }
 
 // Interceptor returns the capture stage to install via tunnel.SetInterceptor.

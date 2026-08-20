@@ -9,6 +9,10 @@ import (
 )
 
 func readConfigFile(path string) ([]byte, error) {
+	return readConfigFileForOwner(path, 0)
+}
+
+func readConfigFileForOwner(path string, expectedOwnerUID int) ([]byte, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("config path is required")
 	}
@@ -48,7 +52,7 @@ func readConfigFile(path string) ([]byte, error) {
 	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
 		return nil, fmt.Errorf("config changed while opening")
 	}
-	if err := requireSecureConfigMetadata(file, opened); err != nil {
+	if err := requireSecureConfigMetadata(file, opened, expectedOwnerUID); err != nil {
 		return nil, err
 	}
 	if err := requireSingleConfigLink(file, opened); err != nil {
@@ -70,7 +74,7 @@ func readConfigFile(path string) ([]byte, error) {
 		after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
 		return nil, fmt.Errorf("config changed while reading")
 	}
-	if err := requireSecureConfigMetadata(file, after); err != nil {
+	if err := requireSecureConfigMetadata(file, after, expectedOwnerUID); err != nil {
 		return nil, err
 	}
 	if err := requireSingleConfigLink(file, after); err != nil {
@@ -81,7 +85,7 @@ func readConfigFile(path string) ([]byte, error) {
 		current.Size() != after.Size() || !current.ModTime().Equal(after.ModTime()) {
 		return nil, fmt.Errorf("config changed while reading")
 	}
-	if err := requireSecureConfigMetadata(file, current); err != nil {
+	if err := requireSecureConfigMetadata(file, current, expectedOwnerUID); err != nil {
 		return nil, err
 	}
 	if err := requireSingleConfigLink(file, current); err != nil {

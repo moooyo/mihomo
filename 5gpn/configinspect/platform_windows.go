@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func requireRoot() error {
+func requireConfigInspectionIdentity(int, bool) error {
 	return fmt.Errorf("controller config inspection is supported only by the root-managed Unix installation")
 }
 
@@ -43,8 +43,8 @@ func openConfigNoFollow(path string) (*os.File, error) {
 	return file, nil
 }
 
-func requireSecureConfigMetadata(_ *os.File, _ os.FileInfo) error {
-	return nil
+func requireSecureConfigMetadata(_ *os.File, _ os.FileInfo, _ int) error {
+	return fmt.Errorf("controller config ownership inspection is unsupported on Windows")
 }
 
 func requireSingleConfigLink(file *os.File, _ os.FileInfo) error {

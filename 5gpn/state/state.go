@@ -179,6 +179,10 @@ func WriteFile(path string, data []byte) error {
 }
 
 func writeFile(path string, data []byte, syncDirectory func(string) error) error {
+	return writeFileMode(path, data, 0o600, syncDirectory)
+}
+
+func writeFileMode(path string, data []byte, mode os.FileMode, syncDirectory func(string) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -191,15 +195,20 @@ func writeFile(path string, data []byte, syncDirectory func(string) error) error
 		tmp.Close()
 		return fmt.Errorf("5gpn/state: write %s: %w", tmpName, err)
 	}
+	// The final mode is inode state just like the bytes. Set it before the file
+	// fsync and rename so a pathname watcher can never observe an intermediate
+	// 0600 certificate request, and so a successful return covers durability of
+	// both the contents and the permissions.
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("5gpn/state: chmod %s: %w", tmpName, err)
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("5gpn/state: fsync %s: %w", tmpName, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("5gpn/state: close %s: %w", tmpName, err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return fmt.Errorf("5gpn/state: chmod %s: %w", tmpName, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("5gpn/state: rename onto %s: %w", path, err)
@@ -254,13 +263,7 @@ func revisionOf(raw []byte) string {
 // would be protecting a secret that is not one, by giving a process that holds
 // the CA signing key a capability it does not otherwise need.
 func WritePublicFile(path string, data []byte) error {
-	if err := WriteFile(path, data); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o644); err != nil {
-		return fmt.Errorf("5gpn/state: chmod %s: %w", path, err)
-	}
-	return nil
+	return writeFileMode(path, data, 0o644, syncDir)
 }
 
 // Dir returns the 5gpn state directory beneath mihomo's home, creating it.

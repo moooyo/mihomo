@@ -15,9 +15,15 @@ type errorOutput struct {
 	Error string `json:"error"`
 }
 
+const (
+	containerRuntimeEnvironment = "FIVEGPN_RUNTIME"
+	containerRuntimeValue       = "container"
+	containerConfigOwnerUID     = 10001
+)
+
 var silenceLogsOnce sync.Once
 
-// Main runs the root-only controller config inspection command.
+// Main runs the local controller config inspection command.
 func Main(args []string) {
 	if code := Run(args, os.Stdout); code != 0 {
 		os.Exit(code)
@@ -26,10 +32,16 @@ func Main(args []string) {
 
 // Run executes one local inspection and writes exactly one JSON value.
 func Run(args []string, stdout io.Writer) int {
-	return run(args, stdout, requireRoot, readConfigFile)
+	return run(args, stdout, requireConfigInspectionIdentity, readConfigFileForOwner, os.Getenv(containerRuntimeEnvironment))
 }
 
-func run(args []string, stdout io.Writer, privilege func() error, read func(string) ([]byte, error)) int {
+func run(
+	args []string,
+	stdout io.Writer,
+	privilege func(int, bool) error,
+	read func(string, int) ([]byte, error),
+	runtimeMode string,
+) int {
 	silenceLogsOnce.Do(func() { log.SetLevel(log.SILENT) })
 	if len(args) == 0 || args[0] != "inspect-controller" {
 		return writeCLIError(stdout, "invalid_input", "inspect-controller is required")
@@ -37,13 +49,29 @@ func run(args []string, stdout io.Writer, privilege func() error, read func(stri
 	flags := flag.NewFlagSet("inspect-controller", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "operator-owned mihomo config path")
+	ownerUID := flags.Int("owner-uid", -1, "expected owner UID in the fixed container runtime")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *configPath == "" {
 		return writeCLIError(stdout, "invalid_input", "--config is required and no positional arguments are allowed")
 	}
-	if err := privilege(); err != nil {
-		return writeCLIError(stdout, "permission_denied", "controller config inspection requires root")
+	ownerUIDProvided := false
+	flags.Visit(func(current *flag.Flag) {
+		if current.Name == "owner-uid" {
+			ownerUIDProvided = true
+		}
+	})
+	expectedOwnerUID := 0
+	containerOwnerMode := false
+	if ownerUIDProvided {
+		if *ownerUID != containerConfigOwnerUID || runtimeMode != containerRuntimeValue {
+			return writeCLIError(stdout, "invalid_input", "--owner-uid is restricted to the fixed container runtime identity")
+		}
+		expectedOwnerUID = containerConfigOwnerUID
+		containerOwnerMode = true
 	}
-	raw, err := read(*configPath)
+	if err := privilege(expectedOwnerUID, containerOwnerMode); err != nil {
+		return writeCLIError(stdout, "permission_denied", "controller config inspection identity is not authorized")
+	}
+	raw, err := read(*configPath, expectedOwnerUID)
 	if err != nil {
 		return writeCLIError(stdout, "invalid_config", "operator config could not be read safely")
 	}

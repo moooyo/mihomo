@@ -1484,6 +1484,12 @@ type configStore struct {
 
 	logsMu sync.RWMutex
 	logs   engineLogPublisher
+
+	certificateRequestPublished atomic.Pointer[certificateRequestPublishedHandler]
+}
+
+type certificateRequestPublishedHandler struct {
+	fn func()
 }
 
 // CommittedConfigView is one atomically published interception document and
@@ -1529,10 +1535,44 @@ func newConfigStore(path string, workers ...*workerController) (*configStore, er
 	})
 	// Published at startup as well as on every write, so a gateway edited while
 	// the certificate oneshot was not running still converges.
-	if err := publishCertificateRequest(path, cfg); err != nil {
+	if err := store.publishCertificateRequest(cfg); err != nil {
 		return nil, err
 	}
 	return store, nil
+}
+
+func (s *configStore) setCertificateRequestReconcileCallback(callback func()) {
+	if callback == nil {
+		s.certificateRequestPublished.Store(nil)
+		return
+	}
+	s.certificateRequestPublished.Store(&certificateRequestPublishedHandler{fn: callback})
+	// Engine construction publishes before the process owner can install this
+	// callback. Treat registration as a wake so a container reconciles that
+	// already-durable startup request without relying on a filesystem watcher.
+	callback()
+}
+
+func (s *configStore) notifyCertificateRequestPublished() {
+	if handler := s.certificateRequestPublished.Load(); handler != nil && handler.fn != nil {
+		handler.fn()
+	}
+}
+
+func (s *configStore) publishCertificateRequest(cfg Config) error {
+	if err := publishCertificateRequest(s.path, cfg); err != nil {
+		return err
+	}
+	s.notifyCertificateRequestPublished()
+	return nil
+}
+
+func (s *configStore) writeCertificateRequest(request certificateRequest) error {
+	if err := writeCertificateRequest(certificateRequestPath(s.path), request); err != nil {
+		return err
+	}
+	s.notifyCertificateRequestPublished()
+	return nil
 }
 
 // Current returns the compiled snapshot. A pointer load: no syscall, no lock,
@@ -1626,7 +1666,7 @@ func (s *configStore) Update(expected string, mutate func(Config) (Config, error
 	// After the document is durable, never before: the oneshot that reads this
 	// mints a leaf, and a leaf covering hosts a crash would un-declare is worse
 	// than a leaf that is briefly one edit behind.
-	if err := publishCertificateRequest(s.path, compiled); err != nil {
+	if err := s.publishCertificateRequest(compiled); err != nil {
 		s.publishEngineLog("warn", err.Error())
 	}
 	s.publishEngineLog("info", "configuration updated")
@@ -1666,7 +1706,7 @@ func (s *configStore) Reload() error {
 	s.generation++
 	cfg.generation = s.generation
 	s.committed.Store(&CommittedConfigView{Config: cfg, Revision: revision})
-	if err := publishCertificateRequest(s.path, cfg); err != nil {
+	if err := s.publishCertificateRequest(cfg); err != nil {
 		s.publishEngineLog("warn", err.Error())
 	}
 	s.publishEngineLog("info", "configuration reloaded")

@@ -79,3 +79,41 @@ func TestReadConfigFileRejectsUnsafeOwnershipAndModes(t *testing.T) {
 		t.Fatal("non-root-owned config was accepted")
 	}
 }
+
+func TestReadConfigFileForOwnerRequiresTheExpectedIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(validConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownerUID := os.Geteuid()
+	if _, err := readConfigFileForOwner(path, ownerUID); err != nil {
+		t.Fatalf("matching owner was rejected: %v", err)
+	}
+	if _, err := readConfigFileForOwner(path, ownerUID+1); err == nil {
+		t.Fatal("mismatched expected owner was accepted")
+	}
+}
+
+func TestConfigInspectionIdentityModesAreDisjoint(t *testing.T) {
+	tests := []struct {
+		name          string
+		currentUID    int
+		expectedOwner int
+		containerMode bool
+		wantError     bool
+	}{
+		{name: "host root", currentUID: 0, expectedOwner: 0},
+		{name: "host non-root", currentUID: containerConfigOwnerUID, expectedOwner: 0, wantError: true},
+		{name: "container owner", currentUID: containerConfigOwnerUID, expectedOwner: containerConfigOwnerUID, containerMode: true},
+		{name: "container root", currentUID: 0, expectedOwner: containerConfigOwnerUID, containerMode: true, wantError: true},
+		{name: "container arbitrary owner", currentUID: 20000, expectedOwner: 20000, containerMode: true, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateConfigInspectionIdentity(test.currentUID, test.expectedOwner, test.containerMode)
+			if (err != nil) != test.wantError {
+				t.Fatalf("identity validation error = %v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}

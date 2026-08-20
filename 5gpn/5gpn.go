@@ -29,11 +29,12 @@ import (
 )
 
 var (
-	stateDir  atomic.Pointer[string]
-	engineRef atomic.Pointer[engine.Engine]
-	dnsRef    atomic.Pointer[dns.Service]
-	botRef    atomic.Pointer[bot.Service]
-	installed atomic.Bool
+	stateDir       atomic.Pointer[string]
+	engineRef      atomic.Pointer[engine.Engine]
+	dnsRef         atomic.Pointer[dns.Service]
+	botRef         atomic.Pointer[bot.Service]
+	certManagerRef atomic.Pointer[certificateManager]
+	installed      atomic.Bool
 )
 
 const (
@@ -60,6 +61,9 @@ const (
 func Start(home string, onFatal func(error)) error {
 	if onFatal == nil {
 		return errors.New("5gpn: a fatal error handler is required")
+	}
+	if err := configureDeploymentRuntime(); err != nil {
+		return err
 	}
 	// A successful rename followed by a failed directory fsync leaves disk and
 	// the immutable in-memory revision unable to agree on what crash recovery
@@ -89,7 +93,6 @@ func Start(home string, onFatal func(error)) error {
 	api.SetLocationSearcher(location.New(func(ctx context.Context, host string, port int) (net.Conn, error) {
 		return dial.SystemTCP(ctx, host, port)
 	}))
-	installed.Store(true)
 	log.Infoln("[5GPN] state directory %s", dir)
 
 	// The resolver comes up here rather than in StartInterception because it is
@@ -134,11 +137,37 @@ func Start(home string, onFatal func(error)) error {
 	interceptPath := filepath.Join(dir, "intercept.json")
 	if err := startInterceptionBeforeDNS(
 		func() error { return engine.EnsureDocument(interceptPath) },
-		func() error { return StartInterception(interceptPath, onFatal) },
+		func() error {
+			if err := StartInterception(interceptPath, onFatal); err != nil {
+				return err
+			}
+			if !ContainerMode() {
+				return nil
+			}
+			manager, err := newContainerCertificateManager(onFatal)
+			if err != nil {
+				return err
+			}
+			current := engineRef.Load()
+			if current == nil {
+				_ = manager.Close()
+				return errors.New("5gpn: interception engine disappeared before container certificate manager startup")
+			}
+			certManagerRef.Store(manager)
+			current.SetCertificateRequestReconcileCallback(manager.NotifyIntercept)
+			if err := manager.Start(); err != nil {
+				current.SetCertificateRequestReconcileCallback(nil)
+				certManagerRef.CompareAndSwap(manager, nil)
+				_ = manager.Close()
+				return err
+			}
+			log.Infoln("[5GPN] container certificate manager started")
+			return nil
+		},
 		svc.Listen,
 	); err != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		svc.Shutdown(ctx)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_ = Shutdown(ctx)
 		cancel()
 		return err
 	}
@@ -149,7 +178,33 @@ func Start(home string, onFatal func(error)) error {
 	if err := startBot(filepath.Join(dir, "bot.json")); err != nil {
 		log.Warnln("[5GPN] Telegram bot not installed: %v", err)
 	}
+	installed.Store(true)
 	return nil
+}
+
+// Shutdown waits for each owned goroutine or child process. It is idempotent:
+// process signals, a fatal event, and a restart request all converge here.
+//
+// The traffic hooks deliberately remain installed until process exit. Shutdown
+// releases owned goroutines and workers without publishing an empty interceptor
+// or policy that could create a fail-open window.
+func Shutdown(ctx context.Context) error {
+	installed.Store(false)
+
+	var shutdownErr error
+	if manager := certManagerRef.Swap(nil); manager != nil {
+		shutdownErr = errors.Join(shutdownErr, manager.Close())
+	}
+	if service := botRef.Swap(nil); service != nil {
+		service.Shutdown()
+	}
+	if service := dnsRef.Swap(nil); service != nil {
+		service.Shutdown(ctx)
+	}
+	if current := engineRef.Swap(nil); current != nil {
+		shutdownErr = errors.Join(shutdownErr, current.Close())
+	}
+	return shutdownErr
 }
 
 // startInterceptionBeforeDNS makes the startup ordering executable rather than
