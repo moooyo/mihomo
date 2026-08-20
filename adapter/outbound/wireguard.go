@@ -136,6 +136,8 @@ type AmneziaWGOption struct {
 	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
 	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
 	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
+	RandomTrailers         bool   `proxy:"random-trailers,omitempty"` // AmneziaWG v3.1+
+	DisableCookies         bool   `proxy:"disable-cookies,omitempty"` // AmneziaWG v3.1+
 }
 
 type IPStackOption struct {
@@ -162,10 +164,10 @@ func (o IPStackOption) validate() error {
 		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
 	}
 	switch mipstack.CongestionControl(o.CongestionController) {
-	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR:
+	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
 		return nil
 	default:
-		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, or bbr", o.CongestionController)
+		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
 	}
 }
 
@@ -677,6 +679,12 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 			}
 			if w.option.AmneziaWGOption.MaxHandshakeAttempts != "" {
 				ipcConf += "max_handshake_attempts=" + w.option.AmneziaWGOption.MaxHandshakeAttempts + "\n"
+			}
+			if w.option.AmneziaWGOption.RandomTrailers {
+				ipcConf += "random_trailers=1\n"
+			}
+			if w.option.AmneziaWGOption.DisableCookies {
+				ipcConf += "disable_cookies=1\n"
 			}
 		}
 	}

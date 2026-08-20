@@ -1294,7 +1294,7 @@ proxies: # socks5
     # persistent-keepalive: 0
     # ip-stack:
     #   mode: auto # options: auto, gvisor, mips; auto uses gVisor when compiled in and mihomo IP stack (MIPS) otherwise
-    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, or bbr; ignored by gVisor
+    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, bbr, or bbr3; ignored by gVisor
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
     # dialer-proxy: "ss1"
     # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
@@ -1339,6 +1339,8 @@ proxies: # socks5
     #   reject-after-time: 180                            # AmneziaWG v3+
     #   keepalive-timeout: 10                             # AmneziaWG v3+
     #   max-handshake-attempts: 18                        # AmneziaWG v3+
+    #   random-trailers: true                             # AmneziaWG v3.1+
+    #   disable-cookies: true                             # AmneziaWG v3.1+
 
   # tailscale
   - name: "tailscale"
@@ -1370,7 +1372,7 @@ proxies: # socks5
     # physical-mtu: 1432 # optional ZeroTier UDP payload MTU (510-10324; default 1432)
     # ip-stack:
     #   mode: auto # options: auto, gvisor, mips; auto uses gVisor when compiled in and mihomo IP stack (MIPS) otherwise
-    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, or bbr; ignored by gVisor
+    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, bbr, or bbr3; ignored by gVisor
     # primary-port: 0 # primary UDP port; 0 selects an available port
     # secondary-port: 0 # second UDP port; 0 selects an available port, -1 disables it
     # tcp-fallback-mode: auto # auto uses relay after UDP failure; force uses relay only; disable turns relay off
@@ -1443,12 +1445,13 @@ proxies: # socks5
     #   UV_DEVICE_ID: "laptop-001"
     # ping: 10 # 默认值为 0
     # ping-restart: 60 # 默认值为 0
+    # tran-window: 3600 # 旧 data key 在 rekey 后保留的秒数；默认 3600，显式设为 0 表示立即过期，应与服务端 --tran-window 对齐
     # handshake-timeout: 30 # 单位为秒；配置后握手时不受外层连接超时影响；默认值为 0，表示仅使用外层连接超时
     # mtu: 1500
     udp: true
     # ip-stack:
     #   mode: auto # options: auto, gvisor, mips; auto uses gVisor when compiled in and mihomo IP stack (MIPS) otherwise
-    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, or bbr; ignored by gVisor
+    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, bbr, or bbr3; ignored by gVisor
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
     # dialer-proxy: "ss1"
     # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
@@ -1467,7 +1470,7 @@ proxies: # socks5
     udp: true
     # ip-stack:
     #   mode: auto # options: auto, gvisor, mips; auto uses gVisor when compiled in and mihomo IP stack (MIPS) otherwise
-    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, or bbr; ignored by gVisor
+    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, bbr, or bbr3; ignored by gVisor
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
     # dialer-proxy: "ss1"
     # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
@@ -1505,7 +1508,7 @@ proxies: # socks5
     network: h2
     # ip-stack:
     #   mode: auto # options: auto, gvisor, mips; auto uses gVisor when compiled in and mihomo IP stack (MIPS) otherwise
-    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, or bbr; ignored by gVisor
+    #   congestion-controller: cubic # TCP congestion controller: cubic, reno, bbr, or bbr3; ignored by gVisor
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
     # dialer-proxy: "ss1"
     # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
@@ -1650,6 +1653,7 @@ proxies: # socks5
     password: "<your password>"
     # client-fingerprint: chrome
     udp: true
+    # client-metadata: "" # 发送给服务端的客户端元数据，由于这可能被用于统计客户端信息并区别对待，从v1.19.30开始默认再不发送该内容，如果需要请自行填写
     # idle-session-check-interval: 30 # seconds
     # idle-session-timeout: 30 # seconds
     # min-idle-session: 0
