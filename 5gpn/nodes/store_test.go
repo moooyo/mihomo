@@ -243,6 +243,49 @@ func TestImportRejectsConflictsUnsafeNamesAndProhibitedTypes(t *testing.T) {
 	}
 }
 
+func TestImportRejectsCrashingMuxProtocol(t *testing.T) {
+	// h2mux takes the process down on first dial rather than failing the
+	// connection (x/net rewrote http2 and sing-mux never caught up), so it is
+	// refused at the import boundary. The positive cases matter as much as the
+	// negative ones: the guard must not quietly swallow the mux protocols that
+	// do work, or it stops being a targeted fix and becomes a feature removal.
+	rejected := []struct {
+		name    string
+		content string
+	}{
+		{name: "enabled", content: "name: Muxed\ntype: http\nserver: a.example\nport: 80\nsmux:\n  enabled: true\n  protocol: h2mux\n"},
+		{name: "disabled is still rejected", content: "name: Muxed\ntype: http\nserver: a.example\nport: 80\nsmux:\n  enabled: false\n  protocol: h2mux\n"},
+		{name: "case and padding", content: "name: Muxed\ntype: http\nserver: a.example\nport: 80\nsmux:\n  enabled: true\n  protocol: \"  H2Mux \"\n"},
+	}
+	for _, test := range rejected {
+		t.Run("rejected/"+test.name, func(t *testing.T) {
+			store, path, original := newTestStore(t, testConfig)
+			_, err := store.Import(revisionOf(original), []byte(test.content))
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("expected invalid input, got %v", err)
+			}
+			assertConfigUnchangedAndNoBackup(t, path, original)
+		})
+	}
+
+	for _, protocol := range []string{"smux", "yamux"} {
+		t.Run("allowed/"+protocol, func(t *testing.T) {
+			store, path, original := newTestStore(t, testConfig)
+			content := "name: Muxed\ntype: http\nserver: a.example\nport: 80\nsmux:\n  enabled: true\n  protocol: " + protocol + "\n"
+			if _, err := store.Import(revisionOf(original), []byte(content)); err != nil {
+				t.Fatalf("%s must remain importable, got %v", protocol, err)
+			}
+			written, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(written, []byte("Muxed")) {
+				t.Fatalf("%s node was not written:\n%s", protocol, written)
+			}
+		})
+	}
+}
+
 func TestImportRejectsMultipleDocumentsAndNodeLimit(t *testing.T) {
 	tests := []struct {
 		name    string

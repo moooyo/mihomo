@@ -46,6 +46,48 @@ var prohibitedProxyTypes = map[string]struct{}{
 	"zerotier":  {},
 }
 
+// sing-mux protocols refused at the import boundary.
+//
+// h2mux is broken for every x/net this fork can build against. x/net v0.55
+// rewrote http2 as a thin wrapper over net/http's implementation, and sing-mux
+// builds its client from a bare http2.Transport it never registers: v0.55 and
+// v0.56 nil-deref on the first dial (SIGSEGV, not an error return), and v0.57+
+// stop crashing only because the missing init was added -- the session still
+// never completes a request. There is no published sing-mux that works against
+// the rewritten package, and upstream mihomo keeps h2mux out of its own
+// long-running mux test for the same reason (listener/inbound/mux_test.go).
+//
+// So an imported node carrying this protocol is a process crash waiting for its
+// first use. Rejecting it here costs one import error; letting it through costs
+// the whole runtime. smux and yamux are unaffected and stay allowed.
+//
+// This is deliberately not conditioned on smux.enabled. The field is inert
+// while disabled, but it stays in the stored node and the crash is then one
+// toggle away, which is the wrong trade for a fault that takes the process
+// down rather than failing the connection.
+var prohibitedMuxProtocols = map[string]struct{}{
+	"h2mux": {},
+}
+
+// rejectProhibitedMux guards every path that turns imported content into a
+// proxy mapping. It is called at both adapter.ParseProxy sites on purpose:
+// ParseProxy itself accepts h2mux happily, so a single missed call site would
+// reopen the crash path silently.
+func rejectProhibitedMux(mapping map[string]any) error {
+	muxMapping, ok := mapping["smux"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	protocol, ok := muxMapping["protocol"].(string)
+	if !ok {
+		return nil
+	}
+	if _, prohibited := prohibitedMuxProtocols[strings.ToLower(strings.TrimSpace(protocol))]; prohibited {
+		return fmt.Errorf("mux protocol %q is not supported", protocol)
+	}
+	return nil
+}
+
 func parseImportedProxies(content []byte) ([]*yaml.Node, error) {
 	if len(content) > MaxImportBytes {
 		return nil, fmt.Errorf("%w: imported content exceeds %d bytes", ErrInvalidInput, MaxImportBytes)
@@ -213,6 +255,9 @@ func convertStrictLine(line string) ([]map[string]any, error) {
 		if !ok || strings.TrimSpace(server) == "" {
 			return nil, fmt.Errorf("converted proxy has no server")
 		}
+		if err := rejectProhibitedMux(mapping); err != nil {
+			return nil, fmt.Errorf("converted proxy uses an unsupported mux: %v", err)
+		}
 		if _, err := adapter.ParseProxy(mapping); err != nil {
 			return nil, fmt.Errorf("converted proxy is invalid")
 		}
@@ -355,6 +400,9 @@ func validateImportedNodes(items []*yaml.Node) ([]*yaml.Node, error) {
 		var mapping map[string]any
 		if err := item.Decode(&mapping); err != nil {
 			return nil, fmt.Errorf("%w: proxy %d cannot be decoded", ErrInvalidInput, index)
+		}
+		if err := rejectProhibitedMux(mapping); err != nil {
+			return nil, fmt.Errorf("%w: proxy %d: %v", ErrInvalidInput, index, err)
 		}
 		if _, err := adapter.ParseProxy(mapping); err != nil {
 			return nil, fmt.Errorf("%w: proxy %d is invalid", ErrInvalidInput, index)
