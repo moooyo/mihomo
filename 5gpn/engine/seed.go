@@ -28,9 +28,10 @@ const (
 // it is off, and those must not be the same thing — one is a gateway to
 // investigate and the other is a gateway working as configured.
 //
-// No marketplace is seeded. Fetching one is an outbound trust decision, so an
-// authenticated operator explicitly adds every catalog source through the
-// Console before discovery performs any network request.
+// The document carries no discovery state at all. The Marketplace is one index
+// compiled into the Core, not a list the operator assembles, so a fresh gateway
+// has nothing to seed: it reads that index the first time someone opens the
+// Marketplace page, and never before, because nothing else asks for it.
 func DefaultDocument() Config {
 	return Config{
 		Version:        configVersion,
@@ -38,7 +39,6 @@ func DefaultDocument() Config {
 		TLSCert:        interceptCertPath,
 		TLSKey:         interceptKeyPath,
 		MITM:           MITMSettings{Enabled: false, HTTP2: true, HTTP3: false},
-		Catalogs:       defaultCatalogSources(),
 	}
 }
 

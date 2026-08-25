@@ -40,23 +40,6 @@ A branch name, moving tag, unqualified container tag, or mutable download URL is
 not an acceptance input. A run stops before mutation when any fetched byte
 stream differs from its recorded SHA-256.
 
-## Pinned external extension fixture
-
-The optional Apple WLOC path uses the following immutable inputs. Verify the
-bytes before exposing the manifest URL to the importer. The manifest's own
-source URLs already name the exact upstream commit, and the two script digests
-below make that dependency independently auditable.
-
-| Resource | Immutable source | Bytes | SHA-256 |
-| --- | --- | ---: | --- |
-| Apple WLOC manifest | `https://raw.githubusercontent.com/moooyo/5gpn-extensions/e5c550c46e819a06e078751ee9a245dda07bcbe7/apple-wloc/extension.yaml` | 3952 | `facffe31b49539a0628379607cdf1b81306f45d2ff81a5586102fa31468055f7` |
-| WLOC response script | `https://raw.githubusercontent.com/Yu9191/wloc/782e9c5cadf215263d9d168314113e47baaa302c/dist/wloc.js` | 41180 | `a1b361e60f0b434585260fb59c65d1ddbe3bff89ace3639f592e7d8af432b3c1` |
-| WLOC settings script | `https://raw.githubusercontent.com/Yu9191/wloc/782e9c5cadf215263d9d168314113e47baaa302c/dist/wloc-settings.js` | 13101 | `433073eed20064ee59cafc857eb444e0bcc958290323ac7586a77093776d8f42` |
-
-Record the importer-returned immutable snapshot digest as additional run
-evidence. The manifest digest alone does not cover separately fetched script
-bytes.
-
 Synthetic capacity and failure fixtures should be served from an acceptance
 origin controlled by the runner. Their source commit and every served-object
 digest must be recorded in the run evidence; they must not be fetched from a

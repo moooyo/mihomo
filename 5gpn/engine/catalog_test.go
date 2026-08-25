@@ -98,6 +98,11 @@ func stubImporter(t *testing.T, served stubFetch) *Importer {
 	return stubImporterTransport(t, served)
 }
 
+// catalogIndexURL is the URL the importer-level tests below pass explicitly.
+// It is deliberately not officialCatalogIndexURL: imp.catalog parses whatever
+// it is pointed at, and keeping the two distinct means an engine-level test
+// that stubbed the wrong host fails instead of quietly following whichever
+// index this Core happens to be compiled with.
 const catalogIndexURL = "https://catalog.example.com/index.json"
 const catalogManifestURL = "https://catalog.example.com/example.yaml"
 
@@ -195,15 +200,13 @@ func TestSomethingThatIsNotACatalogIsRefused(t *testing.T) {
 
 func catalogTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	document := fmt.Sprintf(`{
-  "version": 6,
+	return newTestEngine(t, `{
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": false, "http2": true, "http3": false},
-  "catalogs": [{"id": "io.5gpn.official", "name": "Official", "url": %q, "enabled": true}]
-}`, catalogIndexURL)
-	return newTestEngine(t, document)
+  "mitm": {"enabled": false, "http2": true, "http3": false}
+}`)
 }
 
 // The happy path, which is also what makes the refusals below meaningful: an
@@ -211,12 +214,12 @@ func catalogTestEngine(t *testing.T) *Engine {
 // the same Candidate a pasted URL would produce.
 func TestAnHonestCatalogEntryReviewsLikeAPastedURL(t *testing.T) {
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 
-	candidate, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	candidate, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err != nil {
 		t.Fatalf("ReviewCatalogEntry: %v", err)
 	}
@@ -231,11 +234,16 @@ func TestAnHonestCatalogEntryReviewsLikeAPastedURL(t *testing.T) {
 	}
 }
 
+// A review that is still fetching must not be relabelled by a write that lands
+// while it waits. The reviewed entry and the revision the operator will quote
+// back have to come from the same committed document, so the conflict is
+// reported rather than the stale candidate being handed back under a revision
+// that no longer describes it.
 func TestCatalogReviewDoesNotMixAStaleSourceWithANewRevision(t *testing.T) {
 	barrier := &catalogReviewBarrier{
 		served: stubFetch{
-			catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-			catalogManifestURL: validManifest,
+			officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+			catalogManifestURL:      validManifest,
 		},
 		started: make(chan struct{}),
 		release: make(chan struct{}),
@@ -250,16 +258,20 @@ func TestCatalogReviewDoesNotMixAStaleSourceWithANewRevision(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		_, _, revision, err := e.ReviewCatalogEntryView(
-			context.Background(), "io.5gpn.official", "example.plugin",
+			context.Background(), "example.plugin",
 		)
 		done <- result{revision: revision, err: err}
 	}()
 	<-barrier.started
-	_, changedRevision, err := e.SetCatalogSources(initialRevision, []CatalogSource{{
-		ID: "io.5gpn.official", Name: "Renamed while reviewing", URL: catalogIndexURL, Enabled: true,
-	}})
+	// Any committed write will do; this one touches nothing the review reads,
+	// which is the point — the review is stale because the document moved, not
+	// because its own inputs changed.
+	_, changedRevision, err := e.SetSettings(initialRevision, MITMSettings{Enabled: false, HTTP2: false, HTTP3: false})
 	if err != nil {
-		t.Fatalf("SetCatalogSources: %v", err)
+		t.Fatalf("SetSettings: %v", err)
+	}
+	if changedRevision == initialRevision {
+		t.Fatalf("the concurrent write did not advance the revision from %q", initialRevision)
 	}
 	close(barrier.release)
 	got := <-done
@@ -300,8 +312,8 @@ func TestCatalogProjectsWhetherTheInstalledManifestIsCurrent(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			stubImporter(t, stubFetch{
-				catalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
-				oldURL:          test.installedBody,
+				officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+				oldURL:                  test.installedBody,
 			})
 			e := catalogTestEngine(t)
 			installFromCatalog(t, e, oldURL)
@@ -310,10 +322,10 @@ func TestCatalogProjectsWhetherTheInstalledManifestIsCurrent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CatalogWithRevision: %v", err)
 			}
-			if len(view.Sources) != 1 || len(view.Sources[0].Entries) != 1 {
+			if len(view.Entries) != 1 {
 				t.Fatalf("catalog view = %+v", view)
 			}
-			entry := view.Sources[0].Entries[0]
+			entry := view.Entries[0]
 			if entry.InstalledVersion != test.wantInstalledVer || entry.InstalledCurrent != test.wantCurrent {
 				t.Fatalf("installed version %q current %v, want %q current %v",
 					entry.InstalledVersion, entry.InstalledCurrent, test.wantInstalledVer, test.wantCurrent)
@@ -328,12 +340,12 @@ func TestCatalogProjectsWhetherTheInstalledManifestIsCurrent(t *testing.T) {
 func TestAnEntryThatUnderstatesTheManifestIsRefused(t *testing.T) {
 	understated := strings.Replace(honestCapabilities, `"network": true`, `"network": false`, 1)
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, understated, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, understated, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 
-	_, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	_, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err == nil {
 		t.Fatal("an entry claiming no network grant reviewed a manifest that takes one")
 	}
@@ -346,12 +358,12 @@ func TestAnEntryThatUnderstatesTheManifestIsRefused(t *testing.T) {
 // published, whatever either of them claims about capabilities.
 func TestAnEntryWhoseDigestDoesNotMatchIsRefused(t *testing.T) {
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, strings.Repeat("a", 64)),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, strings.Repeat("a", 64)),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 
-	_, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	_, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err == nil {
 		t.Fatal("a manifest that does not match the published digest was reviewed")
 	}
@@ -373,19 +385,19 @@ func TestCatalogReviewTreatsExternalScriptsAsLiveSnapshotDependencies(t *testing
 	}
 	index := catalogIndexJSON(t, honestCapabilities, digestText(externalManifest))
 	served := stubFetch{
-		catalogIndexURL:    index,
-		catalogManifestURL: externalManifest,
-		scriptURL:          "function transform(context) { return {}; }",
+		officialCatalogIndexURL: index,
+		catalogManifestURL:      externalManifest,
+		scriptURL:               "function transform(context) { return {}; }",
 	}
 	stubImporter(t, served)
 	e := catalogTestEngine(t)
 
-	first, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	first, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err != nil {
 		t.Fatalf("first live script review: %v", err)
 	}
 	served[scriptURL] = "function transform(context) { return {headers: {set: {\"X-Live\": \"changed\"}}}; }"
-	second, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	second, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err != nil {
 		t.Fatalf("second live script review: %v", err)
 	}
@@ -400,12 +412,12 @@ func TestCatalogReviewTreatsExternalScriptsAsLiveSnapshotDependencies(t *testing
 func TestAnEntryWhoseVersionDoesNotMatchIsRefused(t *testing.T) {
 	index := strings.Replace(catalogIndexJSON(t, honestCapabilities, ""), `"version": "1.2.0"`, `"version": "9.9.9"`, 1)
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    index,
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: index,
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 
-	_, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin")
+	_, err := e.ReviewCatalogEntry(context.Background(), "example.plugin")
 	if err == nil {
 		t.Fatal("a catalog version that does not match the manifest was reviewed")
 	}
@@ -425,61 +437,35 @@ func TestAnAbsentRoutingRuleCountIsUnverifiedNotZero(t *testing.T) {
 		t.Fatal("the fixture did not drop routingRuleCount")
 	}
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, silent, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, silent, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 
-	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err != nil {
+	if _, err := e.ReviewCatalogEntry(context.Background(), "example.plugin"); err != nil {
 		t.Fatalf("an index that predates routingRuleCount was refused: %v", err)
 	}
 }
 
-// A disabled catalog is still the operator's configuration and still has to be
-// listed, but nothing installs from it.
-func TestADisabledCatalogIsListedAndNotFetched(t *testing.T) {
-	stubImporter(t, stubFetch{})
-	document := fmt.Sprintf(`{
-  "version": 6,
-  "execution_order": [],
-  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
-  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": false, "http2": true, "http3": false},
-  "catalogs": [{"id": "io.5gpn.official", "name": "Official", "url": %q, "enabled": false}]
-}`, catalogIndexURL)
-	e := newTestEngine(t, document)
-
-	view, err := e.Catalog(context.Background(), false)
-	if err != nil {
-		t.Fatalf("Catalog: %v", err)
-	}
-	if len(view.Sources) != 1 {
-		t.Fatalf("listed %d sources, want the disabled one", len(view.Sources))
-	}
-	// It was not fetched, so it carries neither entries nor a fetch failure.
-	if view.Sources[0].Error != "" {
-		t.Errorf("a disabled source reported a fetch error: %q", view.Sources[0].Error)
-	}
-	if _, err := e.ReviewCatalogEntry(context.Background(), "io.5gpn.official", "example.plugin"); err == nil {
-		t.Fatal("an entry was installed from a disabled catalog")
-	}
-}
-
-// A source that cannot be fetched still appears, with the reason. The page it
-// would otherwise break is the only place it can be corrected or removed.
+// The Marketplace that cannot be fetched still renders, with the reason. The
+// page it would otherwise break is the only place an operator learns that
+// discovery is down rather than empty.
 func TestAnUnreachableCatalogIsReportedRatherThanFailingTheList(t *testing.T) {
 	stubImporter(t, stubFetch{})
 	e := catalogTestEngine(t)
 
 	view, err := e.Catalog(context.Background(), false)
 	if err != nil {
-		t.Fatalf("one unreachable source failed the whole list: %v", err)
+		t.Fatalf("an unreachable Marketplace failed the whole read: %v", err)
 	}
-	if len(view.Sources) != 1 || view.Sources[0].Error == "" {
-		t.Fatalf("the unreachable source was not reported: %+v", view.Sources)
+	if view.URL != officialCatalogIndexURL {
+		t.Fatalf("catalog view URL = %q, want the built-in %q", view.URL, officialCatalogIndexURL)
 	}
-	if view.Sources[0].FetchedAt != "" || len(view.Sources[0].Entries) != 0 {
-		t.Fatalf("a source that never succeeded invented a snapshot: %+v", view.Sources[0])
+	if view.Error == "" {
+		t.Fatalf("the unreachable Marketplace was not reported: %+v", view)
+	}
+	if view.FetchedAt != "" || len(view.Entries) != 0 {
+		t.Fatalf("a Marketplace that never succeeded invented a snapshot: %+v", view)
 	}
 }
 
@@ -494,23 +480,23 @@ func TestFailedCatalogRefreshRetainsTheLastCompleteSnapshot(t *testing.T) {
   ]
 }`
 	for name, breakFetch := range map[string]func(stubFetch){
-		"network failure": func(served stubFetch) { delete(served, catalogIndexURL) },
-		"JSON failure":    func(served stubFetch) { served[catalogIndexURL] = `{"apiVersion":` },
+		"network failure": func(served stubFetch) { delete(served, officialCatalogIndexURL) },
+		"JSON failure":    func(served stubFetch) { served[officialCatalogIndexURL] = `{"apiVersion":` },
 		"duplicate field": func(served stubFetch) {
-			served[catalogIndexURL] = strings.Replace(
-				served[catalogIndexURL],
+			served[officialCatalogIndexURL] = strings.Replace(
+				served[officialCatalogIndexURL],
 				`"kind": "ExtensionMarketplace"`,
 				`"kind": "ExtensionMarketplace", "kind": "ExtensionMarketplace"`,
 				1,
 			)
 		},
 		"missing entries": func(served stubFetch) {
-			served[catalogIndexURL] = `{"apiVersion":"5gpn.io/marketplace/v1","kind":"ExtensionMarketplace","metadata":{}}`
+			served[officialCatalogIndexURL] = `{"apiVersion":"5gpn.io/marketplace/v1","kind":"ExtensionMarketplace","metadata":{}}`
 		},
-		"partial index": func(served stubFetch) { served[catalogIndexURL] = partial },
+		"partial index": func(served stubFetch) { served[officialCatalogIndexURL] = partial },
 	} {
 		t.Run(name, func(t *testing.T) {
-			served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+			served := stubFetch{officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
 			stubImporter(t, served)
 			e := catalogTestEngine(t)
 
@@ -518,8 +504,8 @@ func TestFailedCatalogRefreshRetainsTheLastCompleteSnapshot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("initial catalog: %v", err)
 			}
-			if len(before.Sources) != 1 || len(before.Sources[0].Entries) != 1 || before.Sources[0].Error != "" {
-				t.Fatalf("initial complete snapshot = %+v", before.Sources)
+			if len(before.Entries) != 1 || before.Error != "" {
+				t.Fatalf("initial complete snapshot = %+v", before)
 			}
 			breakFetch(served)
 
@@ -527,20 +513,19 @@ func TestFailedCatalogRefreshRetainsTheLastCompleteSnapshot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed refresh broke the complete listing: %v", err)
 			}
-			if len(after.Sources) != 1 || after.Sources[0].Error == "" {
-				t.Fatalf("failed refresh did not report its source error: %+v", after.Sources)
+			if after.Error == "" {
+				t.Fatalf("failed refresh did not report its fetch error: %+v", after)
 			}
-			got := after.Sources[0]
-			want := before.Sources[0]
-			if got.FetchedAt != want.FetchedAt || got.Metadata != want.Metadata || len(got.Entries) != 1 || got.Entries[0].ID != want.Entries[0].ID {
-				t.Fatalf("failed refresh replaced prior snapshot:\n got %+v\nwant %+v plus error", got, want)
+			if after.FetchedAt != before.FetchedAt || after.Metadata != before.Metadata ||
+				len(after.Entries) != 1 || after.Entries[0].ID != before.Entries[0].ID {
+				t.Fatalf("failed refresh replaced prior snapshot:\n got %+v\nwant %+v plus error", after, before)
 			}
 		})
 	}
 }
 
 func TestExpiredCatalogSurvivesARefreshFailure(t *testing.T) {
-	served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+	served := stubFetch{officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
 	stubImporter(t, served)
 	e := catalogTestEngine(t)
 	if _, err := e.Catalog(context.Background(), false); err != nil {
@@ -548,33 +533,31 @@ func TestExpiredCatalogSurvivesARefreshFailure(t *testing.T) {
 	}
 
 	e.catalogs.mu.Lock()
-	retained := e.catalogs.entries[catalogIndexURL]
-	retained.fetchedAt = time.Now().Add(-catalogCacheTTL - time.Minute)
-	wantFetchedAt := retained.fetchedAt.UTC().Format(time.RFC3339)
-	e.catalogs.entries[catalogIndexURL] = retained
+	e.catalogs.fetchedAt = time.Now().Add(-catalogCacheTTL - time.Minute)
+	wantFetchedAt := e.catalogs.fetchedAt.UTC().Format(time.RFC3339)
 	e.catalogs.mu.Unlock()
-	delete(served, catalogIndexURL)
+	delete(served, officialCatalogIndexURL)
 
 	view, err := e.Catalog(context.Background(), false)
 	if err != nil {
 		t.Fatalf("expired refresh failure broke the listing: %v", err)
 	}
-	if len(view.Sources) != 1 || view.Sources[0].Error == "" || len(view.Sources[0].Entries) != 1 || view.Sources[0].Entries[0].ID != "example.plugin" {
-		t.Fatalf("expired snapshot was treated as deleted: %+v", view.Sources)
+	if view.Error == "" || len(view.Entries) != 1 || view.Entries[0].ID != "example.plugin" {
+		t.Fatalf("expired snapshot was treated as deleted: %+v", view)
 	}
-	if view.Sources[0].FetchedAt != wantFetchedAt {
-		t.Fatalf("expired snapshot fetched_at = %q, want retained %q", view.Sources[0].FetchedAt, wantFetchedAt)
+	if view.FetchedAt != wantFetchedAt {
+		t.Fatalf("expired snapshot fetched_at = %q, want retained %q", view.FetchedAt, wantFetchedAt)
 	}
 }
 
 func TestSuccessfulCatalogRefreshAtomicallyReplacesTheSnapshot(t *testing.T) {
-	served := stubFetch{catalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
+	served := stubFetch{officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, "")}
 	stubImporter(t, served)
 	e := catalogTestEngine(t)
 	if _, err := e.Catalog(context.Background(), false); err != nil {
 		t.Fatalf("initial catalog: %v", err)
 	}
-	served[catalogIndexURL] = strings.Replace(
+	served[officialCatalogIndexURL] = strings.Replace(
 		catalogIndexJSON(t, honestCapabilities, ""),
 		`"id": "example.plugin"`, `"id": "next.plugin"`, 1,
 	)
@@ -583,61 +566,15 @@ func TestSuccessfulCatalogRefreshAtomicallyReplacesTheSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("successful refresh: %v", err)
 	}
-	if len(refreshed.Sources) != 1 || refreshed.Sources[0].Error != "" || len(refreshed.Sources[0].Entries) != 1 || refreshed.Sources[0].Entries[0].ID != "next.plugin" {
-		t.Fatalf("successful refresh did not replace the complete snapshot: %+v", refreshed.Sources)
+	if refreshed.Error != "" || len(refreshed.Entries) != 1 || refreshed.Entries[0].ID != "next.plugin" {
+		t.Fatalf("successful refresh did not replace the complete snapshot: %+v", refreshed)
 	}
 	cached, err := e.Catalog(context.Background(), false)
 	if err != nil {
 		t.Fatalf("read refreshed cache: %v", err)
 	}
-	if len(cached.Sources[0].Entries) != 1 || cached.Sources[0].Entries[0].ID != "next.plugin" {
-		t.Fatalf("cache retained the superseded snapshot: %+v", cached.Sources)
-	}
-}
-
-func TestCatalogSourcesAreValidatedBeforeTheyAreStored(t *testing.T) {
-	for name, sources := range map[string][]CatalogSource{
-		"a plaintext URL":  {{ID: "a", URL: "http://example.com/i.json", Enabled: true}},
-		"a duplicate id":   {{ID: "a", URL: "https://one.example/i.json"}, {ID: "a", URL: "https://two.example/i.json"}},
-		"a duplicate URL":  {{ID: "a", URL: "https://one.example/i.json"}, {ID: "b", URL: "https://one.example/i.json"}},
-		"an invalid id":    {{ID: "Not An Id", URL: "https://one.example/i.json"}},
-		"a URL with a ref": {{ID: "a", URL: "https://one.example/i.json#frag"}},
-	} {
-		if _, err := normaliseCatalogSources(sources); err == nil {
-			t.Errorf("%s was accepted", name)
-		}
-	}
-
-	tooMany := make([]CatalogSource, 0, maxCatalogSources+1)
-	for i := 0; i <= maxCatalogSources; i++ {
-		tooMany = append(tooMany, CatalogSource{ID: fmt.Sprintf("source%d", i), URL: fmt.Sprintf("https://example.com/%d.json", i)})
-	}
-	if _, err := normaliseCatalogSources(tooMany); err == nil {
-		t.Errorf("%d catalogs were accepted", len(tooMany))
-	}
-}
-
-// A fresh gateway must not contact a marketplace the operator did not choose.
-// The non-nil empty slice is also part of the wire contract: Console iterates
-// it directly and must receive `[]`, not `null`.
-func TestFreshDocumentHasNoCatalogSources(t *testing.T) {
-	document := DefaultDocument()
-	if document.Catalogs == nil || len(document.Catalogs) != 0 {
-		t.Fatalf("fresh catalogs = %#v, want a non-nil empty list", document.Catalogs)
-	}
-	cloned := cloneConfig(document)
-	if cloned.Catalogs == nil || len(cloned.Catalogs) != 0 {
-		t.Fatalf("cloned fresh catalogs = %#v, want a non-nil empty list", cloned.Catalogs)
-	}
-	if err := validateCatalogs(document.Catalogs); err != nil {
-		t.Fatalf("the empty catalog list does not validate: %v", err)
-	}
-	raw, err := json.Marshal(document)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"catalogs":[]`) {
-		t.Fatalf("fresh document did not publish an empty catalog list: %s", raw)
+	if len(cached.Entries) != 1 || cached.Entries[0].ID != "next.plugin" {
+		t.Fatalf("cache retained the superseded snapshot: %+v", cached)
 	}
 }
 
@@ -682,7 +619,7 @@ func TestAForwardCompatibleIndexDecodes(t *testing.T) {
 
 func TestAnUnknownFieldIsRefused(t *testing.T) {
 	body := []byte(`{
-  "version": 6,
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
@@ -695,7 +632,7 @@ func TestAnUnknownFieldIsRefused(t *testing.T) {
 
 func TestRetiredQUICFallbackProtectionIsRefused(t *testing.T) {
 	body := []byte(`{
-  "version": 6,
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
@@ -706,87 +643,55 @@ func TestRetiredQUICFallbackProtectionIsRefused(t *testing.T) {
 	}
 }
 
-// A missing key authorizes no implicit publisher. It is normalized to a
-// non-nil empty list so the next write persists the current contract.
-func TestADocumentWithNoCatalogKeyStaysOffline(t *testing.T) {
+// There is one Marketplace and it is compiled into the Core, so a document that
+// still carries the operator-configured source list is a document from before
+// that decision. It is refused rather than migrated: this project is
+// pre-release, and silently dropping a key an operator once used to point the
+// gateway somewhere would leave them believing a source they configured is
+// still being read.
+func TestRetiredCatalogSourcesAreRefused(t *testing.T) {
 	body := []byte(`{
-  "version": 6,
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": false, "http2": true}
+  "mitm": {"enabled": false, "http2": true, "http3": false},
+  "catalogs": [{"id": "io.5gpn.official", "url": "https://catalog.example.com/index.json", "enabled": true}]
 }`)
-	cfg, err := decodeConfig(body)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := decodeConfig(body); err == nil {
+		t.Fatal("retired catalogs key was accepted")
 	}
-	if cfg.Catalogs == nil || len(cfg.Catalogs) != 0 {
-		t.Fatalf("an absent catalog key authorized a source: %#v", cfg.Catalogs)
-	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"catalogs":[]`) {
-		t.Fatalf("an absent catalog key did not normalize to an empty list: %s", raw)
-	}
-}
-
-// An operator who removed every catalog decided something, and that decision
-// has to survive a restart. The field is not omitempty because `[]` must remain
-// the explicit current wire shape.
-func TestAnExplicitlyEmptyCatalogListIsNotReseeded(t *testing.T) {
-	body := []byte(`{
-  "version": 6,
-  "execution_order": [],
-  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
-  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
-  "mitm": {"enabled": false, "http2": true},
-  "catalogs": []
-}`)
-	cfg, err := decodeConfig(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Catalogs) != 0 {
-		t.Fatalf("an emptied catalog list was re-seeded: %+v", cfg.Catalogs)
-	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"catalogs":[]`) {
-		t.Errorf("an empty list did not survive the write: %s", raw)
-	}
-}
-
-func TestAnEmptyCatalogListSurvivesAManagementWrite(t *testing.T) {
-	e := newTestEngine(t, `{
-  "version": 6,
+	// Not even the emptied form, which is what a gateway that had removed every
+	// source would have persisted.
+	empty := []byte(`{
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
   "mitm": {"enabled": false, "http2": true, "http3": false},
   "catalogs": []
 }`)
-	if _, _, err := e.SetCatalogSources(e.Revision(), []CatalogSource{}); err != nil {
-		t.Fatalf("SetCatalogSources: %v", err)
+	if _, err := decodeConfig(empty); err == nil {
+		t.Fatal("an empty retired catalogs key was accepted")
 	}
-	document, _ := e.ReadDocument()
-	if document.Catalogs == nil || len(document.Catalogs) != 0 {
-		t.Fatalf("management write collapsed catalogs to %#v", document.Catalogs)
-	}
-	raw, err := os.ReadFile(e.config.path)
+}
+
+// A fresh gateway publishes no discovery state at all. The Marketplace URL is
+// compiled in, so there is nothing for the document to carry and nothing for a
+// management write to preserve.
+func TestFreshDocumentPersistsNoDiscoveryState(t *testing.T) {
+	raw, err := json.Marshal(DefaultDocument())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(raw, []byte(`"catalogs": []`)) {
-		t.Fatalf("management write persisted catalogs in a non-array shape: %s", raw)
+	if strings.Contains(string(raw), "catalog") {
+		t.Fatalf("fresh document published discovery state: %s", raw)
 	}
 }
 
 // installFromCatalog is the setup the update tests share: an extension already
-// installed from some other URL, disabled, ready to be moved onto a catalog.
+// installed from some other URL, disabled, ready to be moved onto the
+// Marketplace.
 func installFromCatalog(t *testing.T, e *Engine, sourceURL string) string {
 	t.Helper()
 	_, revision, err := e.Install(context.Background(), e.Revision(), InstallRequest{
@@ -818,9 +723,9 @@ func mustImport(t *testing.T, sourceURL string) Module {
 func TestACatalogUpdateMovesTheExtensionsSource(t *testing.T) {
 	const oldURL = "https://elsewhere.example.com/example.yaml"
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
-		oldURL:             validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
+		oldURL:                  validManifest,
 	})
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, oldURL)
@@ -831,7 +736,7 @@ func TestACatalogUpdateMovesTheExtensionsSource(t *testing.T) {
 	}
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest); err != nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", catalogManifestURL, digest); err != nil {
 		t.Fatalf("ApplyCatalogUpdate: %v", err)
 	}
 	after, _ := e.ReadDocument()
@@ -846,16 +751,16 @@ func TestACatalogUpdateBindsTheReviewedManifestURL(t *testing.T) {
 		newURL = "https://catalog.example.com/repointed.yaml"
 	)
 	served := stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
-		newURL:             validManifest,
-		oldURL:             validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
+		newURL:                  validManifest,
+		oldURL:                  validManifest,
 	}
 	stubImporter(t, served)
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, oldURL)
 	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
-		context.Background(), "io.5gpn.official", "example.plugin",
+		context.Background(), "example.plugin",
 	)
 	if err != nil {
 		t.Fatalf("ReviewCatalogEntryView: %v", err)
@@ -864,12 +769,12 @@ func TestACatalogUpdateBindsTheReviewedManifestURL(t *testing.T) {
 		t.Fatalf("review returned revision %q URL %q, want %q %q", reviewRevision, reviewedURL, revision, catalogManifestURL)
 	}
 
-	served[catalogIndexURL] = strings.Replace(served[catalogIndexURL], catalogManifestURL, newURL, 1)
+	served[officialCatalogIndexURL] = strings.Replace(served[officialCatalogIndexURL], catalogManifestURL, newURL, 1)
 	if _, err := e.Catalog(context.Background(), true); err != nil {
 		t.Fatalf("refresh changed catalog: %v", err)
 	}
 	_, _, err = e.ApplyCatalogUpdate(
-		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin", reviewedURL, candidate.Digest,
+		context.Background(), reviewRevision, "example.plugin", reviewedURL, candidate.Digest,
 	)
 	if !errors.Is(err, ErrReviewConflict) {
 		t.Fatalf("ApplyCatalogUpdate error = %v, want review conflict", err)
@@ -886,9 +791,9 @@ func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
 		finalURL = "https://cdn.example.com/example.yaml"
 	)
 	served := stubFetch{
-		catalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
-		finalURL:        validManifest,
-		oldURL:          validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		finalURL:                validManifest,
+		oldURL:                  validManifest,
 	}
 	stubImporterTransport(t, catalogRedirectTransport{
 		served: served,
@@ -898,7 +803,7 @@ func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, oldURL)
 	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
-		context.Background(), "io.5gpn.official", "example.plugin",
+		context.Background(), "example.plugin",
 	)
 	if err != nil {
 		t.Fatalf("ReviewCatalogEntryView: %v", err)
@@ -910,7 +815,7 @@ func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
 		t.Fatalf("candidate source URL = %q, want redirect target %q", candidate.Detail.SourceURL, finalURL)
 	}
 	if _, _, err := e.ApplyCatalogUpdate(
-		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin",
+		context.Background(), reviewRevision, "example.plugin",
 		candidate.Detail.SourceURL, candidate.Digest,
 	); !errors.Is(err, ErrReviewConflict) {
 		t.Fatalf("redirect target apply error = %v, want review conflict", err)
@@ -919,7 +824,7 @@ func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
 		t.Fatalf("wrong reviewed URL changed revision to %q, want %q", current, revision)
 	}
 	if _, _, err := e.ApplyCatalogUpdate(
-		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin",
+		context.Background(), reviewRevision, "example.plugin",
 		reviewedURL, candidate.Digest,
 	); err != nil {
 		t.Fatalf("apply with reviewed entry URL: %v", err)
@@ -929,20 +834,20 @@ func TestACatalogRedirectKeepsTheReviewedEntryURLAuthoritative(t *testing.T) {
 func TestACatalogUpdateTreatsARemovedReviewedEntryAsConflict(t *testing.T) {
 	const oldURL = "https://elsewhere.example.com/example.yaml"
 	served := stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
-		oldURL:             validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
+		oldURL:                  validManifest,
 	}
 	stubImporter(t, served)
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, oldURL)
 	candidate, reviewedURL, reviewRevision, err := e.ReviewCatalogEntryView(
-		context.Background(), "io.5gpn.official", "example.plugin",
+		context.Background(), "example.plugin",
 	)
 	if err != nil {
 		t.Fatalf("ReviewCatalogEntryView: %v", err)
 	}
-	served[catalogIndexURL] = `{
+	served[officialCatalogIndexURL] = `{
   "apiVersion": "5gpn.io/marketplace/v1",
   "kind": "ExtensionMarketplace",
   "metadata": {"id": "io.5gpn.official", "name": "Official", "homepage": "https://example.com"},
@@ -952,7 +857,7 @@ func TestACatalogUpdateTreatsARemovedReviewedEntryAsConflict(t *testing.T) {
 		t.Fatalf("refresh removed catalog entry: %v", err)
 	}
 	_, _, err = e.ApplyCatalogUpdate(
-		context.Background(), reviewRevision, "io.5gpn.official", "example.plugin", reviewedURL, candidate.Digest,
+		context.Background(), reviewRevision, "example.plugin", reviewedURL, candidate.Digest,
 	)
 	if !errors.Is(err, ErrReviewConflict) {
 		t.Fatalf("ApplyCatalogUpdate error = %v, want review conflict", err)
@@ -967,8 +872,8 @@ func TestACatalogUpdateTreatsARemovedReviewedEntryAsConflict(t *testing.T) {
 // so an enabled extension remains enabled across the replacement.
 func TestACatalogUpdateKeepsAnEnabledExtensionEnabled(t *testing.T) {
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, catalogManifestURL)
@@ -983,7 +888,7 @@ func TestACatalogUpdateKeepsAnEnabledExtensionEnabled(t *testing.T) {
 	}
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest)
+	_, _, err = e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", catalogManifestURL, digest)
 	if err != nil {
 		t.Fatalf("enabled catalog update: %v", err)
 	}
@@ -1002,14 +907,14 @@ func TestACatalogUpdateKeepsAnEnabledExtensionEnabled(t *testing.T) {
 func TestACatalogUpdateStillChecksWhatTheEntryAdvertised(t *testing.T) {
 	understated := strings.Replace(honestCapabilities, `"network": true`, `"network": false`, 1)
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, understated, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, understated, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, catalogManifestURL)
 
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
-	_, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, digest)
+	_, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", catalogManifestURL, digest)
 	if err == nil {
 		t.Fatal("an entry that understates the manifest updated anyway")
 	}
@@ -1025,20 +930,20 @@ func TestACatalogUpdateStillChecksWhatTheEntryAdvertised(t *testing.T) {
 // catalog path must not become a way to skip the confirmation.
 func TestACatalogUpdateStillRequiresTheReviewedDigest(t *testing.T) {
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
 	})
 	e := catalogTestEngine(t)
 	revision := installFromCatalog(t, e, catalogManifestURL)
 	digest := SnapshotDigest(mustImport(t, catalogManifestURL))
 
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", "", digest); !errors.Is(err, ErrInvalidRequest) {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", "", digest); !errors.Is(err, ErrInvalidRequest) {
 		t.Errorf("an update without the reviewed URL returned %v, want invalid request", err)
 	}
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, ""); err == nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", catalogManifestURL, ""); err == nil {
 		t.Error("an update with no digest was applied")
 	}
-	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "io.5gpn.official", "example.plugin", catalogManifestURL, strings.Repeat("b", 64)); err == nil {
+	if _, _, err := e.ApplyCatalogUpdate(context.Background(), revision, "example.plugin", catalogManifestURL, strings.Repeat("b", 64)); err == nil {
 		t.Error("an update quoting the wrong digest was applied")
 	}
 }
@@ -1048,9 +953,9 @@ func TestACatalogUpdateStillRequiresTheReviewedDigest(t *testing.T) {
 func TestCheckUpdateStillReadsOnlyTheInstalledSource(t *testing.T) {
 	const oldURL = "https://elsewhere.example.com/example.yaml"
 	stubImporter(t, stubFetch{
-		catalogIndexURL:    catalogIndexJSON(t, honestCapabilities, ""),
-		catalogManifestURL: validManifest,
-		oldURL:             validManifest,
+		officialCatalogIndexURL: catalogIndexJSON(t, honestCapabilities, ""),
+		catalogManifestURL:      validManifest,
+		oldURL:                  validManifest,
 	})
 	e := catalogTestEngine(t)
 	installFromCatalog(t, e, oldURL)

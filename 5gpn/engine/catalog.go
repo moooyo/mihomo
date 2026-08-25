@@ -22,59 +22,58 @@ import (
 // which meant an operator had to already know what they wanted and where it
 // lived.
 //
-// So a catalog is a list of manifests and nothing else. It is fetched through
-// the same guarded client an import uses, it is never persisted, and it grants
-// no authority: installing from an entry runs exactly the review-then-confirm
-// path a pasted URL runs, and the digest the operator confirms is computed from
-// a fresh fetch of the manifest rather than from anything the catalog said.
+// So the Marketplace is a list of manifests and nothing else. There is exactly
+// one of it, its URL is compiled into this Core, and it is fetched through the
+// same guarded client an import uses. It is never persisted, it is not operator
+// state, and it grants no authority: installing from an entry runs exactly the
+// review-then-confirm path a pasted URL runs, and the digest the operator
+// confirms is computed from a fresh fetch of the manifest rather than from
+// anything the listing said.
 //
-// What the catalog *is* allowed to do is contradict itself, and that is worth
+// What the listing *is* allowed to do is contradict itself, and that is worth
 // checking. An entry states the manifest's SHA-256 and the shape of what it
 // declares -- how many hosts it captures, whether it takes the network grant.
 // If the fetched manifest disagrees with the entry that advertised it, the
-// catalog and the publisher have diverged, and an operator reading a listing
+// index and the publisher have diverged, and an operator reading a listing
 // that says "no network access" would be confirming something else. That is
 // refused rather than reported, because the review is the screen where the
 // operator decides, and the wrong description reaching it is the failure.
 //
-// A catalog does not become an update source by existing. CheckUpdate re-reads
-// the URL an extension was installed from and never an entry that happens to
-// share its id, because a source that could change on its own would mean adding
-// a catalog silently redirects installed code.
+// The Marketplace does not become an update source by existing. CheckUpdate
+// re-reads the URL an extension was installed from and never an entry that
+// happens to share its id, because a listing that could redirect on its own
+// would mean a publisher silently replaces installed code.
 //
-// It can change one when asked. ApplyCatalogUpdate takes a specific entry in a
-// specific catalog for a specific extension, and moves that extension's source
-// to it. The distinction is not "may the source ever change" but "may it change
-// without being asked".
+// It can change one when asked. ApplyCatalogUpdate takes a specific entry for a
+// specific extension, and moves that extension's source to it. The distinction
+// is not "may the source ever change" but "may it change without being asked".
 
 const (
-	maxCatalogSources    = 16
 	maxCatalogEntries    = 512
 	maxCatalogIndexBytes = 2 << 20
-	maxCatalogNameBytes  = 128
 
 	// How long a fetched index is reused. The extensions page is opened,
-	// scrolled and reopened; refetching per render would put a request on a
-	// third-party host for every one of those. An operator who wants the newest
+	// scrolled and reopened; refetching per render would put a request on the
+	// publishing host for every one of those. An operator who wants the newest
 	// listing asks for it, and that bypasses this.
 	catalogCacheTTL = 5 * time.Minute
 
 	catalogAPIVersion = "5gpn.io/marketplace/v1"
 	catalogKind       = "ExtensionMarketplace"
-)
 
-// CatalogSource is one configured catalog. This is the only part of discovery
-// that is operator state, and it lives in the interception document with every
-// other interception decision.
-type CatalogSource struct {
-	ID string `json:"id"`
-	// Name is the operator's own label, which survives whatever the index calls
-	// itself. A source that cannot be fetched still has to be nameable in the
-	// list it is removed from.
-	Name    string `json:"name,omitempty"`
-	URL     string `json:"url"`
-	Enabled bool   `json:"enabled"`
-}
+	// officialCatalogIndexURL is the one Marketplace this Core reads. It is
+	// compiled in rather than configured: an operator cannot add, rename,
+	// reorder or disable a discovery source, so there is no stored list to
+	// reconcile across two Console tabs and no way for a gateway to end up
+	// pointed at an index nobody audited. Pasting an arbitrary HTTPS manifest
+	// URL is untouched and remains the way to install something that is not
+	// listed here; what is retired is the second, persistent kind of trust an
+	// operator-added index carried.
+	//
+	// The /v2/ is the publication path on GitHub Pages, not the wire schema.
+	// catalogAPIVersion above is the schema, and it is still v1.
+	officialCatalogIndexURL = "https://moooyo.github.io/5gpn-extensions/marketplace/v2/index.json"
+)
 
 // CatalogMetadata is what an index says about itself.
 type CatalogMetadata struct {
@@ -156,41 +155,34 @@ type catalogIndex struct {
 	Entries    []CatalogEntry  `json:"entries"`
 }
 
-// CatalogSourceView is one source as the console renders it: the operator's
-// configuration, plus whatever the last fetch produced.
+// CatalogView is the built-in Marketplace as the Console renders it: where it
+// was read from, what it says about itself, and whatever the last fetch
+// produced.
 //
-// Error may accompany Entries from the last complete successful fetch. A
-// source that has never succeeded appears with an empty list and the reason;
-// one whose refresh fails keeps its prior snapshot visible so a transient
-// failure cannot masquerade as the publisher deleting every extension.
-type CatalogSourceView struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name,omitempty"`
+// Error may accompany Entries from the last complete successful fetch. An index
+// that has never been reached appears with an empty list and the reason; one
+// whose refresh fails keeps its prior snapshot visible so a transient failure
+// cannot masquerade as the publisher deleting every extension.
+//
+// Entries is always an array and never null: the Console reads a length off it
+// without checking first.
+type CatalogView struct {
 	URL       string          `json:"url"`
-	Enabled   bool            `json:"enabled"`
 	Error     string          `json:"error,omitempty"`
 	FetchedAt string          `json:"fetched_at,omitempty"`
 	Metadata  CatalogMetadata `json:"metadata"`
 	Entries   []CatalogEntry  `json:"entries"`
 }
 
-// CatalogView is every configured source, in the order the document lists them.
-type CatalogView struct {
-	Sources []CatalogSourceView `json:"sources"`
-}
-
-// Catalog fetches every enabled source and reports what they list.
-//
-// A disabled source is reported without being fetched: it is still the
-// operator's configuration and still has to be visible to re-enable.
+// Catalog fetches the Marketplace and reports what it lists.
 func (e *Engine) Catalog(ctx context.Context, refresh bool) (CatalogView, error) {
 	catalog, _, err := e.CatalogWithRevision(ctx, refresh)
 	return catalog, err
 }
 
 // CatalogWithRevision pairs discovery with the committed config that supplied
-// its source list and installed-version projection. Network fetches may take
-// time, but a concurrent edit cannot relabel the resulting old view as new.
+// its installed-version projection. Network fetches may take time, but a
+// concurrent edit cannot relabel the resulting old view as new.
 func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (CatalogView, string, error) {
 	committed, err := e.CommittedView()
 	if err != nil {
@@ -205,72 +197,43 @@ func (e *Engine) CatalogWithRevision(ctx context.Context, refresh bool) (Catalog
 		installed[m.ID] = installedIdentity{version: m.Version, manifestDigest: m.Source.Digest}
 	}
 
-	view := CatalogView{Sources: make([]CatalogSourceView, 0, len(committed.Config.Catalogs))}
-	for _, source := range committed.Config.Catalogs {
-		rendered := CatalogSourceView{
-			ID: source.ID, Name: source.Name, URL: source.URL, Enabled: source.Enabled,
-			Entries: []CatalogEntry{},
+	view := CatalogView{URL: officialCatalogIndexURL, Entries: []CatalogEntry{}}
+	index, fetchedAt, available, err := e.catalogIndexFor(ctx, refresh)
+	if err != nil {
+		view.Error = err.Error()
+		// A refresh attempt is advisory, not a transaction that deletes the last
+		// complete discovery snapshot. catalogIndexFor returns that retained
+		// index with the fetch error when one exists, so the Console can keep
+		// rendering known entries while making the failure visible.
+		if !available {
+			return view, committed.Revision, nil
 		}
-		if !source.Enabled {
-			view.Sources = append(view.Sources, rendered)
-			continue
+	}
+	view.Metadata = index.Metadata
+	view.FetchedAt = fetchedAt.UTC().Format(time.RFC3339)
+	for _, entry := range index.Entries {
+		if identity, ok := installed[entry.ID]; ok {
+			entry.InstalledVersion = identity.version
+			entry.InstalledCurrent = identity.version == entry.Version &&
+				validLowerHex(entry.Manifest.SHA256, 64) &&
+				strings.EqualFold(identity.manifestDigest, entry.Manifest.SHA256)
 		}
-		index, fetchedAt, available, err := e.catalogIndexFor(ctx, source.URL, refresh)
-		if err != nil {
-			rendered.Error = err.Error()
-			// A refresh attempt is advisory, not a transaction that deletes the
-			// last complete discovery snapshot. catalogIndexFor returns that
-			// retained index with the fetch error when one exists, so the Console
-			// can keep rendering known entries while making the failure visible.
-			if !available {
-				view.Sources = append(view.Sources, rendered)
-				continue
-			}
-		}
-		rendered.Metadata = index.Metadata
-		rendered.FetchedAt = fetchedAt.UTC().Format(time.RFC3339)
-		for _, entry := range index.Entries {
-			if identity, ok := installed[entry.ID]; ok {
-				entry.InstalledVersion = identity.version
-				entry.InstalledCurrent = identity.version == entry.Version &&
-					validLowerHex(entry.Manifest.SHA256, 64) &&
-					strings.EqualFold(identity.manifestDigest, entry.Manifest.SHA256)
-			}
-			rendered.Entries = append(rendered.Entries, entry)
-		}
-		view.Sources = append(view.Sources, rendered)
+		view.Entries = append(view.Entries, entry)
 	}
 	return view, committed.Revision, nil
 }
 
-// SetCatalogSources replaces the configured catalogs.
-//
-// One write for the whole list rather than add and remove, because the list is
-// ordered and an id is only unique within it: reconciling two independent edits
-// would need a per-source revision, which is a lot of machinery for a field an
-// operator changes a handful of times in the life of a gateway.
-func (e *Engine) SetCatalogSources(revision string, sources []CatalogSource) (Snapshot, string, error) {
-	normalised, err := normaliseCatalogSources(sources)
-	if err != nil {
-		return Snapshot{}, revision, err
-	}
-	return e.mutate(revision, func(c *Config) error {
-		c.Catalogs = normalised
-		return nil
-	})
-}
-
 // ReviewCatalogEntry is the review step for an entry, and the only place the
-// catalog's claims are held to the manifest.
+// Marketplace's claims are held to the manifest.
 //
 // It returns exactly what postReview returns for a pasted URL, so installing
-// from a catalog is the same confirmation with the same digest and the same
-// re-fetch. The difference is entirely in what happens before: the manifest is
-// checked against the digest and the shape the entry advertised, and a
-// disagreement refuses rather than being reported alongside a review the
+// from the Marketplace is the same confirmation with the same digest and the
+// same re-fetch. The difference is entirely in what happens before: the
+// manifest is checked against the digest and the shape the entry advertised,
+// and a disagreement refuses rather than being reported alongside a review the
 // operator would then confirm.
-func (e *Engine) ReviewCatalogEntry(ctx context.Context, sourceID, entryID string) (Candidate, error) {
-	candidate, _, _, err := e.ReviewCatalogEntryView(ctx, sourceID, entryID)
+func (e *Engine) ReviewCatalogEntry(ctx context.Context, entryID string) (Candidate, error) {
+	candidate, _, _, err := e.ReviewCatalogEntryView(ctx, entryID)
 	return candidate, err
 }
 
@@ -278,12 +241,12 @@ func (e *Engine) ReviewCatalogEntry(ctx context.Context, sourceID, entryID strin
 // the committed revision used by the review. The URL is an opaque review token:
 // a redirect may make Candidate.Detail.SourceURL different, and a client must
 // still quote this selected-entry URL rather than reconstructing it.
-func (e *Engine) ReviewCatalogEntryView(ctx context.Context, sourceID, entryID string) (Candidate, string, string, error) {
+func (e *Engine) ReviewCatalogEntryView(ctx context.Context, entryID string) (Candidate, string, string, error) {
 	reviewView, err := e.CommittedView()
 	if err != nil {
 		return Candidate{}, "", "", err
 	}
-	entry, err := e.catalogEntryForConfig(ctx, reviewView.Config, sourceID, entryID)
+	entry, err := e.catalogEntry(ctx, entryID)
 	if err != nil {
 		return Candidate{}, "", reviewView.Revision, err
 	}
@@ -303,40 +266,30 @@ func (e *Engine) ReviewCatalogEntryView(ctx context.Context, sourceID, entryID s
 	return candidate, entry.Manifest.URL, candidateView.Revision, nil
 }
 
-// CatalogEntrySource resolves an entry to the manifest URL an install must
-// quote, so a client never has to reconstruct it from the listing.
-func (e *Engine) CatalogEntrySource(ctx context.Context, sourceID, entryID string) (string, error) {
-	entry, err := e.catalogEntry(ctx, sourceID, entryID)
-	if err != nil {
-		return "", err
-	}
-	return entry.Manifest.URL, nil
-}
-
-// ApplyCatalogUpdate replaces an installed extension with a catalog entry's
+// ApplyCatalogUpdate replaces an installed extension with a Marketplace entry's
 // version, and in doing so changes where that extension's code comes from.
 //
 // That is the whole weight of this call, and it is why it is a separate one.
 // CheckUpdate deliberately re-reads only the URL an extension was installed
-// from: a source that could change on its own would mean adding a catalog
-// silently redirects installed code. Here the operator picked this entry, in
-// this catalog, for this extension — so the redirection is the thing they
-// asked for rather than a side effect of configuration.
+// from: a source that could change on its own would mean a republished listing
+// silently redirects installed code. Here the operator picked this entry for
+// this extension — so the redirection is the thing they asked for rather than a
+// side effect of a listing moving underneath them.
 //
 // Everything the ordinary update path checks still applies: the fetched
 // manifest must still be the same extension id and its digest must match what
-// was reviewed. On top of that the entry's own claims are checked, so a catalog
-// cannot advertise one shape and update to another.
-func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, sourceID, entryID, reviewedURL, digest string) (Snapshot, string, error) {
-	return e.ApplyCatalogUpdateWithSettings(ctx, revision, sourceID, entryID, reviewedURL, digest, nil)
+// was reviewed. On top of that the entry's own claims are checked, so the
+// Marketplace cannot advertise one shape and update to another.
+func (e *Engine) ApplyCatalogUpdate(ctx context.Context, revision, entryID, reviewedURL, digest string) (Snapshot, string, error) {
+	return e.ApplyCatalogUpdateWithSettings(ctx, revision, entryID, reviewedURL, digest, nil)
 }
 
-// ApplyCatalogUpdateWithSettings is the catalog-source variant of
+// ApplyCatalogUpdateWithSettings is the Marketplace variant of
 // ApplyUpdateWithSettings. Values, when present, are the complete proposed
 // settings document for the freshly fetched candidate.
 func (e *Engine) ApplyCatalogUpdateWithSettings(
 	ctx context.Context,
-	revision, sourceID, entryID, reviewedURL, digest string,
+	revision, entryID, reviewedURL, digest string,
 	values SettingValues,
 ) (Snapshot, string, error) {
 	reviewedURL = strings.TrimSpace(reviewedURL)
@@ -350,7 +303,7 @@ func (e *Engine) ApplyCatalogUpdateWithSettings(
 	if revision != "" && revision != view.Revision {
 		return Snapshot{}, view.Revision, state.ErrRevisionConflict
 	}
-	entry, err := e.catalogEntryForConfig(ctx, view.Config, sourceID, entryID)
+	entry, err := e.catalogEntry(ctx, entryID)
 	if err != nil {
 		if errors.Is(err, ErrModuleNotFound) {
 			return Snapshot{}, revision, reviewConflictf("the selected Marketplace entry changed since you reviewed it: %v", err)
@@ -377,34 +330,24 @@ func (e *Engine) ApplyCatalogUpdateWithSettings(
 	})
 }
 
-func (e *Engine) catalogEntry(ctx context.Context, sourceID, entryID string) (CatalogEntry, error) {
-	cfg, err := e.config.Current()
+// catalogEntry is the only path from an entry id to a manifest URL, and both
+// review and apply take it.
+//
+// An entry the index no longer lists is ErrModuleNotFound rather than a plain
+// failure, because ApplyCatalogUpdateWithSettings turns exactly that error into
+// a review conflict: the operator reviewed something that has since been
+// withdrawn, which is a stale confirmation and not a missing route.
+func (e *Engine) catalogEntry(ctx context.Context, entryID string) (CatalogEntry, error) {
+	index, _, _, err := e.catalogIndexFor(ctx, false)
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	return e.catalogEntryForConfig(ctx, cfg, sourceID, entryID)
-}
-
-func (e *Engine) catalogEntryForConfig(ctx context.Context, cfg Config, sourceID, entryID string) (CatalogEntry, error) {
-	for _, source := range cfg.Catalogs {
-		if source.ID != sourceID {
-			continue
+	for _, entry := range index.Entries {
+		if entry.ID == entryID {
+			return entry, nil
 		}
-		if !source.Enabled {
-			return CatalogEntry{}, fmt.Errorf("%w: catalog %q is disabled", ErrInvalidRequest, sourceID)
-		}
-		index, _, _, err := e.catalogIndexFor(ctx, source.URL, false)
-		if err != nil {
-			return CatalogEntry{}, err
-		}
-		for _, entry := range index.Entries {
-			if entry.ID == entryID {
-				return entry, nil
-			}
-		}
-		return CatalogEntry{}, fmt.Errorf("%w: catalog %q lists no extension %q", ErrModuleNotFound, sourceID, entryID)
 	}
-	return CatalogEntry{}, fmt.Errorf("%w: no catalog %q is configured", ErrModuleNotFound, sourceID)
+	return CatalogEntry{}, fmt.Errorf("%w: the Marketplace lists no extension %q", ErrModuleNotFound, entryID)
 }
 
 // verifyAgainstEntry refuses a review whose manifest does not match the listing
@@ -459,31 +402,32 @@ func (e *Engine) verifyAgainstEntry(entry CatalogEntry, candidate Candidate) err
 	return nil
 }
 
-// catalogIndexFor fetches an index, or reuses one fetched recently. available
-// distinguishes a retained complete snapshot from the zero value when a fetch
-// fails; callers that only authorize reviews still treat any error as fatal.
-func (e *Engine) catalogIndexFor(ctx context.Context, rawURL string, refresh bool) (catalogIndex, time.Time, bool, error) {
+// catalogIndexFor fetches the Marketplace index, or reuses one fetched
+// recently. available distinguishes a retained complete snapshot from the zero
+// value when a fetch fails; callers that only authorize reviews still treat any
+// error as fatal.
+func (e *Engine) catalogIndexFor(ctx context.Context, refresh bool) (catalogIndex, time.Time, bool, error) {
 	if !refresh {
-		if cached, cachedAt, ok := e.catalogs.get(rawURL); ok {
+		if cached, cachedAt, ok := e.catalogs.get(); ok {
 			return cached, cachedAt, true, nil
 		}
 	}
 	imp, err := currentImporter()
 	if err != nil {
-		if retained, retainedAt, retainedOK := e.catalogs.retained(rawURL); retainedOK {
+		if retained, retainedAt, retainedOK := e.catalogs.retained(); retainedOK {
 			return retained, retainedAt, true, err
 		}
 		return catalogIndex{}, time.Time{}, false, err
 	}
-	index, err := imp.catalog(ctx, rawURL)
+	index, err := imp.catalog(ctx, officialCatalogIndexURL)
 	if err != nil {
-		if retained, retainedAt, retainedOK := e.catalogs.retained(rawURL); retainedOK {
+		if retained, retainedAt, retainedOK := e.catalogs.retained(); retainedOK {
 			return retained, retainedAt, true, err
 		}
 		return catalogIndex{}, time.Time{}, false, err
 	}
 	at := imp.clock().UTC()
-	e.catalogs.put(rawURL, index, at)
+	e.catalogs.put(index, at)
 	return index, at, true, nil
 }
 
@@ -534,106 +478,46 @@ func (imp *Importer) catalog(ctx context.Context, rawURL string) (catalogIndex, 
 	return index, nil
 }
 
-// catalogCache holds the last complete successful index for each source.
-// catalogCacheTTL controls when normal reads attempt another fetch; an older
-// entry remains the failure fallback until a complete successor replaces it.
-// Nothing here is persisted: an index is refetchable by definition, and
-// writing one to disk would make stale discovery state survive a process start.
+// catalogCache holds the last complete successful index. One slot, because
+// there is one Marketplace. catalogCacheTTL controls when normal reads attempt
+// another fetch; an older snapshot remains the failure fallback until a
+// complete successor replaces it. Nothing here is persisted: an index is
+// refetchable by definition, and writing one to disk would make stale discovery
+// state survive a process start.
 type catalogCache struct {
-	mu      sync.Mutex
-	entries map[string]catalogCacheEntry
-}
-
-type catalogCacheEntry struct {
+	mu        sync.Mutex
+	present   bool
 	index     catalogIndex
 	fetchedAt time.Time
 }
 
-func (c *catalogCache) get(rawURL string) (catalogIndex, time.Time, bool) {
+func (c *catalogCache) get() (catalogIndex, time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	cached, ok := c.entries[rawURL]
-	if !ok || time.Since(cached.fetchedAt) > catalogCacheTTL {
+	if !c.present || time.Since(c.fetchedAt) > catalogCacheTTL {
 		return catalogIndex{}, time.Time{}, false
 	}
-	return cached.index, cached.fetchedAt, true
+	return c.index, c.fetchedAt, true
 }
 
 // retained returns the last complete successful fetch regardless of age. TTL
 // decides when to attempt a refresh; it is not permission to erase discovery
 // state when that attempt fails.
-func (c *catalogCache) retained(rawURL string) (catalogIndex, time.Time, bool) {
+func (c *catalogCache) retained() (catalogIndex, time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	cached, ok := c.entries[rawURL]
-	if !ok {
+	if !c.present {
 		return catalogIndex{}, time.Time{}, false
 	}
-	return cached.index, cached.fetchedAt, true
+	return c.index, c.fetchedAt, true
 }
 
-func (c *catalogCache) put(rawURL string, index catalogIndex, at time.Time) {
+func (c *catalogCache) put(index catalogIndex, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.entries == nil {
-		c.entries = make(map[string]catalogCacheEntry, 4)
-	}
-	// Bounded by the source limit, and a source that is removed leaves at most
-	// one stale entry behind until the process restarts.
-	if _, exists := c.entries[rawURL]; !exists && len(c.entries) >= maxCatalogSources {
-		c.entries = make(map[string]catalogCacheEntry, 4)
-	}
-	c.entries[rawURL] = catalogCacheEntry{index: index, fetchedAt: at}
-}
-
-// normaliseCatalogSources validates and canonicalises a proposed source list.
-func normaliseCatalogSources(sources []CatalogSource) ([]CatalogSource, error) {
-	if len(sources) > maxCatalogSources {
-		return nil, fmt.Errorf("%w: at most %d catalogs may be configured", ErrInvalidRequest, maxCatalogSources)
-	}
-	out := make([]CatalogSource, 0, len(sources))
-	seenID := make(map[string]struct{}, len(sources))
-	seenURL := make(map[string]struct{}, len(sources))
-	for _, source := range sources {
-		id := strings.TrimSpace(source.ID)
-		if !validModuleID(id) {
-			return nil, fmt.Errorf("%w: catalog id %q is not a valid identifier", ErrInvalidRequest, source.ID)
-		}
-		if _, duplicate := seenID[id]; duplicate {
-			return nil, fmt.Errorf("%w: catalog id %q is listed twice", ErrInvalidRequest, id)
-		}
-		raw := strings.TrimSpace(source.URL)
-		if err := checkResourceURL(raw); err != nil {
-			return nil, fmt.Errorf("%w: catalog %q: %v", ErrInvalidRequest, id, err)
-		}
-		if _, duplicate := seenURL[raw]; duplicate {
-			return nil, fmt.Errorf("%w: %s is listed twice", ErrInvalidRequest, raw)
-		}
-		name := strings.TrimSpace(source.Name)
-		if len(name) > maxCatalogNameBytes {
-			return nil, fmt.Errorf("%w: catalog %q name exceeds %d bytes", ErrInvalidRequest, id, maxCatalogNameBytes)
-		}
-		seenID[id] = struct{}{}
-		seenURL[raw] = struct{}{}
-		out = append(out, CatalogSource{ID: id, Name: name, URL: raw, Enabled: source.Enabled})
-	}
-	return out, nil
-}
-
-// validateCatalogs is the document-level check, run on every decode so a
-// hand-edited file is held to the same rule an API write is.
-func validateCatalogs(sources []CatalogSource) error {
-	if _, err := normaliseCatalogSources(sources); err != nil {
-		return err
-	}
-	return nil
-}
-
-// defaultCatalogSources is deliberately empty. A catalog fetch is outbound
-// traffic to a publisher the operator chose to trust, so a fresh gateway does
-// not contact any marketplace until an authenticated Console write adds one.
-func defaultCatalogSources() []CatalogSource {
-	return []CatalogSource{}
+	c.index = index
+	c.fetchedAt = at
+	c.present = true
 }
 
 // catalogHost is used only in messages, to name the host an operator would have

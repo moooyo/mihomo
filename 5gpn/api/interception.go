@@ -55,9 +55,8 @@ func interceptionRouter() http.Handler {
 	r.Post("/extensions", postInstall)
 	r.Get("/logs", getEngineLogs)
 	r.Get("/catalog", getCatalog)
-	r.Put("/catalog/sources", putCatalogSources)
-	r.Post("/catalog/{source}/entries/{entry}/review", postCatalogReview)
-	r.Post("/catalog/{source}/entries/{entry}/update", postCatalogUpdate)
+	r.Post("/catalog/entries/{entry}/review", postCatalogReview)
+	r.Post("/catalog/entries/{entry}/update", postCatalogUpdate)
 	r.Route("/extensions/{id}", func(r chi.Router) {
 		r.Get("/", getExtension)
 		r.Delete("/", deleteExtension)
@@ -281,12 +280,13 @@ func putInterceptionSettings(w http.ResponseWriter, r *http.Request) {
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 
-// getCatalog lists every configured extension source and what it advertises.
+// getCatalog reports the Marketplace and what it advertises.
 //
-// It takes no revision because it changes nothing, and it fetches rather than
-// reading stored state: a catalog is not the gateway's data. `?refresh=1`
-// bypasses the few-minute cache, which is what an operator clicks when a
-// publisher has just released something.
+// There is one, its URL is compiled into the Core, and it is not stored: this
+// route fetches rather than reading gateway state, because a listing is the
+// publisher's data and not ours. It takes no revision because it changes
+// nothing. `?refresh=1` bypasses the few-minute cache, which is what an
+// operator clicks when a publisher has just released something.
 func getCatalog(w http.ResponseWriter, r *http.Request) {
 	e := currentEngine()
 	if e == nil {
@@ -304,24 +304,7 @@ func getCatalog(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, render.M{"catalog": view, "revision": revision})
 }
 
-type catalogSourcesRequest struct {
-	Revision string                 `json:"revision"`
-	Sources  []engine.CatalogSource `json:"sources"`
-}
-
-func (b *catalogSourcesRequest) revision() string { return b.Revision }
-
-func putCatalogSources(w http.ResponseWriter, r *http.Request) {
-	var body catalogSourcesRequest
-	e, ok := decodeWrite(w, r, &body)
-	if !ok {
-		return
-	}
-	snapshot, revision, err := e.SetCatalogSources(body.Revision, body.Sources)
-	respondEngine(w, r, snapshot, revision, err, e)
-}
-
-// postCatalogReview reviews one catalog entry.
+// postCatalogReview reviews one Marketplace entry.
 //
 // It returns exactly what postReview returns, and for the same reason: the
 // install that follows is the same call with the same digest. What this adds is
@@ -338,8 +321,7 @@ func postCatalogReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 2*time.Minute)
 	defer cancel()
 
-	source, entry := chi.URLParam(r, "source"), chi.URLParam(r, "entry")
-	candidate, url, revision, err := e.ReviewCatalogEntryView(ctx, source, entry)
+	candidate, url, revision, err := e.ReviewCatalogEntryView(ctx, chi.URLParam(r, "entry"))
 	if err != nil {
 		writeEngineError(w, r, err, e)
 		return
@@ -360,7 +342,7 @@ type catalogUpdateRequest struct {
 
 func (b *catalogUpdateRequest) revision() string { return b.Revision }
 
-// postCatalogUpdate applies a catalog entry's version to an installed
+// postCatalogUpdate applies a Marketplace entry's version to an installed
 // extension, which moves where that extension's code comes from.
 //
 // Its own route rather than a flag on the ordinary update, because that is a
@@ -381,7 +363,7 @@ func postCatalogUpdate(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	snapshot, revision, err := e.ApplyCatalogUpdateWithSettings(
-		ctx, body.Revision, chi.URLParam(r, "source"), chi.URLParam(r, "entry"), body.URL, body.Digest, body.Values)
+		ctx, body.Revision, chi.URLParam(r, "entry"), body.URL, body.Digest, body.Values)
 	respondEngine(w, r, snapshot, revision, err, e)
 }
 

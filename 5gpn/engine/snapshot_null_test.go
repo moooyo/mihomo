@@ -9,7 +9,7 @@ import (
 // The document a gateway has before anything is installed: no extensions, no
 // execution order, master off. This is the shape the console met in the wild.
 const emptyInterceptDocument = `{
-  "version": 6,
+  "version": 7,
   "execution_order": [],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",

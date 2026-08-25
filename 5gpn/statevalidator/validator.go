@@ -118,7 +118,7 @@ func validateIntercept(raw []byte) error {
 	if err := state.DecodeJSONBytes(raw, state.MaxDocumentBytes, &document); err != nil {
 		return err
 	}
-	// Validate covers modules, actions, catalogs, routing, and HTTP/3. The
+	// Validate covers modules, actions, routing, and HTTP/3. The
 	// certificate-request validator pins the TLS paths but does not publish a
 	// request; publication belongs to the live config store, which this package
 	// deliberately never opens.

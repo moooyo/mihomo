@@ -4,7 +4,7 @@ import "encoding/json"
 
 // ReviewContractVersion is the control-plane contract shared by capability
 // advertisement, review responses, and confirmation writes.
-const ReviewContractVersion = 7
+const ReviewContractVersion = 8
 
 const (
 	actionReviewKindScript      = "script"

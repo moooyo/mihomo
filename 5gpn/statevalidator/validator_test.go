@@ -164,12 +164,6 @@ func TestValidateRejectsInvalidInterceptionSemantics(t *testing.T) {
 				document.Modules[0].Scripts[0].BodyMode = "invalid"
 			},
 		},
-		{
-			name: "catalog",
-			mutate: func(document *engine.Config) {
-				document.Catalogs = []engine.CatalogSource{{ID: "INVALID", URL: "https://catalog.example/index.json", Enabled: true}}
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

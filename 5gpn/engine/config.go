@@ -27,7 +27,7 @@ import (
 	"github.com/metacubex/mihomo/5gpn/state"
 )
 
-const configVersion = 6
+const configVersion = 7
 const maxConfigBytes = 16 << 20
 const maxModuleCaptureHosts = 512
 const maxActionMatchHosts = 512
@@ -49,12 +49,7 @@ type Config struct {
 	TLSKey         string       `json:"tls_key"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
-	// Catalogs are exclusively operator-selected. The field is not omitempty so
-	// a fresh or explicitly emptied document round-trips as `[]`, never `null`.
-	// An absent key is normalized to the same empty list and does not authorize
-	// an implicit marketplace fetch.
-	Catalogs []CatalogSource `json:"catalogs"`
-	runtime  *compiledScriptConfig
+	runtime        *compiledScriptConfig
 	// generation is assigned by configStore and advances only when validated
 	// document content changes. Directly decoded test/check configs leave it zero.
 	generation uint64
@@ -371,9 +366,6 @@ func decodeConfig(body []byte) (Config, error) {
 	if err := state.DecodeJSONBytes(body, maxConfigBytes, &cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
-	if cfg.Catalogs == nil {
-		cfg.Catalogs = defaultCatalogSources()
-	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
@@ -422,9 +414,6 @@ func (c Config) validate() error {
 		return err
 	}
 	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
-		return err
-	}
-	if err := validateCatalogs(c.Catalogs); err != nil {
 		return err
 	}
 	if len(certificateHostPatterns(c)) > maxCertificateHosts {

@@ -14,7 +14,7 @@ import (
 // A document with two extensions, one enabled, both declaring overlapping
 // hosts. Overlap is the interesting case: it is what execution order decides.
 const twoExtensionDocument = `{
-  "version": 6,
+  "version": 7,
   "execution_order": ["first", "second"],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
@@ -570,7 +570,7 @@ func TestReloadKeepsTheLastValidSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(`{"version": 6, "nonsense":`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version": 7, "nonsense":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Reload(); err == nil {

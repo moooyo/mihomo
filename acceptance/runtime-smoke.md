@@ -67,7 +67,7 @@ invalid.
 
 - [ ] An authenticated `GET /capabilities` returns `controllerApi: "1"` and
   advertises `5gpn-core` version 1, `5gpn-dns` version 2,
-  `5gpn-interception` version 7, and `5gpn-bot` version 1.
+  `5gpn-interception` version 8, and `5gpn-bot` version 1.
 - [ ] Capability, DNS, interception, bot, and engine-log reads include
   `Cache-Control: no-store`.
 - [ ] A missing or deliberately wrong credential returns 401 for

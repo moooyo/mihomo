@@ -94,10 +94,10 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 	}
 
 	// Loon hands the bundle a decoded object. Every encoding bug this layer hit
-	// -- weatherkit's quoted form, bilibili's and youtube's JSON, wloc's bare
-	// query -- came from serializing settings into a string each publisher then
-	// parsed differently, and a bundle that mis-parses $argument does not fail,
-	// it silently runs on its defaults.
+	// -- weatherkit's quoted form, bilibili's and youtube's JSON, another
+	// bundle's bare query string -- came from serializing settings into a string
+	// each publisher then parsed differently, and a bundle that mis-parses
+	// $argument does not fail, it silently runs on its defaults.
 	if err := vm.Set("$argument", options.argument); err != nil {
 		return nil, err
 	}
@@ -522,18 +522,19 @@ func flatCompatHeaders(headers map[string][]string) map[string]string {
 
 // parseCompatScriptResult translates the value a bundle handed $done.
 //
-// A Loon completion wraps the projection in a `response` envelope. The shipped
-// wloc bundle ends with, after minification:
+// A Loon completion wraps the projection in a `response` envelope. Published
+// bundles routinely end with the same two-branch tail, which after
+// minification reads:
 //
 //	"Quantumult X" === client ? done(out) : done({response: out})
 //
 // and this runtime presents as Loon precisely so it takes the second branch --
 // so the envelope is the shape it should have expected all along, not an
-// exception. Ignoring it made both apple-wloc actions permanent silent no-ops:
-// the projection came out empty, no error was raised, and the device's real
-// location was forwarded whatever point an operator had configured. That is the
-// failure docs/proxy-compat.md predicted, where a gap "will look like the bundle
-// chose not to act, not like a crash".
+// exception. Ignoring it made every action in such a bundle a permanent silent
+// no-op: the projection came out empty, no error was raised, and the captured
+// exchange was forwarded untouched whatever the operator had configured. That
+// is the failure docs/proxy-compat.md predicted, where a gap "will look like
+// the bundle chose not to act, not like a crash".
 //
 // The native contract has always handled this shape (parseNativeScriptResult),
 // including turning a request-phase `response` into a synthetic reply, so the
@@ -556,8 +557,9 @@ func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult
 			return scriptResult{}, err
 		}
 		// A request-phase action that completes with a response is answering the
-		// exchange itself, which is what save-wloc-settings does to return its
-		// stored point as JSON.
+		// exchange itself, which is what a bundle does when it serves an
+		// operator's own stored settings back as JSON rather than letting the
+		// request reach the origin at all.
 		result.Synthetic = !responsePhase
 		return result, nil
 	}
@@ -606,8 +608,8 @@ func compatProjectionIsEmpty(value goja.Value) bool {
 	// envelope's inner object through the same compatProjection filter, so an
 	// envelope whose inner members are all transport hints is exactly the empty
 	// projection this detector exists to report -- and returning false here made
-	// it the one shape it refused to look inside, leaving the apple-wloc failure
-	// mode (a permanent silent no-op with no error and no warning) undiagnosable
+	// it the one shape it refused to look inside, leaving that failure mode (a
+	// permanent silent no-op with no error and no warning) undiagnosable
 	// through the engine log ring.
 	//
 	// Two sub-cases stay unreported, matching the flat path's own conventions: a

@@ -24,9 +24,9 @@ type Engine struct {
 	trafficChanged      func()
 	clientBoundaryReady func() bool
 	workers             *workerController
-	// catalogs holds fetched extension indexes for a few minutes. Nothing in it
-	// is state: it exists so opening the extensions page does not put a request
-	// on a publisher's host per render.
+	// catalogs holds the fetched Marketplace index for a few minutes. Nothing in
+	// it is state: it exists so opening the extensions page does not put a
+	// request on the publishing host per render.
 	catalogs catalogCache
 }
 

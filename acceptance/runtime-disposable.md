@@ -193,11 +193,6 @@ do not depend on a temporary rule left behind.
   Restart the process and verify the new stream returns `reset: true` with a
   usable current tail. Script console text never appears in the persistent
   journal.
-- [ ] Optional Apple WLOC compatibility observation uses only the pinned
-  manifest and script bytes and records whether the current live Apple origin
-  exercised TCP/H2 through the selected inner-dialer egress. Because the remote
-  origin's protocol behavior is not pinned, this observation cannot determine
-  the reproducible acceptance result; the controlled H1/H2 fixture above does.
 
 Root CA secrecy, root helper sandboxing, certificate-request path-unit delivery,
 and atomic filesystem publication are integration responsibilities of the 5gpn

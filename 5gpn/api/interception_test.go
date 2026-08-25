@@ -223,6 +223,21 @@ func TestInstalledSourceUpdateRoutesAreNotExposed(t *testing.T) {
 	}
 }
 
+// There is one Marketplace and its URL is compiled into the Core. The route
+// that used to replace the configured source list is gone rather than emptied,
+// so an operator — or a stale Console still holding the old page — cannot point
+// this gateway at a discovery source nobody audited.
+func TestTheMarketplaceSourceListRouteIsNotExposed(t *testing.T) {
+	body := strings.NewReader(`{"revision":"any","sources":[]}`)
+	request := httptest.NewRequest(http.MethodPut, "/catalog/sources", body)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	interceptionRouter().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("PUT /catalog/sources returned %d, want 404", response.Code)
+	}
+}
+
 func TestConfirmationWritesRequireTheCurrentReviewContract(t *testing.T) {
 	e := newInterceptionAPIEngine(t)
 	revision := e.Revision()
@@ -248,7 +263,7 @@ func TestConfirmationWritesRequireTheCurrentReviewContract(t *testing.T) {
 		},
 		"catalog update": {
 			method: http.MethodPost,
-			path:   "/catalog/source/entries/entry/update",
+			path:   "/catalog/entries/entry/update",
 			body: func(contract int) any {
 				return catalogUpdateRequest{
 					Revision: revision, ReviewContract: contract,
@@ -271,7 +286,7 @@ func TestConfirmationWritesRequireTheCurrentReviewContract(t *testing.T) {
 			},
 		},
 	}
-	wantMessage := "review_contract must be 7; reload the current state and review the action again"
+	wantMessage := "review_contract must be 8; reload the current state and review the action again"
 
 	for name, fixture := range fixtures {
 		for label, contract := range map[string]int{
@@ -382,7 +397,7 @@ func TestDisableAllowsAnOmittedReviewContract(t *testing.T) {
 		t.Fatal("disable without review_contract left the extension enabled")
 	}
 
-	wrongBody := `{"revision":"` + e.Revision() + `","enabled":false,"review_contract":6}`
+	wrongBody := `{"revision":"` + e.Revision() + `","enabled":false,"review_contract":7}`
 	wrong := httptest.NewRequest(http.MethodPut, "/extensions/"+candidate.Detail.ID+"/enabled", strings.NewReader(wrongBody))
 	wrong.Header.Set("Content-Type", "application/json")
 	wrongResponse := httptest.NewRecorder()
@@ -479,7 +494,7 @@ func TestExtensionSettingsRouteRequiresACompleteValuesDocument(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "intercept.json")
 	const document = `{
-  "version": 6,
+  "version": 7,
   "execution_order": ["settings-test"],
   "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
   "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
@@ -498,8 +513,7 @@ func TestExtensionSettingsRouteRequiresACompleteValuesDocument(t *testing.T) {
     "persistent_storage": false,
     "egress_group": "DIRECT",
     "egress_group_required": false
-  }],
-  "catalogs": []
+  }]
 }`
 	if err := os.WriteFile(configPath, []byte(document), 0o600); err != nil {
 		t.Fatal(err)
