@@ -25,6 +25,7 @@ import (
 
 	"github.com/metacubex/mihomo/5gpn/netguard"
 	"github.com/metacubex/mihomo/5gpn/state"
+	"golang.org/x/net/publicsuffix"
 )
 
 const configVersion = 7
@@ -702,22 +703,25 @@ func certificateHostPatterns(cfg Config) []string {
 
 func matchHostPattern(pattern, host string) bool {
 	if strings.HasPrefix(pattern, "*.") {
-		suffix := strings.TrimPrefix(pattern, "*.")
-		return len(host) > len(suffix)+1 && strings.HasSuffix(host, "."+suffix)
+		return matchSingleLabelWildcard(strings.TrimPrefix(pattern, "*."), host)
 	}
 	return host == pattern
+}
+
+func matchSingleLabelWildcard(suffix, host string) bool {
+	separator := len(host) - len(suffix) - 1
+	return separator > 0 && host[separator] == '.' &&
+		!strings.Contains(host[:separator], ".") && strings.HasSuffix(host, suffix)
 }
 
 func hostPatternCovers(allowed, candidate string) bool {
 	if allowed == candidate {
 		return true
 	}
-	if !strings.HasPrefix(allowed, "*.") {
+	if strings.HasPrefix(candidate, "*.") {
 		return false
 	}
-	base := strings.TrimPrefix(allowed, "*.")
-	candidateBase := strings.TrimPrefix(candidate, "*.")
-	return strings.HasSuffix(candidateBase, "."+base)
+	return matchHostPattern(allowed, candidate)
 }
 
 func hostCoveredBy(patterns []string, candidate string) bool {
@@ -1389,7 +1393,8 @@ func validSnapshotURL(raw string) bool {
 
 func validHostPattern(pattern string) bool {
 	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	if strings.HasPrefix(pattern, "*.") {
+	wildcard := strings.HasPrefix(pattern, "*.")
+	if wildcard {
 		pattern = strings.TrimPrefix(pattern, "*.")
 	}
 	if strings.Contains(pattern, "*") || len(pattern) > 253 || !strings.Contains(pattern, ".") {
@@ -1403,6 +1408,12 @@ func validHostPattern(pattern string) bool {
 			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
 				return false
 			}
+		}
+	}
+	if wildcard {
+		suffix, _ := publicsuffix.PublicSuffix(pattern)
+		if suffix == pattern {
+			return false
 		}
 	}
 	return true

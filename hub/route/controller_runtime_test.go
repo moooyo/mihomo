@@ -7,12 +7,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
+	listenerpkg "github.com/metacubex/mihomo/listener"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
@@ -110,6 +112,40 @@ func TestManagedControllerConfigFailsClosed(t *testing.T) {
 	upstream.UnixAddr = "mihomo.sock"
 	if err := ValidateConfig(&upstream); err != nil {
 		t.Fatalf("upstream controller behavior was restricted: %v", err)
+	}
+}
+
+func TestManagedControllerServerBoundsOnlyHeadersAndIdleConnections(t *testing.T) {
+	previousManaged := updater.ManagedDistribution()
+	t.Cleanup(func() { updater.SetManagedDistribution(previousManaged) })
+
+	updater.SetManagedDistribution(true)
+	managed := newControllerServer(false)
+	if managed.ReadHeaderTimeout != managedControllerReadHeaderTimeout {
+		t.Fatalf("managed ReadHeaderTimeout = %s, want %s", managed.ReadHeaderTimeout, managedControllerReadHeaderTimeout)
+	}
+	if managed.IdleTimeout != managedControllerIdleTimeout {
+		t.Fatalf("managed IdleTimeout = %s, want %s", managed.IdleTimeout, managedControllerIdleTimeout)
+	}
+	if managed.MaxHeaderBytes != managedControllerMaxHeaderBytes {
+		t.Fatalf("managed MaxHeaderBytes = %d, want %d", managed.MaxHeaderBytes, managedControllerMaxHeaderBytes)
+	}
+	if managed.ReadTimeout != 0 || managed.WriteTimeout != 0 {
+		t.Fatalf("managed whole-request timeouts = (%s, %s), want both disabled", managed.ReadTimeout, managed.WriteTimeout)
+	}
+
+	updater.SetManagedDistribution(false)
+	upstream := newControllerServer(false)
+	if upstream.ReadHeaderTimeout != 0 || upstream.IdleTimeout != 0 || upstream.MaxHeaderBytes != 0 {
+		t.Fatalf(
+			"upstream server limits = (%s, %s, %d), want zero values",
+			upstream.ReadHeaderTimeout,
+			upstream.IdleTimeout,
+			upstream.MaxHeaderBytes,
+		)
+	}
+	if upstream.ReadTimeout != 0 || upstream.WriteTimeout != 0 {
+		t.Fatalf("upstream whole-request timeouts = (%s, %s), want zero values", upstream.ReadTimeout, upstream.WriteTimeout)
 	}
 }
 
@@ -214,6 +250,17 @@ func TestManagedConfigPutRejectsBootstrapChangesAndKeepsTheLiveGeneration(t *tes
 			updater.SetManagedDistribution(true)
 			t.Cleanup(func() { updater.SetManagedDistribution(previousManaged) })
 
+			emptyProjection := listenerpkg.ProjectInboundListeners(nil)
+			configApplyMu.Lock()
+			previousProjection := managedNamedListenerProjection
+			managedNamedListenerProjection = &emptyProjection
+			configApplyMu.Unlock()
+			t.Cleanup(func() {
+				configApplyMu.Lock()
+				managedNamedListenerProjection = previousProjection
+				configApplyMu.Unlock()
+			})
+
 			listener := &controllerListener{spec: controllerListenerSpec{
 				kind: controllerTLS, network: "tcp", address: "127.0.0.1:443",
 			}}
@@ -253,6 +300,9 @@ func TestManagedConfigPutRejectsBootstrapChangesAndKeepsTheLiveGeneration(t *tes
 			updateConfigs(response, request)
 			if response.Code != http.StatusConflict {
 				t.Fatalf("PUT /configs status %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), ErrControllerRestartRequired.Error()) {
+				t.Fatalf("PUT /configs response does not identify the controller restart boundary: %s", response.Body.String())
 			}
 			controllerMu.Lock()
 			unchanged := currentController == live && currentController.generation == 7 && currentController.listeners[controllerTLS] == listener

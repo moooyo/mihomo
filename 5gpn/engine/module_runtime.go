@@ -931,8 +931,9 @@ func wireHeaders(source http.Header) http.Header {
 // was written, for a response this process was only relaying.
 //
 // responseTrailerNames and publishResponseTrailers already drop exactly these
-// names one layer down, so dropping here loses nothing and additionally keeps
-// the script's projection equal to what the runtime could put back on the wire.
+// names one layer down, plus the interception-owned Alt-Svc field, so dropping
+// here loses nothing and additionally keeps the script's projection equal to
+// what the runtime could put back on the wire.
 //
 // The count, value and duplicate-name bounds stay. Unlike a header block -- where
 // those counts are calibrated for what a script invents and wrongly refused
@@ -1259,8 +1260,7 @@ func (m *compiledHostMatcher) matchCanonical(host string) bool {
 		return true
 	}
 	for _, suffix := range m.wildcard {
-		separator := len(host) - len(suffix) - 1
-		if separator > 0 && host[separator] == '.' && strings.HasSuffix(host, suffix) {
+		if matchSingleLabelWildcard(suffix, host) {
 			return true
 		}
 	}

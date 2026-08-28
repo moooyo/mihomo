@@ -264,11 +264,29 @@ type failFastInterceptHandler struct {
 	fatal func(error)
 }
 
+const (
+	interceptAltSvcHeader = "Alt-Svc"
+	interceptAltSvcClear  = "clear"
+)
+
+// pinInterceptAltSvc owns Alt-Svc at the downstream boundary. The handler sets
+// it before any error path can write, and both successful response writers set
+// it again after origin and extension headers have reached their final form.
+func pinInterceptAltSvc(header http.Header) {
+	for name := range header {
+		if strings.EqualFold(name, interceptAltSvcHeader) {
+			delete(header, name)
+		}
+	}
+	header.Set(interceptAltSvcHeader, interceptAltSvcClear)
+}
+
 func (p *interceptProxy) failFastHandler() http.Handler {
 	return failFastInterceptHandler{next: p, fatal: p.fatal}
 }
 
 func (h failFastInterceptHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	pinInterceptAltSvc(w.Header())
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
@@ -1013,7 +1031,7 @@ func validResponseTrailerName(name string) bool {
 		return false
 	}
 	switch canonical {
-	case "Authorization", "Cache-Control", "Connection", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type",
+	case interceptAltSvcHeader, "Authorization", "Cache-Control", "Connection", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type",
 		"Expect", "Host", "Keep-Alive", "Max-Forwards", "Pragma", "Proxy-Authenticate", "Proxy-Authorization",
 		"Proxy-Connection", "Range", "Realm", "Te", "Trailer", "Transfer-Encoding", "Www-Authenticate":
 		return false
@@ -1111,6 +1129,7 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 	if forceChunked {
 		w.Header().Del("Content-Length")
 	}
+	pinInterceptAltSvc(w.Header())
 	w.WriteHeader(response.StatusCode)
 	if forceChunked {
 		if err := controller.Flush(); err != nil {

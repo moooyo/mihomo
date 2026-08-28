@@ -82,6 +82,16 @@ func ParseWithBytes(buf []byte) (*config.Config, error) {
 
 // ApplyConfig dispatch configure to all parts without ExternalController
 func ApplyConfig(cfg *config.Config, force bool) {
+	_ = applyConfig(cfg, force, false)
+}
+
+// ApplyConfigChecked preserves the managed startup failure boundary by
+// returning named-listener bind failures to the process owner.
+func ApplyConfigChecked(cfg *config.Config, force bool) error {
+	return applyConfig(cfg, force, true)
+}
+
+func applyConfig(cfg *config.Config, force bool, checkNamedListeners bool) error {
 	mux.Lock()
 	defer mux.Unlock()
 	log.SetLevel(cfg.General.LogLevel)
@@ -104,7 +114,9 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
-	updateListeners(cfg.General, cfg.Listeners, force)
+	if err := updateListeners(cfg.General, cfg.Listeners, force, checkNamedListeners); err != nil {
+		return err
+	}
 	updateTun(cfg.General) // tun should not care "force"
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
@@ -120,6 +132,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUpdater(cfg)
 
 	resolver.ResetConnection()
+	return nil
 }
 
 func initInnerTcp() {
@@ -183,10 +196,16 @@ func GetGeneral() *config.General {
 	return general
 }
 
-func updateListeners(general *config.General, listeners map[string]C.InboundListener, force bool) {
-	listener.PatchInboundListeners(listeners, tunnel.Tunnel, true)
+func updateListeners(general *config.General, listeners map[string]C.InboundListener, force bool, checked bool) error {
+	if checked {
+		if err := listener.PatchInboundListenersChecked(listeners, tunnel.Tunnel, true); err != nil {
+			return err
+		}
+	} else {
+		listener.PatchInboundListeners(listeners, tunnel.Tunnel, true)
+	}
 	if !force {
-		return
+		return nil
 	}
 
 	allowLan := general.AllowLan
@@ -205,6 +224,7 @@ func updateListeners(general *config.General, listeners map[string]C.InboundList
 	listener.ReCreateShadowSocks(general.ShadowSocksConfig, tunnel.Tunnel)
 	listener.ReCreateVmess(general.VmessConfig, tunnel.Tunnel)
 	listener.ReCreateTuic(general.TuicServer, tunnel.Tunnel)
+	return nil
 }
 
 func updateTun(general *config.General) {
