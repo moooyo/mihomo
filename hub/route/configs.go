@@ -329,7 +329,7 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 	defer unlockConfigApply()
 	if general.LogLevel != nil {
 		if err := reconcileHotDebugRoute(*general.LogLevel == log.DEBUG); err != nil {
-			if errors.Is(err, ErrControllerRestartRequired) {
+			if configRestartRequired(err) {
 				render.Status(r, http.StatusConflict)
 			} else {
 				render.Status(r, http.StatusBadRequest)
@@ -450,7 +450,7 @@ func updateConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := applyHotConfig(cfg, force); err != nil {
-		if errors.Is(err, ErrControllerRestartRequired) {
+		if configRestartRequired(err) {
 			render.Status(r, http.StatusConflict)
 		} else {
 			render.Status(r, http.StatusBadRequest)
@@ -460,6 +460,10 @@ func updateConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	render.NoContent(w, r)
+}
+
+func configRestartRequired(err error) bool {
+	return errors.Is(err, ErrControllerRestartRequired) || errors.Is(err, ErrNamedListenersRestartRequired)
 }
 
 func updateGeoDatabases(w http.ResponseWriter, r *http.Request) {

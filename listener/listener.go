@@ -1,8 +1,11 @@
 package listener
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +75,53 @@ type Ports struct {
 	MixedPort         int    `json:"mixed-port"`
 	ShadowSocksConfig string `json:"ss-config"`
 	VmessConfig       string `json:"vmess-config"`
+}
+
+type inboundListenerProjectionEntry struct {
+	name       string
+	configType reflect.Type
+	config     C.InboundConfig
+}
+
+// InboundListenerProjection is an immutable semantic view of parsed named
+// listener configuration. Parsed listener configs already contain their
+// defaults, and Equal is the listener-specific canonical comparison.
+type InboundListenerProjection struct {
+	entries []inboundListenerProjectionEntry
+}
+
+// ProjectInboundListeners creates an order-independent projection. Callers
+// must retain the parsed configs as immutable after projecting them.
+func ProjectInboundListeners(listeners map[string]C.InboundListener) InboundListenerProjection {
+	names := sortedInboundListenerNames(listeners)
+	entries := make([]inboundListenerProjectionEntry, 0, len(names))
+	for _, name := range names {
+		config := listeners[name].Config()
+		entries = append(entries, inboundListenerProjectionEntry{
+			name:       name,
+			configType: reflect.TypeOf(config),
+			config:     config,
+		})
+	}
+	return InboundListenerProjection{entries: entries}
+}
+
+// Equal reports whether two projections describe the same named listeners.
+func (p InboundListenerProjection) Equal(other InboundListenerProjection) bool {
+	if len(p.entries) != len(other.entries) {
+		return false
+	}
+	for index := range p.entries {
+		left := p.entries[index]
+		right := other.entries[index]
+		if left.name != right.name || left.configType != right.configType {
+			return false
+		}
+		if !inboundListenerConfigsEqual(left.config, right.config) {
+			return false
+		}
+	}
+	return true
 }
 
 func GetTunConf() LC.Tun {
@@ -651,6 +701,83 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 			}
 		}
 	}
+}
+
+// PatchInboundListenersChecked starts named listeners without hiding bind
+// failures. It is used by managed startup, whose caller must terminate the
+// process if any listener cannot become live. Existing listeners are never
+// replaced here; managed hot apply rejects configuration changes earlier.
+func PatchInboundListenersChecked(newListenerMap map[string]C.InboundListener, tunnel C.Tunnel, dropOld bool) error {
+	inboundMux.Lock()
+	defer inboundMux.Unlock()
+
+	names := sortedInboundListenerNames(newListenerMap)
+	for _, name := range names {
+		newListener := newListenerMap[name]
+		if oldListener, ok := inboundListeners[name]; ok && !inboundListenerConfigsEqual(oldListener.Config(), newListener.Config()) {
+			return fmt.Errorf("named listener %q differs from its active configuration", name)
+		}
+	}
+
+	started := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := inboundListeners[name]; ok {
+			continue
+		}
+		newListener := newListenerMap[name]
+		if err := newListener.Listen(tunnel); err != nil {
+			errs := []error{fmt.Errorf("start named listener %q: %w", name, err)}
+			if closeErr := closeInboundListenerAfterFailure(newListener); closeErr != nil {
+				errs = append(errs, fmt.Errorf("clean failed named listener %q: %w", name, closeErr))
+			}
+			for index := len(started) - 1; index >= 0; index-- {
+				startedName := started[index]
+				startedListener := inboundListeners[startedName]
+				if closeErr := closeInboundListenerAfterFailure(startedListener); closeErr != nil {
+					errs = append(errs, fmt.Errorf("roll back named listener %q: %w", startedName, closeErr))
+				}
+				delete(inboundListeners, startedName)
+			}
+			return errors.Join(errs...)
+		}
+		inboundListeners[name] = newListener
+		started = append(started, name)
+	}
+
+	if dropOld {
+		for name, oldListener := range inboundListeners {
+			if _, ok := newListenerMap[name]; !ok {
+				_ = oldListener.Close()
+				delete(inboundListeners, name)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedInboundListenerNames(listeners map[string]C.InboundListener) []string {
+	names := make([]string, 0, len(listeners))
+	for name := range listeners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func inboundListenerConfigsEqual(left, right C.InboundConfig) bool {
+	if left == nil || right == nil || reflect.TypeOf(left) != reflect.TypeOf(right) {
+		return false
+	}
+	return left.Equal(right) && right.Equal(left)
+}
+
+func closeInboundListenerAfterFailure(listener C.InboundListener) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic while closing partially started listener: %v", recovered)
+		}
+	}()
+	return listener.Close()
 }
 
 // GetPorts return the ports of proxy servers

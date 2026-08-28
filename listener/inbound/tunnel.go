@@ -45,14 +45,19 @@ func (t *Tunnel) Config() C.InboundConfig {
 
 // Close implements constant.InboundListener
 func (t *Tunnel) Close() error {
+	tcpListeners := t.ttl
+	udpListeners := t.tul
+	t.ttl = nil
+	t.tul = nil
+
 	var errs []error
-	for _, l := range t.ttl {
+	for _, l := range tcpListeners {
 		err := l.Close()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("close tcp listener %s err: %w", l.Address(), err))
 		}
 	}
-	for _, l := range t.tul {
+	for _, l := range udpListeners {
 		err := l.Close()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("close udp listener %s err: %w", l.Address(), err))
@@ -77,7 +82,13 @@ func (t *Tunnel) Address() string {
 }
 
 // Listen implements constant.InboundListener
-func (t *Tunnel) Listen(tunnel C.Tunnel) error {
+func (t *Tunnel) Listen(tunnel C.Tunnel) (err error) {
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, t.Close())
+		}
+	}()
+
 	lc := t.ListenConfig()
 	for _, addr := range strings.Split(t.RawAddress(), ",") {
 		for _, network := range t.config.Network {
@@ -85,13 +96,13 @@ func (t *Tunnel) Listen(tunnel C.Tunnel) error {
 			case "tcp":
 				ttl, err := LT.New(addr, t.config.Target, t.config.SpecialProxy, lc, tunnel, t.Additions()...)
 				if err != nil {
-					return err
+					return fmt.Errorf("listen tcp %s: %w", addr, err)
 				}
 				t.ttl = append(t.ttl, ttl)
 			case "udp":
 				tul, err := LT.NewUDP(addr, t.config.Target, t.config.SpecialProxy, lc, tunnel, t.Additions()...)
 				if err != nil {
-					return err
+					return fmt.Errorf("listen udp %s: %w", addr, err)
 				}
 				t.tul = append(t.tul, tul)
 			default:

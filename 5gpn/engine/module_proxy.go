@@ -612,6 +612,7 @@ func writeBufferedModuleResponse(w http.ResponseWriter, method string, status in
 	if len(declared) == 0 {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	}
+	pinInterceptAltSvc(w.Header())
 	w.WriteHeader(status)
 	if len(body) > 0 {
 		buffered := &transferDeadlineWriter{Writer: w, controller: controller, timeout: interceptTransferStallTimeout}

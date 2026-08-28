@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/ca"
@@ -90,6 +91,12 @@ const uiContentSecurityPolicy = "default-src 'self'; " +
 	"worker-src 'self'; manifest-src 'self'; " +
 	"object-src 'none'; base-uri 'self'; form-action 'self'; " +
 	"frame-src 'none'; frame-ancestors 'none'"
+
+const (
+	managedControllerReadHeaderTimeout = 15 * time.Second
+	managedControllerIdleTimeout       = 90 * time.Second
+	managedControllerMaxHeaderBytes    = 64 << 10
+)
 
 func (h controllerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	plan := currentControllerPlan.Load()
@@ -467,7 +474,7 @@ func prepareControllerTLS(cfg *Config) (*tls.Config, error) {
 }
 
 func stageControllerListener(spec controllerListenerSpec) (*controllerListener, error) {
-	server := &http.Server{Handler: controllerHandler{local: spec.kind == controllerUnix || spec.kind == controllerPipe}}
+	server := newControllerServer(spec.kind == controllerUnix || spec.kind == controllerPipe)
 	var listener net.Listener
 	var err error
 	switch spec.kind {
@@ -514,6 +521,18 @@ func stageControllerListener(spec controllerListenerSpec) (*controllerListener, 
 		listener = tls.NewListener(listener, dynamicTLS)
 	}
 	return &controllerListener{spec: spec, server: server, listener: listener}, nil
+}
+
+func newControllerServer(local bool) *http.Server {
+	server := &http.Server{Handler: controllerHandler{local: local}}
+	if updater.ManagedDistribution() {
+		// Bound work before authentication without imposing whole-request limits
+		// on configuration uploads, streaming endpoints, or hijacked WebSockets.
+		server.ReadHeaderTimeout = managedControllerReadHeaderTimeout
+		server.IdleTimeout = managedControllerIdleTimeout
+		server.MaxHeaderBytes = managedControllerMaxHeaderBytes
+	}
+	return server
 }
 
 func closeStagedControllerListeners(listeners []*controllerListener) {

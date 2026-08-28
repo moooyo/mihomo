@@ -126,12 +126,15 @@ func TestCurrentConfigDecodeRejectsAnEmptyEgressBinding(t *testing.T) {
 	}
 }
 
-// A wildcard covers subdomains and not the apex, and each extension only owns
-// what it declared.
+// A wildcard covers exactly one label below its suffix, not deeper descendants
+// or the apex, and each extension only owns what it declared.
 func TestCaptureMatchesWildcardsAndNotTheApex(t *testing.T) {
 	e := newTestEngine(t, twoExtensionDocument)
 	if _, ok := e.CaptureFor("a.first.example"); !ok {
 		t.Error("the wildcard did not cover a subdomain")
+	}
+	if _, ok := e.CaptureFor("deep.a.first.example"); ok {
+		t.Error("the wildcard covered more than one label")
 	}
 	if _, ok := e.CaptureFor("first.example"); ok {
 		t.Error("the wildcard covered its own apex")
