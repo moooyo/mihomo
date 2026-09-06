@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,7 +42,26 @@ type fakeWorkerCgroupFS struct {
 	files    map[string][]byte
 	dirs     map[string]bool
 	writes   []fakeWorkerCgroupWrite
+	removals []string
 	openPath string
+}
+
+type blockingWorkerCleanupFS struct {
+	*fakeWorkerCgroupFS
+	actionPath string
+	entered    chan struct{}
+	proceed    chan struct{}
+	once       sync.Once
+}
+
+func (fs *blockingWorkerCleanupFS) writeFile(path, value string) error {
+	if path == filepath.Join(fs.actionPath, "cgroup.kill") {
+		fs.once.Do(func() {
+			close(fs.entered)
+			<-fs.proceed
+		})
+	}
+	return fs.fakeWorkerCgroupFS.writeFile(path, value)
 }
 
 func TestNewWorkerIsolationConfiguresDelegatedHierarchy(t *testing.T) {
@@ -256,6 +276,246 @@ func TestWorkerIsolationRejectsDifferentExecutable(t *testing.T) {
 	}
 	if started {
 		t.Fatal("different executable reached process creation")
+	}
+}
+
+func TestWorkerIsolationAttachmentFailureReleasesOnlyItsReservation(t *testing.T) {
+	fs, deps := newFakeWorkerLinuxDependencies(t, nil)
+	var commands []*exec.Cmd
+	deps.startCommand = func(cmd *exec.Cmd) error {
+		if err := startWorkerIsolationFixture(cmd); err != nil {
+			return err
+		}
+		commands = append(commands, cmd)
+		if len(commands) == 2 {
+			action := filepath.Join(testWorkerRoot, "workers.4242."+testManagerNonce, "action.cccccccccccccccccccccccccccccccc")
+			fs.setFile(filepath.Join(action, "cgroup.procs"), strconv.Itoa(cmd.Process.Pid)+"\n")
+		}
+		return nil
+	}
+	isolation, err := newWorkerIsolationWithDependencies(testWorkerMemory, testAggregateMemory, 2, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeWorkerIsolationWithTimeout(t, isolation) })
+	// Keep another reservation occupied so a double release cannot hide at zero.
+	if err := isolation.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	spec := workerIsolationFixtureSpec(t)
+	process, err := startWorkerIsolationWithTimeout(t, isolation, spec)
+	if process != nil || err == nil || !strings.Contains(err.Error(), "verify atomic cgroup attachment") {
+		t.Fatalf("Start() = %v, %v, want attachment refusal", process, err)
+	}
+	if len(commands) != 1 || commands[0].ProcessState == nil {
+		t.Fatal("failed attachment did not reap its started child")
+	}
+	assertWorkerIsolationReservations(t, isolation, 1, 0)
+	action := filepath.Join(isolation.aggregatePath, "action."+testFirstActionNonce)
+	assertFakeCgroupRemovedOnce(t, fs, action)
+
+	process, err = startWorkerIsolationWithTimeout(t, isolation, spec)
+	if err != nil {
+		t.Fatalf("Start() after failed attachment: %v", err)
+	}
+	assertWorkerIsolationReservations(t, isolation, 2, 1)
+	if _, err := process.Wait(); err != nil {
+		t.Fatalf("Wait() after healthy startup: %v", err)
+	}
+	assertWorkerIsolationReservations(t, isolation, 1, 0)
+	assertFakeCgroupRemovedOnce(t, fs, process.cgroupPath)
+	isolation.releaseReservation()
+	assertWorkerIsolationReservations(t, isolation, 0, 0)
+}
+
+func TestWorkerIsolationCloseWaitsForStartup(t *testing.T) {
+	for _, name := range []string{"before process start", "after process start", "successful startup"} {
+		t.Run(name, func(t *testing.T) {
+			started := name != "before process start"
+			successful := name == "successful startup"
+			fs, deps := newFakeWorkerLinuxDependencies(t, nil)
+			action := filepath.Join(testWorkerRoot, "workers.4242."+testManagerNonce, "action."+testFirstActionNonce)
+			blocked := &blockingWorkerCleanupFS{
+				fakeWorkerCgroupFS: fs, actionPath: action,
+				entered: make(chan struct{}), proceed: make(chan struct{}),
+			}
+			if !successful {
+				deps.fs = blocked
+			}
+			startErr := errors.New("injected process start failure")
+			var command *exec.Cmd
+			deps.startCommand = func(cmd *exec.Cmd) error {
+				if started {
+					if err := startWorkerIsolationFixture(cmd); err != nil {
+						return err
+					}
+					command = cmd
+					if successful {
+						fs.setFile(filepath.Join(action, "cgroup.procs"), strconv.Itoa(cmd.Process.Pid)+"\n")
+						close(blocked.entered)
+						<-blocked.proceed
+					}
+					return nil
+				}
+				return startErr
+			}
+			isolation, err := newWorkerIsolationWithDependencies(testWorkerMemory, testAggregateMemory, 1, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var unblockOnce sync.Once
+			unblock := func() { unblockOnce.Do(func() { close(blocked.proceed) }) }
+			defer unblock()
+			spec := workerIsolationFixtureSpec(t)
+			startDone := make(chan error, 1)
+			go func() {
+				_, err := isolation.Start(context.Background(), spec)
+				startDone <- err
+			}()
+			select {
+			case <-blocked.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Start() did not reach the blocked startup stage")
+			}
+			if !isolation.mu.TryLock() {
+				t.Fatal("startup holds the process registration lock")
+			}
+			isolation.mu.Unlock()
+			closeDone := make(chan error, 1)
+			go func() { closeDone <- isolation.Close() }()
+			select {
+			case <-isolation.closedCh:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close() could not stop admission during startup")
+			}
+			select {
+			case err := <-closeDone:
+				t.Fatalf("Close() returned before startup completed: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if !fs.hasDir(isolation.aggregatePath) {
+				t.Fatal("Close() removed the aggregate during startup cleanup")
+			}
+			unblock()
+			select {
+			case err := <-startDone:
+				if successful {
+					if err != nil {
+						t.Fatalf("Start() error = %v", err)
+					}
+				} else if started {
+					if err == nil || !strings.Contains(err.Error(), "verify atomic cgroup attachment") {
+						t.Fatalf("Start() error = %v, want attachment refusal", err)
+					}
+				} else if !errors.Is(err, startErr) {
+					t.Fatalf("Start() error = %v, want %v", err, startErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Start() did not complete")
+			}
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					t.Fatalf("Close() error = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close() did not complete after startup")
+			}
+			if started && command.ProcessState == nil {
+				t.Fatal("Close() left a started child unreaped")
+			}
+			assertWorkerIsolationReservations(t, isolation, 0, 0)
+			assertFakeCgroupRemovedOnce(t, fs, action)
+			assertFakeCgroupRemovedOnce(t, fs, isolation.aggregatePath)
+			if _, err := isolation.Start(context.Background(), spec); !errors.Is(err, errWorkerIsolationClosed) {
+				t.Fatalf("Start() after Close() = %v, want isolation closed", err)
+			}
+		})
+	}
+}
+
+func TestWorkerIsolationExitFixture(t *testing.T) {
+	if os.Getenv("FIVEGPN_WORKER_EXIT_FIXTURE") == "1" {
+		os.Exit(0)
+	}
+}
+
+func startWorkerIsolationFixture(cmd *exec.Cmd) error {
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.UseCgroupFD {
+		return errors.New("fixture start did not request atomic cgroup attachment")
+	}
+	// Only this injected test launcher replaces the fake cgroup descriptor.
+	// The real test-binary child still exercises exec.Cmd cancellation and Wait.
+	cmd.SysProcAttr = nil
+	return cmd.Start()
+}
+
+func workerIsolationFixtureSpec(t *testing.T) workerProcessSpec {
+	t.Helper()
+	stdio := openWorkerDevNull(t)
+	return workerProcessSpec{
+		Executable: workerSelfExecutablePath,
+		Args:       []string{"-test.run=^TestWorkerIsolationExitFixture$"},
+		Env:        append(os.Environ(), "FIVEGPN_WORKER_EXIT_FIXTURE=1"),
+		Stdin:      stdio, Stdout: stdio, Stderr: stdio,
+	}
+}
+
+func startWorkerIsolationWithTimeout(t *testing.T, isolation *workerIsolation, spec workerProcessSpec) (*workerProcess, error) {
+	t.Helper()
+	type result struct {
+		process *workerProcess
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		process, err := isolation.Start(context.Background(), spec)
+		done <- result{process, err}
+	}()
+	select {
+	case result := <-done:
+		return result.process, result.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return")
+		return nil, nil
+	}
+}
+
+func closeWorkerIsolationWithTimeout(t *testing.T, isolation *workerIsolation) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- isolation.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Close() did not return")
+	}
+}
+
+func assertWorkerIsolationReservations(t *testing.T, isolation *workerIsolation, active uint32, processes int) {
+	t.Helper()
+	isolation.mu.Lock()
+	defer isolation.mu.Unlock()
+	if isolation.active != active || len(isolation.processes) != processes {
+		t.Fatalf("worker reservations = %d, processes = %d; want %d, %d", isolation.active, len(isolation.processes), active, processes)
+	}
+}
+
+func assertFakeCgroupRemovedOnce(t *testing.T, fs *fakeWorkerCgroupFS, path string) {
+	t.Helper()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	var count int
+	for _, removed := range fs.removals {
+		if removed == path {
+			count++
+		}
+	}
+	if fs.dirs[path] || count != 1 {
+		t.Fatalf("cgroup %q exists = %v, removal attempts = %d; want false, 1", path, fs.dirs[path], count)
 	}
 }
 
@@ -490,9 +750,27 @@ func TestWorkerIsolationDelegatedCgroupIntegration(t *testing.T) {
 	if os.Getenv("FIVEGPN_TEST_DELEGATED_CGROUP") != "1" {
 		t.Skip("requires the production delegated cgroup namespace")
 	}
-	if os.Getenv("FIVEGPN_WORKER_PROCESS_HELPER") == "1" {
+	switch os.Getenv("FIVEGPN_WORKER_PROCESS_HELPER") {
+	case "1":
+		os.Exit(0)
+	case "wait":
+		var signal [1]byte
+		if _, err := io.ReadFull(os.Stdin, signal[:]); err != nil {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
+	waitForExit := func(pid, options int) error {
+		for {
+			var info unix.Siginfo
+			err := unix.Waitid(unix.P_PID, pid, &info, options, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return err
+		}
+	}
+	var commands []*exec.Cmd
 	deps := workerLinuxDependencies{
 		fs:             systemWorkerCgroupFS{},
 		rootPath:       workerCgroupRootPath,
@@ -501,7 +779,23 @@ func TestWorkerIsolationDelegatedCgroupIntegration(t *testing.T) {
 		pid:            os.Getpid(),
 		nonce:          newWorkerCgroupNonce,
 		startCommand: func(cmd *exec.Cmd) error {
-			return cmd.Start()
+			if cmd.SysProcAttr == nil || !cmd.SysProcAttr.UseCgroupFD {
+				return errors.New("integration start did not request atomic cgroup attachment")
+			}
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+			commands = append(commands, cmd)
+			if len(commands) != 1 {
+				return nil
+			}
+			// An exited, unreaped child no longer appears in cgroup.procs. Keep
+			// reaping owned by Start's failed-attachment path and its Cmd.Wait.
+			if err := waitForExit(cmd.Process.Pid, unix.WEXITED|unix.WNOWAIT); err != nil {
+				_ = cmd.Process.Kill()
+				return errors.Join(fmt.Errorf("wait for early worker exit: %w", err), cmd.Wait())
+			}
+			return nil
 		},
 		killProcess: syscall.Kill,
 		sleep:       time.Sleep,
@@ -510,18 +804,58 @@ func TestWorkerIsolationDelegatedCgroupIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWorkerIsolationWithDependencies() error = %v", err)
 	}
-	defer func() { _ = isolation.Close() }()
+	t.Cleanup(func() { closeWorkerIsolationWithTimeout(t, isolation) })
 	stdio := openWorkerDevNull(t)
-	process, err := isolation.Start(context.Background(), workerProcessSpec{
+	spec := workerProcessSpec{
 		Executable: workerSelfExecutablePath,
 		Args:       []string{"-test.run=^TestWorkerIsolationDelegatedCgroupIntegration$"},
 		Env:        append(os.Environ(), "FIVEGPN_WORKER_PROCESS_HELPER=1"),
 		Stdin:      stdio,
 		Stdout:     stdio,
 		Stderr:     stdio,
-	})
+	}
+	process, err := startWorkerIsolationWithTimeout(t, isolation, spec)
+	if process != nil || err == nil || !strings.Contains(err.Error(), "verify atomic cgroup attachment") {
+		t.Fatalf("Start() after early child exit = %v, %v, want attachment refusal", process, err)
+	}
+	if len(commands) != 1 || commands[0].ProcessState == nil || commands[0].ProcessState.ExitCode() != 0 {
+		t.Fatal("failed attachment did not reap its exited child")
+	}
+	if err := waitForExit(commands[0].Process.Pid, unix.WEXITED|unix.WNOHANG|unix.WNOWAIT); !errors.Is(err, unix.ECHILD) {
+		t.Fatalf("waitid after failed startup = %v, want reaped child", err)
+	}
+	assertWorkerIsolationReservations(t, isolation, 0, 0)
+	entries, err := os.ReadDir(isolation.aggregatePath)
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("read aggregate after failed startup: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "action.") {
+			t.Fatalf("failed startup left action cgroup %q", entry.Name())
+		}
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	spec.Env = append(os.Environ(), "FIVEGPN_WORKER_PROCESS_HELPER=wait")
+	spec.Stdin = reader
+	process, err = startWorkerIsolationWithTimeout(t, isolation, spec)
+	if err != nil {
+		t.Fatalf("Start() after recovered attachment failure: %v", err)
+	}
+	assertWorkerIsolationReservations(t, isolation, 1, 1)
+	// The second child stays alive until attachment verification has succeeded.
+	if _, err := writer.Write([]byte{1}); err != nil {
+		t.Fatalf("release healthy worker: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close healthy worker release pipe: %v", err)
 	}
 	exit, err := process.Wait()
 	if err != nil {
@@ -529,6 +863,10 @@ func TestWorkerIsolationDelegatedCgroupIntegration(t *testing.T) {
 	}
 	if exit.Code != 0 || exit.OOM {
 		t.Fatalf("exit = %#v", exit)
+	}
+	assertWorkerIsolationReservations(t, isolation, 0, 0)
+	if _, err := os.Stat(process.cgroupPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("healthy worker cgroup after Wait() = %v, want absent", err)
 	}
 }
 
@@ -673,6 +1011,7 @@ func readFakeDescendants(body []byte) (uint64, bool) {
 func (fs *fakeWorkerCgroupFS) remove(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.removals = append(fs.removals, path)
 	if !fs.dirs[path] {
 		return os.ErrNotExist
 	}
