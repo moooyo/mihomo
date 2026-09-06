@@ -61,6 +61,9 @@ type workerIsolation struct {
 	killProcess    func(int, syscall.Signal) error
 	sleep          func(time.Duration)
 
+	// startMu serializes startup and its failure cleanup with aggregate teardown.
+	// It may be held while taking mu; no caller may wait for startMu while holding mu.
+	startMu     sync.Mutex
 	mu          sync.Mutex
 	closed      bool
 	active      uint32
@@ -255,6 +258,8 @@ func (w *workerIsolation) Start(ctx context.Context, spec workerProcessSpec) (_ 
 			w.releaseReservation()
 		}
 	}()
+	w.startMu.Lock()
+	defer w.startMu.Unlock()
 	if w.testMode {
 		process, err := w.startTestProcess(ctx, spec)
 		if err != nil {
@@ -273,8 +278,9 @@ func (w *workerIsolation) Start(ctx context.Context, spec workerProcessSpec) (_ 
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
+	closed := w.closed
+	w.mu.Unlock()
+	if closed {
 		return nil, errWorkerIsolationClosed
 	}
 
@@ -335,6 +341,13 @@ func (w *workerIsolation) Start(ctx context.Context, spec workerProcessSpec) (_ 
 	if closeErr != nil {
 		process.descriptorErr = fmt.Errorf("close extension worker cgroup descriptor: %w", closeErr)
 	}
+	// A started process owns both the leaf and the reservation, including when
+	// attachment verification fails. Wait releases them through processDone.
+	w.mu.Lock()
+	w.processes[process] = struct{}{}
+	w.mu.Unlock()
+	created = false
+	release = false
 	var attachmentErr error
 	if cmd.Process == nil {
 		attachmentErr = errors.New("atomic cgroup start returned no process")
@@ -347,9 +360,6 @@ func (w *workerIsolation) Start(ctx context.Context, spec workerProcessSpec) (_ 
 		return nil, errors.Join(attachmentErr, killErr, waitErr)
 	}
 
-	w.processes[process] = struct{}{}
-	created = false
-	release = false
 	return process, nil
 }
 
@@ -371,6 +381,13 @@ func (w *workerIsolation) Close() error {
 		w.mu.Lock()
 		w.closed = true
 		close(w.closedCh)
+		w.mu.Unlock()
+
+		// A startup already in progress must register its process or finish its
+		// failure cleanup before the snapshot and aggregate removal below.
+		w.startMu.Lock()
+		defer w.startMu.Unlock()
+		w.mu.Lock()
 		processes := make([]*workerProcess, 0, len(w.processes))
 		for process := range w.processes {
 			processes = append(processes, process)
